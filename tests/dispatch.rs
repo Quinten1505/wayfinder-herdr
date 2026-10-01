@@ -24,14 +24,15 @@ path=args[-1]
 state_path=os.environ['MOCK_GH_STATE']
 with open(state_path) as f: state=json.load(f)
 def dump(value): print(json.dumps(value))
-def child():
-    return {'id':1300,'number':13,'title':'Implement sample task','body':'Implement the requested feature.','state':'open','assignees':([{'login':state['login']}] if state['assigned'] else []),'labels':[{'name':'wayfinder:task'}]}
+def child(number=13):
+    assigned=(state['assigned'] if number == 13 else number in state.get('assigned_tickets', []))
+    return {'id':number*100,'number':number,'title':f'Implement sample task {number}','body':'Implement the requested feature.','state':'open','assignees':([{'login':state['login']}] if assigned else []),'labels':[{'name':'wayfinder:task'}]}
 def map_issue():
     return {'id':4200,'number':42,'title':'Map','body':'## Notes\n\nExecution override: selected by the user for this effort.','state':'open','assignees':[],'labels':[{'name':'wayfinder:map'}]}
 if path == 'user': dump({'login':state['login']})
 elif '--paginate' in args:
     route=path.split('?')[0]
-    if route.endswith('/sub_issues'): page=[child()]
+    if route.endswith('/sub_issues'): page=[child()] + ([child(14)] if state.get('second_ticket') else [])
     elif '/dependencies/blocked_by' in route: page=[]
     else: page=[]
     dump([page])
@@ -40,12 +41,19 @@ elif '--method' in args:
     route=args[args.index('--method')+2]
     body=json.loads(sys.stdin.read() or '{}')
     if route.endswith('/assignees'):
-        state['assigned']=body['assignees'][0] == state['login']
+        ticket=int(route.split('/')[-2])
+        is_assigned=body['assignees'][0] == state['login']
+        if ticket == 13: state['assigned']=is_assigned
+        else:
+            tickets=state.setdefault('assigned_tickets', [])
+            if is_assigned and ticket not in tickets: tickets.append(ticket)
+            if not is_assigned and ticket in tickets: tickets.remove(ticket)
         with open(state_path,'w') as f: json.dump(state,f)
         dump({'assignees':[{'login':state['login']}]})
     else: dump({})
 elif path.endswith('/issues/42'): dump(map_issue())
 elif path.endswith('/issues/13'): dump(child())
+elif path.endswith('/issues/14'): dump(child(14))
 else: sys.stderr.write('unhandled fake gh route: '+path+'\n'); sys.exit(2)
 "##;
 
@@ -57,7 +65,9 @@ struct HerdrState {
     fail_open_without_resource: bool,
     ambiguous_start_response: bool,
     ambiguous_close_response: bool,
+    ambiguous_prompt_response: bool,
     reject_next_prompt_as_blocked: bool,
+    fail_first_open_without_resource: bool,
     fail_next_read: bool,
     empty_next_read: bool,
     changed_read: bool,
@@ -122,7 +132,7 @@ impl Fixture {
         let gh_state = temp.path().join("gh-state.json");
         fs::write(
             &gh_state,
-            json!({"login":"fixture-user","assigned":false}).to_string(),
+            json!({"login":"fixture-user","assigned":false,"assigned_tickets":[],"second_ticket":false}).to_string(),
         )
         .unwrap();
         let binary = temp.path().join("herdr");
@@ -223,7 +233,12 @@ fn handle_request(mut stream: std::os::unix::net::UnixStream, state: &Arc<Mutex<
     let mut error = None;
     match method {
         "worktree.open" => {
-            if state.fail_open_without_resource {
+            if state.fail_first_open_without_resource {
+                state.fail_first_open_without_resource = false;
+                error = Some(
+                    json!({"code":"untrusted_repository","message":"repository trust approval required"}),
+                );
+            } else if state.fail_open_without_resource {
                 error = Some(
                     json!({"code":"untrusted_repository","message":"repository trust approval required"}),
                 );
@@ -318,6 +333,11 @@ fn handle_request(mut stream: std::os::unix::net::UnixStream, state: &Arc<Mutex<
                 updated["agent_session"] = state.sessions.get(pane).cloned().unwrap();
                 state.agents.insert(pane.into(), updated);
                 result = json!({"type":"agent_prompted"});
+                if state.ambiguous_prompt_response {
+                    error = Some(
+                        json!({"code":"response_lost","message":"simulated lost agent.prompt response"}),
+                    );
+                }
             } else {
                 error = Some(json!({"code":"agent_not_found","message":"no agent on pane"}));
             }
@@ -560,6 +580,9 @@ fn recovered_open_intent_starts_the_agent_once_without_reopening_the_worktree() 
         foreground_process: None,
         result_evidence: None,
         initial_prompt_pending: false,
+        initial_prompt_acknowledged: false,
+        initial_prompt_reconnect_pending: false,
+        known_prelaunch_failure: false,
     };
     state.workers.runs.push(run.clone());
     store::atomic_json(&f.dir.join("state.json"), &state).unwrap();
@@ -1181,6 +1204,85 @@ fn trust_failure_is_visible_and_does_not_change_repository_trust_or_retry_open()
 }
 
 #[test]
+fn definite_prelaunch_setup_failure_releases_capacity_for_an_independent_ticket() {
+    let f = Fixture::new();
+    let mut github = serde_json::from_slice::<Value>(&fs::read(&f.gh_state).unwrap()).unwrap();
+    github["second_ticket"] = json!(true);
+    fs::write(&f.gh_state, serde_json::to_vec(&github).unwrap()).unwrap();
+    f.herdr_state
+        .lock()
+        .unwrap()
+        .fail_first_open_without_resource = true;
+
+    f.apply(RequestKind::Start);
+
+    let state = f.state();
+    let failed = state
+        .workers
+        .runs
+        .iter()
+        .find(|run| run.ticket == 13)
+        .unwrap();
+    let independent = state
+        .workers
+        .runs
+        .iter()
+        .find(|run| run.ticket == 14)
+        .unwrap();
+    assert_eq!(failed.status, WorkerStatus::NeedsHuman);
+    assert!(failed.known_prelaunch_failure);
+    assert!(!failed.reserves_capacity());
+    assert!(failed.claim_login.is_some(), "the GitHub claim is retained");
+    assert!(failed.question.as_deref().unwrap().contains("retry-worker"));
+    assert_eq!(independent.status, WorkerStatus::Running);
+    assert!(independent.reserves_capacity());
+
+    let records = f.herdr_state.lock().unwrap();
+    assert_eq!(
+        records
+            .requests
+            .iter()
+            .filter(|request| request["method"] == "worktree.open")
+            .count(),
+        2,
+        "the held setup failure and independent ticket each had one open attempt"
+    );
+    assert_eq!(
+        records
+            .requests
+            .iter()
+            .filter(|request| request["method"] == "agent.start")
+            .count(),
+        1,
+        "only the independent ticket started an agent"
+    );
+    drop(records);
+
+    success(f.once());
+    let after_reconcile = f.state();
+    assert_eq!(
+        after_reconcile
+            .workers
+            .runs
+            .iter()
+            .find(|run| run.ticket == 13)
+            .unwrap()
+            .status,
+        WorkerStatus::NeedsHuman
+    );
+    let records = f.herdr_state.lock().unwrap();
+    assert_eq!(
+        records
+            .requests
+            .iter()
+            .filter(|request| request["method"] == "worktree.open")
+            .count(),
+        2,
+        "the claimed setup failure was not automatically retried"
+    );
+}
+
+#[test]
 fn refused_git_detached_checkout_is_held_for_explicit_human_retry() {
     let f = Fixture::new();
     let repository = f.state().binding.repository;
@@ -1276,6 +1378,155 @@ fn runtime_restart_reconnects_only_the_same_observed_agent_session() {
 }
 
 #[test]
+fn acknowledged_initial_prompt_reconnects_only_the_same_process_without_replay() {
+    for replace_process in [false, true] {
+        let f = Fixture::new();
+        f.apply(RequestKind::Start);
+        let mut state = f.state();
+        let run = &mut state.workers.runs[0];
+        run.initial_prompt_acknowledged = true;
+        run.initial_prompt_pending = false;
+        run.initial_prompt_reconnect_pending = true;
+        run.agent_session = None;
+        if replace_process {
+            let process = run.foreground_process.as_mut().unwrap();
+            process.pid = process.pid.saturating_add(1);
+            process.start_time_ticks = process.start_time_ticks.saturating_add(1);
+        }
+        store::atomic_json(&f.dir.join("state.json"), &state).unwrap();
+        store::enqueue(&f.dir, RequestKind::Reconcile).unwrap();
+
+        success(f.once());
+        let recovered = f.state().workers.runs[0].clone();
+        if replace_process {
+            assert_eq!(recovered.status, WorkerStatus::Uncertain);
+            assert!(recovered.status.reserves_capacity());
+            assert!(recovered.initial_prompt_acknowledged);
+            assert!(recovered.initial_prompt_reconnect_pending);
+            assert!(recovered.agent_session.is_none());
+        } else {
+            assert_eq!(recovered.status, WorkerStatus::Running);
+            assert!(!recovered.initial_prompt_acknowledged);
+            assert!(!recovered.initial_prompt_reconnect_pending);
+            assert!(recovered.agent_session.is_some());
+        }
+        assert_eq!(
+            f.herdr_state
+                .lock()
+                .unwrap()
+                .requests
+                .iter()
+                .filter(|request| request["method"] == "agent.prompt")
+                .count(),
+            1,
+            "an acknowledged initial prompt is never replayed"
+        );
+    }
+}
+
+#[test]
+fn acknowledged_prompt_does_not_override_ambiguous_stop_or_answer_holds() {
+    let stopping = Fixture::new();
+    stopping.apply(RequestKind::Start);
+    let mut state = stopping.state();
+    state.workers.runs[0].initial_prompt_acknowledged = true;
+    state.workers.runs[0].initial_prompt_reconnect_pending = false;
+    state.workers.runs[0].agent_session = None;
+    store::atomic_json(&stopping.dir.join("state.json"), &state).unwrap();
+    stopping
+        .herdr_state
+        .lock()
+        .unwrap()
+        .ambiguous_close_response = true;
+    let run = state.workers.runs[0].clone();
+    let stopped = stopping
+        .cli()
+        .args(["stop-worker", "--map", MAP, "--run", &run.id])
+        .output()
+        .unwrap();
+    assert!(!stopped.status.success());
+    assert_eq!(
+        stopping.state().workers.runs[0].status,
+        WorkerStatus::Uncertain
+    );
+    success(stopping.once());
+    assert_eq!(
+        stopping.state().workers.runs[0].status,
+        WorkerStatus::Uncertain
+    );
+    assert_eq!(
+        stopping
+            .herdr_state
+            .lock()
+            .unwrap()
+            .requests
+            .iter()
+            .filter(|request| request["method"] == "pane.close")
+            .count(),
+        1
+    );
+
+    let answering = Fixture::new();
+    answering.apply(RequestKind::Start);
+    let original = answering.state().workers.runs[0].clone();
+    write_worker_result(
+        &original,
+        json!({
+            "format_version":1,
+            "run_id":original.id,
+            "ticket":original.ticket,
+            "role":original.role,
+            "status":"blocked",
+            "summary":"needs a human decision",
+            "question":"Which option should I use?"
+        }),
+    );
+    answering.herdr_state.lock().unwrap().agent_status = "idle".into();
+    success(answering.once());
+    let mut state = answering.state();
+    let pending = state.workers.runs[0].clone();
+    assert_eq!(
+        pending.human_request_kind,
+        Some(store::HumanRequestKind::WorkerQuestion)
+    );
+    state.workers.runs[0].initial_prompt_acknowledged = true;
+    state.workers.runs[0].initial_prompt_reconnect_pending = false;
+    state.workers.runs[0].agent_session = None;
+    store::atomic_json(&answering.dir.join("state.json"), &state).unwrap();
+    answering
+        .herdr_state
+        .lock()
+        .unwrap()
+        .ambiguous_prompt_response = true;
+
+    let response = answer_cli(&answering, &pending, "worker_question", "Choose option A.");
+    assert!(!response.status.success());
+    let uncertain = answering.state().workers.runs[0].clone();
+    assert_eq!(uncertain.status, WorkerStatus::Uncertain);
+    assert_eq!(
+        uncertain.answer_history[0].disposition,
+        store::AnswerDisposition::Uncertain
+    );
+    success(answering.once());
+    assert_eq!(
+        answering.state().workers.runs[0].status,
+        WorkerStatus::Uncertain
+    );
+    assert_eq!(
+        answering
+            .herdr_state
+            .lock()
+            .unwrap()
+            .requests
+            .iter()
+            .filter(|request| request["method"] == "agent.prompt")
+            .count(),
+        2,
+        "the acknowledged launch and ambiguous answer are each sent once"
+    );
+}
+
+#[test]
 fn cold_restored_or_replaced_agent_identity_becomes_uncertain_without_effects() {
     let scenarios = [
         (
@@ -1352,6 +1603,9 @@ fn cold_restored_or_replaced_agent_identity_becomes_uncertain_without_effects() 
             foreground_process: None,
             result_evidence: None,
             initial_prompt_pending: false,
+            initial_prompt_acknowledged: false,
+            initial_prompt_reconnect_pending: false,
+            known_prelaunch_failure: false,
         });
         store::atomic_json(&f.dir.join("state.json"), &queued).unwrap();
         {
@@ -1936,6 +2190,9 @@ fn insert_uncertain_run(f: &Fixture) -> WorkerRun {
         foreground_process: None,
         result_evidence: None,
         initial_prompt_pending: false,
+        initial_prompt_acknowledged: false,
+        initial_prompt_reconnect_pending: false,
+        known_prelaunch_failure: false,
     };
     state.workers.next_run = 1;
     state.workers.runs.push(run.clone());

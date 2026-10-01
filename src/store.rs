@@ -174,6 +174,25 @@ pub struct WorkerRun {
     /// human resolution of a Herdr startup UI.
     #[serde(default)]
     pub initial_prompt_pending: bool,
+    /// Herdr acknowledged the initial task prompt. Until a session ID is
+    /// persisted, pane/terminal/provider and Linux process identity reconnect
+    /// this confirmed launch without ever replaying its prompt.
+    #[serde(default)]
+    pub initial_prompt_acknowledged: bool,
+    /// One-time recovery window after durable acknowledgement but before the
+    /// original worker identity has been re-established in this runtime.
+    #[serde(default)]
+    pub initial_prompt_reconnect_pending: bool,
+    /// A definite failure occurred before any agent was launched. Keep the
+    /// ticket claim and human retry request, but do not consume an agent slot.
+    #[serde(default)]
+    pub known_prelaunch_failure: bool,
+}
+
+impl WorkerRun {
+    pub fn reserves_capacity(&self) -> bool {
+        self.status.reserves_capacity() && !self.known_prelaunch_failure
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

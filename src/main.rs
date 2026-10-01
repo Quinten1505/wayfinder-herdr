@@ -406,7 +406,7 @@ fn run() -> Result<()> {
             );
             let pane = worker.pane_id.clone().context("worker has no owned pane")?;
             let herdr = Client::new(&state.binding.socket);
-            let inspected = if worker.initial_prompt_pending {
+            let inspected = if worker.initial_prompt_pending || worker.initial_prompt_acknowledged {
                 wayfinder_herdr::herdr::inspect_pre_prompt_worker(&herdr, &worker)
             } else {
                 wayfinder_herdr::herdr::inspect_worker(&herdr, &worker)
@@ -424,6 +424,10 @@ fn run() -> Result<()> {
                     );
                 }
             };
+            if worker.initial_prompt_reconnect_pending {
+                state.workers.runs[i].initial_prompt_reconnect_pending = false;
+                store::atomic_json(&dir.join("state.json"), &state)?;
+            }
             if confirmed_blocked {
                 ensure!(
                     agent["agent"]["agent_status"].as_str() == Some("blocked"),
@@ -496,7 +500,7 @@ fn run() -> Result<()> {
                 .clone()
                 .context("blocked worker has no owned pane")?;
             let herdr = Client::new(&state.binding.socket);
-            let inspected = if worker.initial_prompt_pending {
+            let inspected = if worker.initial_prompt_pending || worker.initial_prompt_acknowledged {
                 wayfinder_herdr::herdr::inspect_pre_prompt_worker(&herdr, &worker)
             } else {
                 wayfinder_herdr::herdr::inspect_worker(&herdr, &worker)
@@ -514,6 +518,10 @@ fn run() -> Result<()> {
                     );
                 }
             };
+            if worker.initial_prompt_reconnect_pending {
+                state.workers.runs[index].initial_prompt_reconnect_pending = false;
+                store::atomic_json(&dir.join("state.json"), &state)?;
+            }
             let agent_status = agent["agent"]["agent_status"].as_str().unwrap_or("unknown");
             if request_kind == HumanRequestKind::HerdrBlockedUi {
                 ensure!(
@@ -720,7 +728,7 @@ fn run() -> Result<()> {
                 human_request_seq: 0, human_request_id: None, human_request_kind: None,
                 human_request_fingerprint: None, answer_request_id: None, answer_request_kind: None,
                 answer_history: Vec::new(),
-                source_run: Some(prior.id), claim_login: prior.claim_login, context: Some("Human explicitly authorized this retry after the preceding worker was confirmed stopped or absent.".into()), last_activity_ms: None, terminal_id: None, agent_provider: None, agent_session: None, foreground_process: None, result_evidence: None, initial_prompt_pending: false,
+                source_run: Some(prior.id), claim_login: prior.claim_login, context: Some("Human explicitly authorized this retry after the preceding worker was confirmed stopped or absent.".into()), last_activity_ms: None, terminal_id: None, agent_provider: None, agent_session: None, foreground_process: None, result_evidence: None, initial_prompt_pending: false, initial_prompt_acknowledged: false, initial_prompt_reconnect_pending: false, known_prelaunch_failure: false,
             });
             store::atomic_json(&dir.join("state.json"), &state)?;
             println!(

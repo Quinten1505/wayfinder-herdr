@@ -92,7 +92,7 @@ fn reconcile(dir: &Path, state: &mut State) -> Result<String> {
         .workers
         .runs
         .iter()
-        .filter(|r| r.status.reserves_capacity())
+        .filter(|r| r.reserves_capacity())
         .count();
     Ok(format!(
         "Host and GitHub reconciled; {active}/{} worker slots reserved",
@@ -226,6 +226,9 @@ fn new_run(state: &mut State, request: NewRun<'_>) {
         foreground_process: None,
         result_evidence: None,
         initial_prompt_pending: false,
+        initial_prompt_acknowledged: false,
+        initial_prompt_reconnect_pending: false,
+        known_prelaunch_failure: false,
     });
 }
 
@@ -251,6 +254,7 @@ fn reconcile_workers(
                     | WorkerStatus::StopRequested
             ) || (r.status == WorkerStatus::NeedsHuman
                 && r.human_request_kind == Some(crate::store::HumanRequestKind::HerdrBlockedUi))
+                || (r.status == WorkerStatus::Uncertain && r.initial_prompt_reconnect_pending)
         })
         .map(|r| r.id.clone())
         .collect();
@@ -297,7 +301,7 @@ fn reconcile_workers(
             }
         };
         if let Err(error) = crate::herdr::verify_worker_identity(&info, &run) {
-            if !run.initial_prompt_pending {
+            if !run.initial_prompt_pending && !run.initial_prompt_acknowledged {
                 state.workers.runs[i].status = WorkerStatus::Uncertain;
                 state.workers.runs[i].question = Some(format!(
                     "The pane no longer proves this run's terminal and agent-session identity; no further effect was sent and capacity remains reserved: {error:#}"
@@ -309,7 +313,7 @@ fn reconcile_workers(
             {
                 state.workers.runs[i].status = WorkerStatus::Uncertain;
                 state.workers.runs[i].question = Some(format!(
-                    "The initial task prompt is pending, but pane and terminal identity could not be verified: {process_error:#}"
+                    "The worker's process identity could not be verified, so no further effect was sent: {process_error:#}"
                 ));
                 save(dir, state)?;
                 continue;
@@ -333,6 +337,32 @@ fn reconcile_workers(
             ));
             save(dir, state)?;
             continue;
+        }
+        if run.initial_prompt_acknowledged && run.agent_session.is_none() {
+            match crate::herdr::capture_agent_identity(&info, &run) {
+                Ok((_, _, Some(session))) => {
+                    state.workers.runs[i].agent_session = Some(session);
+                    state.workers.runs[i].initial_prompt_acknowledged = false;
+                    save(dir, state)?;
+                }
+                Ok((_, _, None)) => {}
+                Err(error) => {
+                    state.workers.runs[i].status = WorkerStatus::Uncertain;
+                    state.workers.runs[i].question = Some(format!(
+                        "The acknowledged task prompt is retained, but Herdr could not bind its session identity: {error:#}"
+                    ));
+                    save(dir, state)?;
+                    continue;
+                }
+            }
+        }
+        if run.status == WorkerStatus::Uncertain && run.initial_prompt_reconnect_pending {
+            state.workers.runs[i].status = WorkerStatus::Running;
+            state.workers.runs[i].question = None;
+        }
+        if run.initial_prompt_reconnect_pending {
+            state.workers.runs[i].initial_prompt_reconnect_pending = false;
+            save(dir, state)?;
         }
         match status(&info).unwrap_or("unknown") {
             "working" => {
@@ -841,13 +871,6 @@ fn launch_queued(
     for id in intents {
         launch_one(dir, state, map, github, herdr, &id)?;
     }
-    let reserved = state
-        .workers
-        .runs
-        .iter()
-        .filter(|r| r.status.reserves_capacity())
-        .count();
-    let capacity = (state.concurrency as usize).saturating_sub(reserved);
     let mut queued: Vec<_> = state
         .workers
         .runs
@@ -859,7 +882,16 @@ fn launch_queued(
         let r = state.workers.runs.iter().find(|r| &r.id == id).unwrap();
         (if r.role == "reviewer" { 0 } else { 1 }, r.ticket)
     });
-    for id in queued.into_iter().take(capacity) {
+    for id in queued {
+        let reserved = state
+            .workers
+            .runs
+            .iter()
+            .filter(|run| run.reserves_capacity())
+            .count();
+        if reserved >= state.concurrency as usize {
+            break;
+        }
         let i = state.workers.runs.iter().position(|r| r.id == id).unwrap();
         state.workers.runs[i].status = WorkerStatus::LaunchIntent;
         save(dir, state)?;
@@ -919,6 +951,7 @@ fn launch_one(
         {
             state.workers.runs[i].status = WorkerStatus::NeedsHuman;
             state.workers.runs[i].claim_login = run.claim_login;
+            state.workers.runs[i].known_prelaunch_failure = true;
             state.workers.runs[i].question = Some(format!(
                 "Detached checkout creation failed without producing the requested worktree: {error:#}. Fix the local Git/setup error, then retry explicitly with `retry-worker --confirmed-absent-or-stopped`."
             ));
@@ -945,6 +978,7 @@ fn launch_one(
             }
             Ok(None) => {
                 state.workers.runs[i].status = WorkerStatus::NeedsHuman;
+                state.workers.runs[i].known_prelaunch_failure = true;
                 state.workers.runs[i].question = Some(format!(
                     "Herdr refused to open this checkout. Trust was not changed. Address the reported host-side requirement, then retry explicitly with `retry-worker --confirmed-absent-or-stopped`: {error:#}"
                 ));
@@ -1115,18 +1149,17 @@ fn submit_initial_task_prompt(
     // Herdr acknowledged this exact initial submission. From this point onward
     // a restart must not treat the still-empty result file as task completion.
     state.workers.runs[i].initial_prompt_pending = false;
+    state.workers.runs[i].initial_prompt_acknowledged = true;
+    state.workers.runs[i].initial_prompt_reconnect_pending = true;
+    state.workers.runs[i].status = WorkerStatus::Running;
+    state.workers.runs[i].last_activity_ms = Some(now_ms());
     save(dir, state)?;
     let current = state.workers.runs[i].clone();
     let observed = match herdr
         .agent(pane)
         .and_then(|info| crate::herdr::capture_agent_identity(&info, &current))
     {
-        Ok((terminal, provider, Some(session))) => (terminal, provider, session),
-        Ok((_, _, None)) => {
-            state.workers.runs[i].status = WorkerStatus::Uncertain;
-            state.workers.runs[i].question = Some("Herdr acknowledged the initial prompt but did not expose an agent-session identity; it was not repeated.".into());
-            return save(dir, state);
-        }
+        Ok((terminal, provider, session)) => (terminal, provider, session),
         Err(error) => {
             state.workers.runs[i].status = WorkerStatus::Uncertain;
             state.workers.runs[i].question = Some(format!(
@@ -1158,7 +1191,9 @@ fn submit_initial_task_prompt(
     worker.last_activity_ms = Some(now_ms());
     worker.terminal_id = Some(observed.0);
     worker.agent_provider = observed.1;
-    worker.agent_session = Some(observed.2);
+    worker.agent_session = observed.2;
+    worker.initial_prompt_acknowledged = worker.agent_session.is_none();
+    worker.initial_prompt_reconnect_pending = false;
     worker.foreground_process = Some(process);
     worker.question = None;
     worker.human_request_id = None;
