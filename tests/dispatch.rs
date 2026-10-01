@@ -903,7 +903,7 @@ fn trust_failure_is_visible_and_does_not_change_repository_trust_or_retry_open()
     f.herdr_state.lock().unwrap().fail_open_without_resource = true;
     f.apply(RequestKind::Start);
     let state = f.state();
-    assert_eq!(state.workers.runs[0].status, WorkerStatus::Failed);
+    assert_eq!(state.workers.runs[0].status, WorkerStatus::NeedsHuman);
     assert!(
         state.workers.runs[0]
             .question
@@ -911,6 +911,23 @@ fn trust_failure_is_visible_and_does_not_change_repository_trust_or_retry_open()
             .unwrap()
             .contains("repository trust approval required")
     );
+    assert!(
+        state.workers.runs[0]
+            .question
+            .as_deref()
+            .unwrap()
+            .contains("retry-worker --confirmed-absent-or-stopped")
+    );
+    let repository = state.binding.repository.clone();
+    let worktree = state.workers.runs[0].worktree.clone();
+    for _ in 0..3 {
+        success(f.once());
+    }
+    let repeated = f.state();
+    assert_eq!(repeated.workers.runs.len(), 1);
+    assert_eq!(repeated.workers.runs[0].status, WorkerStatus::NeedsHuman);
+    let worktree_list = git(&repository, &["worktree", "list", "--porcelain"]);
+    assert_eq!(worktree_list.matches(worktree.to_str().unwrap()).count(), 1);
     let records = f.herdr_state.lock().unwrap();
     assert_eq!(
         records
@@ -919,6 +936,46 @@ fn trust_failure_is_visible_and_does_not_change_repository_trust_or_retry_open()
             .filter(|r| r["method"] == "worktree.open")
             .count(),
         1
+    );
+    assert_eq!(records.opened_worktrees.len(), 0);
+    assert!(
+        records
+            .requests
+            .iter()
+            .filter(|r| r["method"] == "worktree.open")
+            .all(|r| r["params"]["trust_repository"] != true)
+    );
+}
+
+#[test]
+fn refused_git_detached_checkout_is_held_for_explicit_human_retry() {
+    let f = Fixture::new();
+    let repository = f.state().binding.repository;
+    fs::remove_dir_all(repository.join(".git")).unwrap();
+    success(f.once());
+    f.apply(RequestKind::Start);
+    for _ in 0..3 {
+        success(f.once());
+    }
+    let state = f.state();
+    assert_eq!(state.workers.runs.len(), 1);
+    assert_eq!(state.workers.runs[0].status, WorkerStatus::NeedsHuman);
+    assert!(state.workers.runs[0].status.reserves_capacity());
+    assert!(
+        state.workers.runs[0]
+            .question
+            .as_deref()
+            .unwrap()
+            .contains("retry-worker --confirmed-absent-or-stopped")
+    );
+    assert!(!state.workers.runs[0].worktree.exists());
+    assert!(
+        f.herdr_state
+            .lock()
+            .unwrap()
+            .requests
+            .iter()
+            .all(|r| r["method"] != "worktree.open")
     );
 }
 

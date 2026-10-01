@@ -895,10 +895,10 @@ fn launch_one(
         if !run.worktree.exists()
             || validate_detached_worktree(&state.binding.repository, &run.worktree).is_err()
         {
-            state.workers.runs[i].status = WorkerStatus::Failed;
+            state.workers.runs[i].status = WorkerStatus::NeedsHuman;
             state.workers.runs[i].claim_login = run.claim_login;
             state.workers.runs[i].question = Some(format!(
-                "Detached checkout creation failed without producing the requested worktree: {error:#}"
+                "Detached checkout creation failed without producing the requested worktree: {error:#}. Fix the local Git/setup error, then retry explicitly with `retry-worker --confirmed-absent-or-stopped`."
             ));
             return save(dir, state);
         }
@@ -922,9 +922,9 @@ fn launch_one(
                 Value::Null
             }
             Ok(None) => {
-                state.workers.runs[i].status = WorkerStatus::Failed;
+                state.workers.runs[i].status = WorkerStatus::NeedsHuman;
                 state.workers.runs[i].question = Some(format!(
-                    "Herdr refused to open this checkout. Trust was not changed; after addressing the host trust requirement a human may explicitly retry: {error:#}"
+                    "Herdr refused to open this checkout. Trust was not changed. Address the reported host-side requirement, then retry explicitly with `retry-worker --confirmed-absent-or-stopped`: {error:#}"
                 ));
                 return save(dir, state);
             }
