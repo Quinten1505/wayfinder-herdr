@@ -217,7 +217,7 @@ pub fn attach(
             concurrency: 3,
             reconciled: false,
             suspension:
-                "First attachment: explicit Start required; tracker reconciliation not implemented"
+                "First attachment: explicit Start required; GitHub tracker reads begin with runtime reconciliation"
                     .into(),
             history: vec![],
         };

@@ -4,12 +4,13 @@ use std::{env, fs, path::PathBuf, process::Command};
 use wayfinder_herdr::{
     runtime,
     store::{self, Binding, RequestKind},
+    tracker::{self, MapRef, TicketInput},
 };
 
 #[derive(Parser)]
 #[command(
     version,
-    about = "Wayfinder local runtime foundation (dispatch not implemented)"
+    about = "Wayfinder GitHub map workflow and local runtime (worker dispatch not implemented)"
 )]
 struct Cli {
     /// Stable durable root. Defaults to $XDG_STATE_HOME/wayfinder-herdr.
@@ -70,6 +71,70 @@ enum CommandName {
         #[arg(value_parser = ["start", "pause", "resume", "status"])]
         name: String,
     },
+    /// GitHub Issues map and ticket operations.
+    Tracker {
+        #[command(subcommand)]
+        command: TrackerCommand,
+    },
+}
+#[derive(Subcommand)]
+enum TrackerCommand {
+    /// Create a map in planning mode; opt in to execution with --execution-override.
+    CreateMap {
+        #[arg(long)]
+        repository: String,
+        #[arg(long)]
+        title: String,
+        #[arg(long, default_value = "")]
+        notes: String,
+        #[arg(long)]
+        execution_override: bool,
+    },
+    /// Create and attach a decision or task ticket under a map.
+    CreateTicket {
+        #[arg(long)]
+        map: String,
+        #[arg(long)]
+        title: String,
+        #[arg(long, default_value = "")]
+        body: String,
+        #[arg(long, default_value = "wayfinder:task")]
+        label: String,
+    },
+    /// Show ready, open, unclaimed child tickets in native map order.
+    Frontier {
+        #[arg(long)]
+        map: String,
+    },
+    /// Add a native blocking dependency between map tickets.
+    Block {
+        #[arg(long)]
+        map: String,
+        #[arg(long)]
+        ticket: u64,
+        #[arg(long)]
+        by: u64,
+    },
+    /// Claim a child ticket by assigning it to a GitHub user.
+    Claim {
+        #[arg(long)]
+        map: String,
+        #[arg(long)]
+        ticket: u64,
+        #[arg(long, default_value = "@me")]
+        assignee: String,
+    },
+    /// Record an orchestrator resolution and update the map and spec index.
+    Resolve {
+        #[arg(long)]
+        map: String,
+        #[arg(long)]
+        ticket: u64,
+        #[arg(long)]
+        resolution: String,
+        #[arg(long, default_value_t = 10)]
+        spec: u64,
+    },
 }
 fn root(explicit: Option<PathBuf>) -> Result<PathBuf> {
     let root = match explicit {
@@ -107,6 +172,23 @@ fn request(root: &std::path::Path, map: &str, kind: RequestKind) -> Result<()> {
         "Request {id} durably queued. The runtime applies it; inspect status for the outcome."
     );
     Ok(())
+}
+fn tracker_context(root: &std::path::Path, value: &str) -> Result<(MapRef, PathBuf)> {
+    let map = MapRef::parse(value)?;
+    let (_, key) = store::map_identity(value)?;
+    let dir = store::map_dir(root, &key)?;
+    let state = store::read_state(&dir).context("attach this map before tracker mutations")?;
+    let canonical = format!(
+        "{}/{}#{}",
+        map.owner.to_ascii_lowercase(),
+        map.repository.to_ascii_lowercase(),
+        map.number
+    );
+    ensure!(
+        state.map == canonical,
+        "requested map is not attached to this state directory"
+    );
+    Ok((map, dir))
 }
 fn main() {
     if let Err(error) = run() {
@@ -227,6 +309,78 @@ fn run() -> Result<()> {
                         _ => RequestKind::Resume,
                     },
                 )?;
+            }
+        }
+        CommandName::Tracker { command } => {
+            let github = tracker::GitHub::default();
+            match command {
+                TrackerCommand::CreateMap {
+                    repository,
+                    title,
+                    notes,
+                    execution_override,
+                } => {
+                    let (owner, repo) = repository
+                        .split_once('/')
+                        .context("repository must use OWNER/REPOSITORY")?;
+                    let issue = github.create_map(
+                        owner,
+                        repo,
+                        &title,
+                        &notes,
+                        execution_override,
+                        &root,
+                    )?;
+                    println!(
+                        "Created map: {}",
+                        issue["html_url"].as_str().unwrap_or("GitHub issue created")
+                    );
+                }
+                TrackerCommand::CreateTicket {
+                    map,
+                    title,
+                    body,
+                    label,
+                } => {
+                    let (map, dir) = tracker_context(&root, &map)?;
+                    let issue =
+                        github.create_ticket(&map, &TicketInput { title, body, label }, &dir)?;
+                    println!(
+                        "Created ticket: {}",
+                        issue["html_url"].as_str().unwrap_or("GitHub issue created")
+                    );
+                }
+                TrackerCommand::Frontier { map } => {
+                    let map = MapRef::parse(&map)?;
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&github.reconcile(&map)?)?
+                    );
+                }
+                TrackerCommand::Block { map, ticket, by } => {
+                    let (map, dir) = tracker_context(&root, &map)?;
+                    github.add_dependency(&map, ticket, by, &dir)?;
+                    println!("Added native dependency: #{ticket} blocked by #{by}");
+                }
+                TrackerCommand::Claim {
+                    map,
+                    ticket,
+                    assignee,
+                } => {
+                    let (map, dir) = tracker_context(&root, &map)?;
+                    let login = github.claim(&map, ticket, Some(&assignee), &dir)?;
+                    println!("Claimed #{ticket} as @{login}");
+                }
+                TrackerCommand::Resolve {
+                    map,
+                    ticket,
+                    resolution,
+                    spec,
+                } => {
+                    let (map, dir) = tracker_context(&root, &map)?;
+                    github.resolve(&map, ticket, &resolution, spec, &dir)?;
+                    println!("Recorded resolution for #{ticket}; map and spec indexes updated.");
+                }
             }
         }
     }

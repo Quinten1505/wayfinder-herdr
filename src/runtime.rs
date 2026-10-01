@@ -23,11 +23,19 @@ pub fn serve(root: &Path, key: &str, once: bool) -> Result<()> {
             let before = state.history.len();
             store::process_requests(&dir, &mut state)?;
             if before != state.history.len() || Instant::now() >= next_check {
-                let result = host::check(&state.binding);
+                let result = host::check(&state.binding).and_then(|()| {
+                    let map = crate::tracker::MapRef::parse(&state.map)?;
+                    let frontier = crate::tracker::GitHub::default().reconcile(&map)?;
+                    let tracker_dir = dir.join("tracker");
+                    std::fs::create_dir_all(&tracker_dir)?;
+                    store::atomic_json(&tracker_dir.join("frontier.json"), &frontier)?;
+                    Ok(())
+                });
                 let suspension = match result {
                     Ok(()) => {
                         failures = 0;
-                        "Tracker/worker reconciliation not implemented; dispatch unavailable in foundation".to_owned()
+                        "GitHub tracker reconciled; worker dispatch not implemented in this release"
+                            .to_owned()
                     }
                     Err(error) => {
                         failures = failures.saturating_add(1);
