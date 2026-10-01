@@ -209,6 +209,12 @@ fn new_run(state: &mut State, request: NewRun<'_>) {
         question: None,
         human_response: None,
         human_decision: None,
+        human_request_seq: 0,
+        human_request_id: None,
+        human_request_kind: None,
+        human_request_fingerprint: None,
+        answer_request_id: None,
+        answer_request_kind: None,
         source_run,
         claim_login: None,
         context,
@@ -315,8 +321,26 @@ fn reconcile_workers(
                 save(dir, state)?;
             }
             "blocked" => {
-                state.workers.runs[i].status = WorkerStatus::NeedsHuman;
-                state.workers.runs[i].question = herdr.read_recent(pane).ok().and_then(|v| v["read"]["text"].as_str().map(str::to_owned)).or_else(|| Some("Worker is blocked; inspect the owned Herdr pane for its actual question.".into()));
+                match herdr
+                    .read_recent(pane)
+                    .ok()
+                    .and_then(|v| v["read"]["text"].as_str().map(str::to_owned))
+                    .filter(|text| !text.trim().is_empty())
+                {
+                    Some(question) => {
+                        let worker = &mut state.workers.runs[i];
+                        worker.status = WorkerStatus::NeedsHuman;
+                        worker.set_human_request(
+                            crate::store::HumanRequestKind::HerdrBlockedUi,
+                            &question,
+                        );
+                        worker.question = Some(question);
+                    }
+                    None => {
+                        state.workers.runs[i].status = WorkerStatus::Uncertain;
+                        state.workers.runs[i].question = Some("Herdr reports a blocked worker but its exact prompt could not be read; capacity remains reserved and no answer can be correlated safely.".into());
+                    }
+                }
                 save(dir, state)?;
             }
             "idle" | "done" => {
@@ -601,8 +625,13 @@ fn accept_result(
     result: WorkerResult,
 ) -> Result<()> {
     if result.status == "blocked" {
+        let question = result
+            .question
+            .context("blocked worker result omitted its question")?;
         state.workers.runs[i].status = WorkerStatus::NeedsHuman;
-        state.workers.runs[i].question = result.question;
+        state.workers.runs[i]
+            .set_human_request(crate::store::HumanRequestKind::WorkerQuestion, &question);
+        state.workers.runs[i].question = Some(question);
         state.workers.runs[i].summary = Some(result.summary);
         return save(dir, state);
     }

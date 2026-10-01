@@ -4,7 +4,9 @@ use std::{env, fs, path::PathBuf, process::Command};
 use wayfinder_herdr::{
     herdr::Client,
     runtime,
-    store::{self, Binding, Lock, Provider, RequestKind, WorkerRun, WorkerStatus},
+    store::{
+        self, Binding, HumanRequestKind, Lock, Provider, RequestKind, WorkerRun, WorkerStatus,
+    },
     tracker::{self, MapRef, TicketInput},
 };
 
@@ -87,6 +89,12 @@ enum CommandName {
         map: String,
         #[arg(long)]
         run: String,
+        /// Exact pending request ID shown by status.
+        #[arg(long)]
+        request_id: String,
+        /// Request source: worker_question or herdr_blocked_ui.
+        #[arg(long, value_parser = ["worker_question", "herdr_blocked_ui"])]
+        request_type: String,
         #[arg(long)]
         response: String,
     },
@@ -434,7 +442,13 @@ fn run() -> Result<()> {
                 }
             }
         }
-        CommandName::AnswerWorker { map, run, response } => {
+        CommandName::AnswerWorker {
+            map,
+            run,
+            request_id,
+            request_type,
+            response,
+        } => {
             ensure!(
                 !response.trim().is_empty(),
                 "human response cannot be empty"
@@ -453,25 +467,86 @@ fn run() -> Result<()> {
                 "worker has no pending human question"
             );
             let worker = state.workers.runs[index].clone();
+            let request_kind = match request_type.as_str() {
+                "worker_question" => HumanRequestKind::WorkerQuestion,
+                "herdr_blocked_ui" => HumanRequestKind::HerdrBlockedUi,
+                _ => unreachable!("clap validates the request type"),
+            };
+            ensure!(
+                worker.human_request_id.as_deref() == Some(request_id.as_str())
+                    && worker.human_request_kind == Some(request_kind),
+                "human request ID/type is stale or does not match this worker"
+            );
             let pane = worker
                 .pane_id
                 .clone()
                 .context("blocked worker has no owned pane")?;
             let herdr = Client::new(&state.binding.socket);
-            if let Err(error) = wayfinder_herdr::herdr::inspect_worker(&herdr, &worker) {
-                state.workers.runs[index].status = WorkerStatus::Uncertain;
-                state.workers.runs[index].question = Some(format!(
-                    "Worker identity/process continuity could not be verified; human response was not submitted: {error:#}"
-                ));
+            let agent = match wayfinder_herdr::herdr::inspect_worker(&herdr, &worker) {
+                Ok(agent) => agent,
+                Err(error) => {
+                    state.workers.runs[index].status = WorkerStatus::Uncertain;
+                    state.workers.runs[index].question = Some(format!(
+                        "Worker identity/process continuity could not be verified; human response was not submitted: {error:#}"
+                    ));
+                    store::atomic_json(&dir.join("state.json"), &state)?;
+                    anyhow::bail!(
+                        "worker identity could not be verified; response was not submitted: {error:#}"
+                    );
+                }
+            };
+            let agent_status = agent["agent"]["agent_status"].as_str().unwrap_or("unknown");
+            if request_kind == HumanRequestKind::HerdrBlockedUi {
+                ensure!(
+                    agent_status == "blocked",
+                    "the correlated Herdr blocked UI is no longer active"
+                );
+                let current = herdr.read_recent(&pane)?["read"]["text"]
+                    .as_str()
+                    .context("Herdr omitted the current blocked prompt text")?
+                    .to_owned();
+                if store::human_request_fingerprint(&current)
+                    != worker
+                        .human_request_fingerprint
+                        .as_deref()
+                        .unwrap_or_default()
+                {
+                    let pending = &mut state.workers.runs[index];
+                    pending.set_human_request(HumanRequestKind::HerdrBlockedUi, &current);
+                    pending.question = Some(current);
+                    store::atomic_json(&dir.join("state.json"), &state)?;
+                    anyhow::bail!(
+                        "the blocked Herdr prompt changed; review the updated prompt and use its new request ID/type"
+                    );
+                }
+            } else if agent_status == "blocked" {
+                let current = herdr.read_recent(&pane)?["read"]["text"]
+                    .as_str()
+                    .context("Herdr omitted the current blocked prompt text")?
+                    .to_owned();
+                let pending = &mut state.workers.runs[index];
+                pending.set_human_request(HumanRequestKind::HerdrBlockedUi, &current);
+                pending.question = Some(current);
                 store::atomic_json(&dir.join("state.json"), &state)?;
                 anyhow::bail!(
-                    "worker identity could not be verified; response was not submitted: {error:#}"
+                    "worker entered a Herdr blocked UI; no answer was submitted. Review the current prompt and use its new request ID/type"
+                );
+            } else {
+                ensure!(
+                    matches!(agent_status, "idle" | "done"),
+                    "worker question can only be answered while its exact worker is idle or done"
                 );
             }
             state.workers.runs[index].human_response = Some(response.clone());
+            state.workers.runs[index].answer_request_id = Some(request_id.clone());
+            state.workers.runs[index].answer_request_kind = Some(request_kind);
             state.workers.runs[index].status = WorkerStatus::AnswerIntent;
             store::atomic_json(&dir.join("state.json"), &state)?;
-            match herdr.prompt(&pane, &response) {
+            let delivery = match request_kind {
+                HumanRequestKind::WorkerQuestion => herdr.prompt(&pane, &response),
+                HumanRequestKind::HerdrBlockedUi => herdr.answer_blocked_ui(&pane, &response),
+            };
+            match delivery {
                 Ok(_) => {
                     let observed = wayfinder_herdr::herdr::inspect_worker(&herdr, &worker);
                     if let Err(error) = observed {
@@ -493,8 +568,30 @@ fn run() -> Result<()> {
                     );
                     worker.question = None;
                     worker.human_decision = Some("human response submitted".into());
+                    worker.human_request_id = None;
+                    worker.human_request_kind = None;
+                    worker.human_request_fingerprint = None;
                     store::atomic_json(&dir.join("state.json"), &state)?;
                     println!("Human response submitted to owned pane {pane}.");
+                }
+                Err(error)
+                    if request_kind == HumanRequestKind::WorkerQuestion
+                        && error
+                            .downcast_ref::<wayfinder_herdr::herdr::HerdrApiError>()
+                            .is_some_and(
+                                wayfinder_herdr::herdr::HerdrApiError::is_agent_blocked,
+                            ) =>
+                {
+                    let question = herdr.read_recent(&pane)?["read"]["text"]
+                        .as_str().context("Herdr rejected the worker prompt as blocked and omitted its current prompt")?.to_owned();
+                    let worker = &mut state.workers.runs[index];
+                    worker.status = WorkerStatus::NeedsHuman;
+                    worker.set_human_request(HumanRequestKind::HerdrBlockedUi, &question);
+                    worker.question = Some(question);
+                    store::atomic_json(&dir.join("state.json"), &state)?;
+                    anyhow::bail!(
+                        "Herdr confirmed the prompt was rejected before input; no answer was submitted. Review the current prompt and use its new request ID/type"
+                    );
                 }
                 Err(error) => {
                     let worker = &mut state.workers.runs[index];
@@ -563,6 +660,8 @@ fn run() -> Result<()> {
                 status: WorkerStatus::Queued, worktree, workspace_id: None, tab_id: None, pane_id: None,
                 base_commit: prior.result_commit.clone().or(prior.base_commit.clone()), result_commit: None,
                 summary: None, question: None, human_response: None, human_decision: None,
+                human_request_seq: 0, human_request_id: None, human_request_kind: None,
+                human_request_fingerprint: None, answer_request_id: None, answer_request_kind: None,
                 source_run: Some(prior.id), claim_login: prior.claim_login, context: Some("Human explicitly authorized this retry after the preceding worker was confirmed stopped or absent.".into()), last_activity_ms: None, terminal_id: None, agent_provider: None, agent_session: None, foreground_process: None, result_evidence: None,
             });
             store::atomic_json(&dir.join("state.json"), &state)?;

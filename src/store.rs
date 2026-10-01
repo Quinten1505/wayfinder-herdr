@@ -129,6 +129,21 @@ pub struct WorkerRun {
     pub human_response: Option<String>,
     #[serde(default)]
     pub human_decision: Option<String>,
+    /// Current human request identity. Answers must name both this ID and kind.
+    #[serde(default)]
+    pub human_request_seq: u32,
+    #[serde(default)]
+    pub human_request_id: Option<String>,
+    #[serde(default)]
+    pub human_request_kind: Option<HumanRequestKind>,
+    /// Fingerprint of the exact blocked prompt snapshot, when Herdr supplied it.
+    #[serde(default)]
+    pub human_request_fingerprint: Option<String>,
+    /// Correlation retained for an answer attempt, including ambiguous delivery.
+    #[serde(default)]
+    pub answer_request_id: Option<String>,
+    #[serde(default)]
+    pub answer_request_kind: Option<HumanRequestKind>,
     #[serde(default)]
     pub source_run: Option<String>,
     #[serde(default)]
@@ -152,6 +167,45 @@ pub struct WorkerRun {
     /// Durable output copy outside the source checkout.
     #[serde(default)]
     pub result_evidence: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HumanRequestKind {
+    WorkerQuestion,
+    HerdrBlockedUi,
+}
+
+impl HumanRequestKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::WorkerQuestion => "worker_question",
+            Self::HerdrBlockedUi => "herdr_blocked_ui",
+        }
+    }
+}
+
+impl WorkerRun {
+    /// Keep a stable correlation while the same request remains pending; create a
+    /// fresh ID when the request source or its exact blocked UI snapshot changes.
+    pub fn set_human_request(&mut self, kind: HumanRequestKind, content: &str) {
+        let fingerprint = human_request_fingerprint(content);
+        if self.human_request_kind == Some(kind)
+            && self.human_request_fingerprint.as_deref() == Some(&fingerprint)
+            && self.human_request_id.is_some()
+        {
+            return;
+        }
+        self.human_request_seq = self.human_request_seq.saturating_add(1);
+        self.human_request_id = Some(format!("human-{}-{:04}", self.id, self.human_request_seq));
+        self.human_request_kind = Some(kind);
+        self.human_request_fingerprint = Some(fingerprint);
+    }
+}
+
+pub fn human_request_fingerprint(content: &str) -> String {
+    use sha2::{Digest, Sha256};
+    format!("{:x}", Sha256::digest(content.as_bytes()))
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

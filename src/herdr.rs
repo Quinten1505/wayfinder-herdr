@@ -1,6 +1,7 @@
 //! Small, explicitly-targeted client for the installed Herdr socket API.
-use anyhow::{Context, Result, bail, ensure};
+use anyhow::{Context, Result, ensure};
 use serde_json::{Value, json};
+use std::fmt;
 use std::{
     io::{BufRead, BufReader, Read, Write},
     os::unix::net::UnixStream,
@@ -13,6 +14,31 @@ use std::{
 use crate::store::{AgentSessionIdentity, LinuxProcessIdentity, WorkerRun};
 
 static REQUEST_ID: AtomicU64 = AtomicU64::new(1);
+
+#[derive(Debug)]
+pub struct HerdrApiError {
+    pub method: String,
+    pub code: String,
+    pub message: String,
+}
+
+impl fmt::Display for HerdrApiError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "herdr {} failed: {} ({})",
+            self.method, self.message, self.code
+        )
+    }
+}
+
+impl std::error::Error for HerdrApiError {}
+
+impl HerdrApiError {
+    pub fn is_agent_blocked(&self) -> bool {
+        self.method == "agent.prompt" && self.code == "agent_blocked"
+    }
+}
 
 #[derive(Clone)]
 pub struct Client {
@@ -220,11 +246,15 @@ impl Client {
             "herdr response ID did not match request"
         );
         if let Some(error) = response.get("error") {
-            bail!(
-                "herdr {method} failed: {} ({})",
-                error["message"],
-                error["code"]
-            );
+            return Err(HerdrApiError {
+                method: method.to_owned(),
+                code: error["code"].as_str().unwrap_or("unknown").to_owned(),
+                message: error["message"]
+                    .as_str()
+                    .unwrap_or("unknown error")
+                    .to_owned(),
+            }
+            .into());
         }
         response
             .get("result")
@@ -308,6 +338,16 @@ impl Client {
 
     pub fn pane_process_info(&self, pane_id: &str) -> Result<Value> {
         self.request("pane.process_info", json!({"pane_id":pane_id}))
+    }
+
+    /// Submit text to the explicitly-owned pane and press Enter as one Herdr
+    /// operation. This is used only after a correlated blocked UI snapshot has
+    /// been re-read and matched; agent.prompt rejects recognized blocked agents.
+    pub fn answer_blocked_ui(&self, pane_id: &str, text: &str) -> Result<Value> {
+        self.request(
+            "pane.send_input",
+            json!({"pane_id":pane_id,"text":text,"keys":["enter"]}),
+        )
     }
 
     pub fn read_recent(&self, pane_id: &str) -> Result<Value> {

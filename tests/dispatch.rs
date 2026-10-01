@@ -57,6 +57,10 @@ struct HerdrState {
     fail_open_without_resource: bool,
     ambiguous_start_response: bool,
     ambiguous_close_response: bool,
+    ambiguous_input_response: bool,
+    reject_next_prompt_as_blocked: bool,
+    changed_read: bool,
+    sent_inputs: Vec<(String, String, Vec<String>)>,
     opened_worktrees: Vec<OpenedWorktree>,
     agents: HashMap<String, Value>,
     sessions: HashMap<String, Value>,
@@ -293,7 +297,13 @@ fn handle_request(mut stream: std::os::unix::net::UnixStream, state: &Arc<Mutex<
         }
         "agent.prompt" => {
             let pane = request["params"]["target"].as_str().unwrap().to_owned();
-            if let Some(info) = state.agents.get(&pane) {
+            if state.agent_status == "blocked" || state.reject_next_prompt_as_blocked {
+                state.reject_next_prompt_as_blocked = false;
+                state.agent_status = "blocked".into();
+                error = Some(
+                    json!({"code":"agent_blocked","message":"recognized blocked agent rejects prompt before input"}),
+                );
+            } else if let Some(info) = state.agents.get(&pane) {
                 let mut updated = info.clone();
                 updated["agent_status"] = json!("working");
                 let pane = request["params"]["target"].as_str().unwrap();
@@ -336,8 +346,31 @@ fn handle_request(mut stream: std::os::unix::net::UnixStream, state: &Arc<Mutex<
             }
         }
         "agent.read" => {
-            result =
-                json!({"type":"pane_read","read":{"text":"Please ask the human to choose A or B."}})
+            let text = if state.changed_read {
+                "Approval required: allow running a shell command?"
+            } else {
+                "Question: Which option should I use, A or B?"
+            };
+            result = json!({"type":"pane_read","read":{"text":text}})
+        }
+        "pane.send_input" => {
+            let pane = request["params"]["pane_id"].as_str().unwrap().to_owned();
+            let text = request["params"]["text"].as_str().unwrap().to_owned();
+            let keys = request["params"]["keys"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|key| key.as_str().unwrap().to_owned())
+                .collect::<Vec<_>>();
+            state.sent_inputs.push((pane.clone(), text, keys));
+            state.agent_status = "working".into();
+            result = json!({"type":"pane_input_sent"});
+            if state.ambiguous_input_response {
+                state.ambiguous_input_response = false;
+                error = Some(
+                    json!({"code":"response_lost","message":"simulated lost pane.send_input response"}),
+                );
+            }
         }
         "pane.close" => {
             let pane = request["params"]["pane_id"].as_str().unwrap().to_owned();
@@ -467,6 +500,202 @@ fn cli_dispatch_creates_a_detached_ticket_worktree_and_uses_explicit_herdr_ids()
     assert!(!prompt.contains("wayfinder-herdr/issues/18"));
     assert!(prompt.contains("$HOME/.agents/skills/implement/SKILL.md"));
     assert!(prompt.contains("Do not invent, infer, or answer a human response"));
+}
+
+fn answer_cli(f: &Fixture, run: &WorkerRun, request_type: &str, response: &str) -> Output {
+    f.cli()
+        .args([
+            "answer-worker",
+            "--map",
+            MAP,
+            "--run",
+            &run.id,
+            "--request-id",
+            run.human_request_id.as_deref().unwrap(),
+            "--request-type",
+            request_type,
+            "--response",
+            response,
+        ])
+        .output()
+        .unwrap()
+}
+
+#[test]
+fn blocked_herdr_ui_uses_correlated_pane_input_not_rejected_agent_prompt() {
+    let f = Fixture::new();
+    f.apply(RequestKind::Start);
+    f.herdr_state.lock().unwrap().agent_status = "blocked".into();
+    success(f.once());
+    let pending = f.state().workers.runs[0].clone();
+    assert_eq!(pending.status, WorkerStatus::NeedsHuman);
+    assert_eq!(
+        pending.human_request_kind,
+        Some(store::HumanRequestKind::HerdrBlockedUi)
+    );
+
+    let stale = f
+        .cli()
+        .args([
+            "answer-worker",
+            "--map",
+            MAP,
+            "--run",
+            &pending.id,
+            "--request-id",
+            "old-request",
+            "--request-type",
+            "herdr_blocked_ui",
+            "--response",
+            "A",
+        ])
+        .output()
+        .unwrap();
+    assert!(!stale.status.success());
+    assert!(f.herdr_state.lock().unwrap().sent_inputs.is_empty());
+
+    success(answer_cli(&f, &pending, "herdr_blocked_ui", "A"));
+    let answered = f.state().workers.runs[0].clone();
+    assert_eq!(answered.status, WorkerStatus::Running);
+    assert_eq!(answered.human_response.as_deref(), Some("A"));
+    assert_eq!(answered.answer_request_id, pending.human_request_id);
+    let records = f.herdr_state.lock().unwrap();
+    assert_eq!(
+        records.sent_inputs,
+        [("pane-owned".into(), "A".into(), vec!["enter".into()])]
+    );
+    assert_eq!(
+        records
+            .requests
+            .iter()
+            .filter(|r| r["method"] == "agent.prompt")
+            .count(),
+        1,
+        "only the original worker launch prompt was sent"
+    );
+    assert_eq!(
+        records
+            .requests
+            .iter()
+            .filter(|r| r["method"] == "pane.send_input")
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn blocked_ui_changed_after_human_request_is_not_answered() {
+    let f = Fixture::new();
+    f.apply(RequestKind::Start);
+    f.herdr_state.lock().unwrap().agent_status = "blocked".into();
+    success(f.once());
+    let pending = f.state().workers.runs[0].clone();
+    // The fixture's visible text is changed after correlation. This must be
+    // refreshed into a distinct request before any answer can be delivered.
+    f.herdr_state.lock().unwrap().changed_read = true;
+    let denied = answer_cli(&f, &pending, "herdr_blocked_ui", "approve");
+    assert!(!denied.status.success());
+    assert!(f.herdr_state.lock().unwrap().sent_inputs.is_empty());
+    assert_eq!(f.state().workers.runs[0].status, WorkerStatus::NeedsHuman);
+    assert_ne!(
+        f.state().workers.runs[0].human_request_id,
+        pending.human_request_id
+    );
+    assert_eq!(
+        f.state().workers.runs[0].question.as_deref(),
+        Some("Approval required: allow running a shell command?")
+    );
+}
+
+#[test]
+fn blocked_ui_input_lost_response_remains_uncertain_and_is_not_repeated() {
+    let f = Fixture::new();
+    f.apply(RequestKind::Start);
+    f.herdr_state.lock().unwrap().agent_status = "blocked".into();
+    success(f.once());
+    let pending = f.state().workers.runs[0].clone();
+    f.herdr_state.lock().unwrap().ambiguous_input_response = true;
+    let failed = answer_cli(&f, &pending, "herdr_blocked_ui", "A");
+    assert!(!failed.status.success());
+    assert_eq!(f.state().workers.runs[0].status, WorkerStatus::Uncertain);
+    assert!(f.state().workers.runs[0].status.reserves_capacity());
+    success(f.once());
+    let records = f.herdr_state.lock().unwrap();
+    assert_eq!(records.sent_inputs.len(), 1);
+    assert_eq!(
+        records
+            .requests
+            .iter()
+            .filter(|r| r["method"] == "pane.send_input")
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn repeated_identical_blocked_prompt_gets_a_new_request_identity() {
+    let f = Fixture::new();
+    f.apply(RequestKind::Start);
+    f.herdr_state.lock().unwrap().agent_status = "blocked".into();
+    success(f.once());
+    let first = f.state().workers.runs[0].clone();
+    success(answer_cli(&f, &first, "herdr_blocked_ui", "A"));
+    assert!(f.state().workers.runs[0].human_request_id.is_none());
+
+    f.herdr_state.lock().unwrap().agent_status = "blocked".into();
+    success(f.once());
+    let second = f.state().workers.runs[0].clone();
+    assert_eq!(second.question, first.question);
+    assert_ne!(second.human_request_id, first.human_request_id);
+    let stale = answer_cli(&f, &first, "herdr_blocked_ui", "A");
+    assert!(!stale.status.success());
+    assert_eq!(f.herdr_state.lock().unwrap().sent_inputs.len(), 1);
+}
+
+#[test]
+fn agent_prompt_blocked_pre_effect_creates_fresh_request_without_uncertainty() {
+    let f = Fixture::new();
+    f.apply(RequestKind::Start);
+    let original = f.state().workers.runs[0].clone();
+    write_worker_result(
+        &original,
+        json!({
+            "format_version":1,
+            "run_id":original.id,
+            "ticket":original.ticket,
+            "role":original.role,
+            "status":"blocked",
+            "summary":"needs a human decision",
+            "question":"Which option should I use, A or B?"
+        }),
+    );
+    f.herdr_state.lock().unwrap().agent_status = "idle".into();
+    success(f.once());
+    let pending = f.state().workers.runs[0].clone();
+    assert_eq!(
+        pending.human_request_kind,
+        Some(store::HumanRequestKind::WorkerQuestion)
+    );
+    f.herdr_state.lock().unwrap().reject_next_prompt_as_blocked = true;
+    let rejected = answer_cli(&f, &pending, "worker_question", "A");
+    assert!(!rejected.status.success());
+    let refreshed = f.state().workers.runs[0].clone();
+    assert_eq!(refreshed.status, WorkerStatus::NeedsHuman);
+    assert_eq!(
+        refreshed.human_request_kind,
+        Some(store::HumanRequestKind::HerdrBlockedUi)
+    );
+    assert_ne!(refreshed.human_request_id, pending.human_request_id);
+    assert_eq!(refreshed.human_response.as_deref(), Some("A"));
+    assert_eq!(
+        f.herdr_state.lock().unwrap().sent_inputs.len(),
+        0,
+        "the rejected answer is never replayed into the blocked screen"
+    );
+
+    success(answer_cli(&f, &refreshed, "herdr_blocked_ui", "B"));
+    assert_eq!(f.state().workers.runs[0].status, WorkerStatus::Running);
+    assert_eq!(f.herdr_state.lock().unwrap().sent_inputs.len(), 1);
 }
 
 #[test]
@@ -642,6 +871,12 @@ fn cold_restored_or_replaced_agent_identity_becomes_uncertain_without_effects() 
             question: None,
             human_response: None,
             human_decision: None,
+            human_request_seq: 0,
+            human_request_id: None,
+            human_request_kind: None,
+            human_request_fingerprint: None,
+            answer_request_id: None,
+            answer_request_kind: None,
             source_run: None,
             claim_login: None,
             context: None,
@@ -1150,6 +1385,12 @@ fn insert_uncertain_run(f: &Fixture) -> WorkerRun {
         question: Some("launch outcome unknown".into()),
         human_response: None,
         human_decision: None,
+        human_request_seq: 0,
+        human_request_id: None,
+        human_request_kind: None,
+        human_request_fingerprint: None,
+        answer_request_id: None,
+        answer_request_kind: None,
         source_run: None,
         claim_login: Some("fixture-user".into()),
         context: None,
