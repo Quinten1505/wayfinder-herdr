@@ -927,8 +927,9 @@ fn launch_one(
         Ok(login) => login,
         Err(e) => {
             state.workers.runs[i].status = WorkerStatus::Uncertain;
+            state.workers.runs[i].known_prelaunch_failure = true;
             state.workers.runs[i].question = Some(format!(
-                "Claim outcome is uncertain; no worker launched: {e:#}"
+                "Claim outcome is uncertain; no worker launched and no worktree or pane was requested. Reconcile the retained GitHub claim before retrying: {e:#}"
             ));
             return save(dir, state);
         }
@@ -938,7 +939,8 @@ fn launch_one(
         if validate_detached_worktree(&state.binding.repository, &run.worktree).is_err() {
             state.workers.runs[i].status = WorkerStatus::Uncertain;
             state.workers.runs[i].claim_login = run.claim_login;
-            state.workers.runs[i].question=Some("A path exists at the intended location but does not identify this detached worktree; creation was not retried.".into());
+            state.workers.runs[i].known_prelaunch_failure = true;
+            state.workers.runs[i].question=Some("A path exists at the intended location but does not identify this detached worktree; no Herdr workspace or agent was requested and the existing path was retained. Reconcile the path before retrying.".into());
             return save(dir, state);
         }
     } else if let Err(error) = herdr.add_detached_worktree(
@@ -1038,10 +1040,20 @@ fn start_agent_from_ready(dir: &Path, state: &mut State, herdr: &Client, i: usiz
             return save(dir, state);
         }
     }
+    let provider = state.workers.providers.for_role(&run.role).clone();
+    let args = match provider_args(&provider) {
+        Ok(args) => args,
+        Err(error) => {
+            state.workers.runs[i].status = WorkerStatus::NeedsHuman;
+            state.workers.runs[i].known_prelaunch_failure = true;
+            state.workers.runs[i].question = Some(format!(
+                "Provider configuration prevented agent.start; the confirmed empty pane and worktree were retained. Fix the provider configuration, then retry explicitly with `retry-worker --confirmed-absent-or-stopped`: {error:#}"
+            ));
+            return save(dir, state);
+        }
+    };
     state.workers.runs[i].status = WorkerStatus::AgentIntent;
     save(dir, state)?;
-    let provider = state.workers.providers.for_role(&run.role).clone();
-    let args = provider_args(&provider)?;
     let started = match herdr.start_agent(
         &format!("wf-{}-{}", run.ticket, run.id),
         &provider.kind,

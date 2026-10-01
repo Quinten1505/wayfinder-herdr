@@ -26,7 +26,8 @@ with open(state_path) as f: state=json.load(f)
 def dump(value): print(json.dumps(value))
 def child(number=13):
     assigned=(state['assigned'] if number == 13 else number in state.get('assigned_tickets', []))
-    return {'id':number*100,'number':number,'title':f'Implement sample task {number}','body':'Implement the requested feature.','state':'open','assignees':([{'login':state['login']}] if assigned else []),'labels':[{'name':'wayfinder:task'}]}
+    label='wayfinder:task' if number == 13 else 'wayfinder:research'
+    return {'id':number*100,'number':number,'title':f'Implement sample task {number}','body':'Implement the requested feature.','state':'open','assignees':([{'login':state['login']}] if assigned else []),'labels':[{'name':label}]}
 def map_issue():
     return {'id':4200,'number':42,'title':'Map','body':'## Notes\n\nExecution override: selected by the user for this effort.','state':'open','assignees':[],'labels':[{'name':'wayfinder:map'}]}
 if path == 'user': dump({'login':state['login']})
@@ -42,6 +43,7 @@ elif '--method' in args:
     body=json.loads(sys.stdin.read() or '{}')
     if route.endswith('/assignees'):
         ticket=int(route.split('/')[-2])
+        state.setdefault('claim_attempts', []).append(ticket)
         is_assigned=body['assignees'][0] == state['login']
         if ticket == 13: state['assigned']=is_assigned
         else:
@@ -49,11 +51,25 @@ elif '--method' in args:
             if is_assigned and ticket not in tickets: tickets.append(ticket)
             if not is_assigned and ticket in tickets: tickets.remove(ticket)
         with open(state_path,'w') as f: json.dump(state,f)
+        if ticket in state.get('fail_claim_after_effect_tickets', []):
+            state['fail_issue_read_after_claim_ticket']=ticket
+            with open(state_path,'w') as f: json.dump(state,f)
+            sys.stderr.write('simulated lost GitHub claim response\n'); sys.exit(1)
         dump({'assignees':[{'login':state['login']}]})
     else: dump({})
 elif path.endswith('/issues/42'): dump(map_issue())
-elif path.endswith('/issues/13'): dump(child())
-elif path.endswith('/issues/14'): dump(child(14))
+elif path.endswith('/issues/13'):
+    if state.get('fail_issue_read_after_claim_ticket') == 13:
+        state['fail_issue_read_after_claim_ticket']=None
+        with open(state_path,'w') as f: json.dump(state,f)
+        sys.stderr.write('simulated unreadable post-claim issue\n'); sys.exit(1)
+    dump(child())
+elif path.endswith('/issues/14'):
+    if state.get('fail_issue_read_after_claim_ticket') == 14:
+        state['fail_issue_read_after_claim_ticket']=None
+        with open(state_path,'w') as f: json.dump(state,f)
+        sys.stderr.write('simulated unreadable post-claim issue\n'); sys.exit(1)
+    dump(child(14))
 else: sys.stderr.write('unhandled fake gh route: '+path+'\n'); sys.exit(2)
 "##;
 
@@ -132,7 +148,7 @@ impl Fixture {
         let gh_state = temp.path().join("gh-state.json");
         fs::write(
             &gh_state,
-            json!({"login":"fixture-user","assigned":false,"assigned_tickets":[],"second_ticket":false}).to_string(),
+            json!({"login":"fixture-user","assigned":false,"assigned_tickets":[],"second_ticket":false,"claim_attempts":[],"fail_claim_after_effect_tickets":[]}).to_string(),
         )
         .unwrap();
         let binary = temp.path().join("herdr");
@@ -1279,6 +1295,272 @@ fn definite_prelaunch_setup_failure_releases_capacity_for_an_independent_ticket(
             .count(),
         2,
         "the claimed setup failure was not automatically retried"
+    );
+}
+
+#[test]
+fn ambiguous_claim_failure_releases_agent_slot_but_keeps_claim_and_intent_held() {
+    let f = Fixture::new();
+    let mut github = serde_json::from_slice::<Value>(&fs::read(&f.gh_state).unwrap()).unwrap();
+    github["second_ticket"] = json!(true);
+    github["fail_claim_after_effect_tickets"] = json!([13]);
+    fs::write(&f.gh_state, serde_json::to_vec(&github).unwrap()).unwrap();
+
+    f.apply(RequestKind::Start);
+
+    let state = f.state();
+    let uncertain = state
+        .workers
+        .runs
+        .iter()
+        .find(|run| run.ticket == 13)
+        .unwrap();
+    let independent = state
+        .workers
+        .runs
+        .iter()
+        .find(|run| run.ticket == 14)
+        .unwrap();
+    assert_eq!(uncertain.status, WorkerStatus::Uncertain);
+    assert!(uncertain.known_prelaunch_failure);
+    assert!(!uncertain.reserves_capacity());
+    assert!(
+        uncertain
+            .question
+            .as_deref()
+            .unwrap()
+            .contains("Claim outcome is uncertain")
+    );
+    assert!(!uncertain.worktree.exists());
+    assert_eq!(independent.status, WorkerStatus::Running);
+
+    let github = serde_json::from_slice::<Value>(&fs::read(&f.gh_state).unwrap()).unwrap();
+    assert!(
+        github["assigned"].as_bool().unwrap(),
+        "the ambiguous GitHub claim is retained"
+    );
+    assert_eq!(
+        github["claim_attempts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|t| *t == 13)
+            .count(),
+        1
+    );
+
+    success(f.once());
+    let after = f.state();
+    assert_eq!(
+        after
+            .workers
+            .runs
+            .iter()
+            .find(|run| run.ticket == 13)
+            .unwrap()
+            .status,
+        WorkerStatus::Uncertain
+    );
+    assert_eq!(
+        serde_json::from_slice::<Value>(&fs::read(&f.gh_state).unwrap()).unwrap()["claim_attempts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|t| *t == 13)
+            .count(),
+        1,
+        "reconciliation does not retry an ambiguous claim"
+    );
+    let records = f.herdr_state.lock().unwrap();
+    assert_eq!(
+        records
+            .requests
+            .iter()
+            .filter(|r| r["method"] == "worktree.open")
+            .count(),
+        1
+    );
+    assert_eq!(
+        records
+            .requests
+            .iter()
+            .filter(|r| r["method"] == "agent.start")
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn invalid_preexisting_worktree_releases_slot_without_touching_the_path() {
+    let f = Fixture::new();
+    let mut github = serde_json::from_slice::<Value>(&fs::read(&f.gh_state).unwrap()).unwrap();
+    github["second_ticket"] = json!(true);
+    fs::write(&f.gh_state, serde_json::to_vec(&github).unwrap()).unwrap();
+    let repository = f.state().binding.repository;
+    let invalid = repository.parent().unwrap().join(".wayfinder-42-13-1");
+    fs::create_dir_all(&invalid).unwrap();
+    fs::write(invalid.join("human-data.txt"), "preserve me\n").unwrap();
+
+    f.apply(RequestKind::Start);
+
+    let state = f.state();
+    let held = state
+        .workers
+        .runs
+        .iter()
+        .find(|run| run.ticket == 13)
+        .unwrap();
+    let independent = state
+        .workers
+        .runs
+        .iter()
+        .find(|run| run.ticket == 14)
+        .unwrap();
+    assert_eq!(held.status, WorkerStatus::Uncertain);
+    assert!(held.known_prelaunch_failure);
+    assert!(!held.reserves_capacity());
+    assert!(held.claim_login.is_some());
+    assert!(
+        held.question
+            .as_deref()
+            .unwrap()
+            .contains("no Herdr workspace or agent was requested")
+    );
+    assert_eq!(independent.status, WorkerStatus::Running);
+    assert_eq!(
+        fs::read_to_string(invalid.join("human-data.txt")).unwrap(),
+        "preserve me\n"
+    );
+
+    let records = f.herdr_state.lock().unwrap();
+    assert_eq!(
+        records
+            .requests
+            .iter()
+            .filter(|r| r["method"] == "worktree.open")
+            .count(),
+        1
+    );
+    assert_eq!(
+        records
+            .requests
+            .iter()
+            .filter(|r| r["method"] == "agent.start")
+            .count(),
+        1
+    );
+    drop(records);
+
+    success(f.once());
+    let after = f.state();
+    assert_eq!(
+        after
+            .workers
+            .runs
+            .iter()
+            .find(|run| run.ticket == 13)
+            .unwrap()
+            .status,
+        WorkerStatus::Uncertain
+    );
+    assert_eq!(
+        fs::read_to_string(invalid.join("human-data.txt")).unwrap(),
+        "preserve me\n"
+    );
+    let records = f.herdr_state.lock().unwrap();
+    assert_eq!(
+        records
+            .requests
+            .iter()
+            .filter(|r| r["method"] == "worktree.open")
+            .count(),
+        1
+    );
+    assert_eq!(
+        records
+            .requests
+            .iter()
+            .filter(|r| r["method"] == "agent.start")
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn invalid_provider_arguments_are_known_prelaunch_and_release_capacity() {
+    let f = Fixture::new();
+    let mut github = serde_json::from_slice::<Value>(&fs::read(&f.gh_state).unwrap()).unwrap();
+    github["second_ticket"] = json!(true);
+    fs::write(&f.gh_state, serde_json::to_vec(&github).unwrap()).unwrap();
+    let configured = f
+        .cli()
+        .args([
+            "configure-worker",
+            "--map",
+            MAP,
+            "--role",
+            "implementer",
+            "--kind",
+            "codex",
+            "--model",
+            "",
+            "--concurrency",
+            "1",
+        ])
+        .output()
+        .unwrap();
+    success(configured);
+
+    f.apply(RequestKind::Start);
+
+    let state = f.state();
+    let held = state
+        .workers
+        .runs
+        .iter()
+        .find(|run| run.ticket == 13)
+        .unwrap();
+    let independent = state
+        .workers
+        .runs
+        .iter()
+        .find(|run| run.ticket == 14)
+        .unwrap();
+    assert_eq!(held.status, WorkerStatus::NeedsHuman);
+    assert!(held.known_prelaunch_failure);
+    assert!(!held.reserves_capacity());
+    assert!(held.claim_login.is_some());
+    assert!(
+        held.pane_id.is_some(),
+        "the verified empty pane remains retained"
+    );
+    assert!(
+        held.question
+            .as_deref()
+            .unwrap()
+            .contains("Provider configuration prevented agent.start")
+    );
+    assert_eq!(independent.status, WorkerStatus::Running);
+    let records = f.herdr_state.lock().unwrap();
+    assert_eq!(
+        records
+            .requests
+            .iter()
+            .filter(|r| r["method"] == "agent.start")
+            .count(),
+        1
+    );
+    drop(records);
+
+    success(f.once());
+    let records = f.herdr_state.lock().unwrap();
+    assert_eq!(
+        records
+            .requests
+            .iter()
+            .filter(|r| r["method"] == "agent.start")
+            .count(),
+        1
     );
 }
 
