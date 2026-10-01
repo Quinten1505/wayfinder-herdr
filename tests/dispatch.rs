@@ -1,5 +1,6 @@
 use serde_json::{Value, json};
 use std::{
+    collections::HashMap,
     fs,
     io::{BufRead, BufReader, Write},
     os::{unix::fs::PermissionsExt, unix::net::UnixListener},
@@ -54,8 +55,21 @@ struct HerdrState {
     agent_status: String,
     ambiguous_open_response: bool,
     fail_open_without_resource: bool,
-    opened: bool,
-    worktree_path: Option<String>,
+    ambiguous_start_response: bool,
+    ambiguous_close_response: bool,
+    opened_worktrees: Vec<OpenedWorktree>,
+    agents: HashMap<String, Value>,
+    sessions: HashMap<String, Value>,
+    closed_panes: Vec<String>,
+}
+
+#[derive(Clone)]
+struct OpenedWorktree {
+    path: String,
+    workspace: String,
+    tab: String,
+    pane: String,
+    terminal: String,
 }
 
 struct Server {
@@ -210,9 +224,32 @@ fn handle_request(mut stream: std::os::unix::net::UnixStream, state: &Arc<Mutex<
                     json!({"code":"untrusted_repository","message":"repository trust approval required"}),
                 );
             } else {
-                state.opened = true;
-                state.worktree_path = request["params"]["path"].as_str().map(str::to_owned);
-                result = json!({"type":"worktree_opened","already_open":false,"worktree":{"path":state.worktree_path},"workspace":{"workspace_id":"workspace-owned"},"tab":{"tab_id":"tab-owned"},"root_pane":{"pane_id":"pane-owned"}});
+                let n = state.opened_worktrees.len();
+                let tree = OpenedWorktree {
+                    path: request["params"]["path"].as_str().unwrap().to_owned(),
+                    workspace: if n == 0 {
+                        "workspace-owned".into()
+                    } else {
+                        format!("workspace-owned-{n}")
+                    },
+                    tab: if n == 0 {
+                        "tab-owned".into()
+                    } else {
+                        format!("tab-owned-{n}")
+                    },
+                    pane: if n == 0 {
+                        "pane-owned".into()
+                    } else {
+                        format!("pane-owned-{n}")
+                    },
+                    terminal: if n == 0 {
+                        "terminal-owned".into()
+                    } else {
+                        format!("terminal-owned-{n}")
+                    },
+                };
+                state.opened_worktrees.push(tree.clone());
+                result = json!({"type":"worktree_opened","already_open":false,"worktree":{"path":tree.path},"workspace":{"workspace_id":tree.workspace},"tab":{"tab_id":tree.tab},"root_pane":{"pane_id":tree.pane}});
                 if state.ambiguous_open_response {
                     error =
                         Some(json!({"code":"response_lost","message":"simulated lost response"}));
@@ -220,28 +257,97 @@ fn handle_request(mut stream: std::os::unix::net::UnixStream, state: &Arc<Mutex<
             }
         }
         "worktree.list" => {
-            let worktrees = if state.opened {
-                vec![json!({"path":state.worktree_path,"open_workspace_id":"workspace-owned"})]
-            } else {
-                vec![]
-            };
+            let worktrees = state
+                .opened_worktrees
+                .iter()
+                .map(|tree| json!({"path":tree.path,"open_workspace_id":tree.workspace}))
+                .collect::<Vec<_>>();
             result = json!({"type":"worktree_list","worktrees":worktrees,"source":{}});
         }
         "pane.list" => {
-            result = json!({"type":"pane_list","panes":[{"pane_id":"pane-owned","tab_id":"tab-owned","cwd":state.worktree_path}]})
+            let workspace = request["params"]["workspace_id"].as_str().unwrap();
+            let panes = state
+                .opened_worktrees
+                .iter()
+                .filter(|tree| tree.workspace == workspace)
+                .map(|tree| json!({"pane_id":tree.pane,"tab_id":tree.tab,"cwd":tree.path}))
+                .collect::<Vec<_>>();
+            result = json!({"type":"pane_list","panes":panes})
         }
         "agent.start" => {
-            result = json!({"type":"agent_started","agent":{"pane_id":request["params"]["pane_id"]},"argv":[]})
+            let pane = request["params"]["pane_id"].as_str().unwrap().to_owned();
+            let name = request["params"]["name"].as_str().unwrap().to_owned();
+            let provider = request["params"]["kind"].as_str().unwrap().to_owned();
+            if let Some(tree) = state.opened_worktrees.iter().find(|tree| tree.pane == pane) {
+                let info = json!({"agent":provider,"agent_session":null,"agent_status":"working","name":name,"terminal_id":tree.terminal,"workspace_id":tree.workspace,"tab_id":tree.tab,"pane_id":tree.pane});
+                state.agents.insert(pane.clone(), info.clone());
+                result = json!({"type":"agent_started","agent":info,"argv":[]});
+                if state.ambiguous_start_response {
+                    error = Some(
+                        json!({"code":"response_lost","message":"simulated lost agent.start response"}),
+                    );
+                }
+            } else {
+                error = Some(json!({"code":"pane_not_found","message":"unknown pane"}));
+            }
         }
-        "agent.prompt" => result = json!({"type":"agent_prompted"}),
+        "agent.prompt" => {
+            let pane = request["params"]["target"].as_str().unwrap().to_owned();
+            if let Some(info) = state.agents.get(&pane) {
+                let mut updated = info.clone();
+                updated["agent_status"] = json!("working");
+                let pane = request["params"]["target"].as_str().unwrap();
+                state.sessions.entry(pane.into()).or_insert_with(|| json!({"source":"fixture","agent":"codex","kind":"id","value":format!("conversation-{pane}")}));
+                updated["agent_session"] = state.sessions.get(pane).cloned().unwrap();
+                state.agents.insert(pane.into(), updated);
+                result = json!({"type":"agent_prompted"});
+            } else {
+                error = Some(json!({"code":"agent_not_found","message":"no agent on pane"}));
+            }
+        }
         "agent.get" => {
-            result = json!({"type":"agent_info","agent":{"pane_id":request["params"]["target"],"agent_status":state.agent_status}})
+            let pane = request["params"]["target"].as_str().unwrap();
+            if let Some(info) = state.agents.get(pane) {
+                let mut current = info.clone();
+                current["agent_status"] = json!(state.agent_status);
+                current["agent_session"] = state.sessions.get(pane).cloned().unwrap_or(Value::Null);
+                result = json!({"type":"agent_info","agent":current});
+            } else {
+                error = Some(json!({"code":"agent_not_found","message":"no agent on pane"}));
+            }
+        }
+        "pane.process_info" => {
+            let pane = request["params"]["pane_id"].as_str().unwrap();
+            let current_pid = std::process::id();
+            if let Some(tree) = state.opened_worktrees.iter().find(|tree| tree.pane == pane) {
+                result = json!({
+                    "type":"pane_process_info",
+                    "process_info":{
+                        "pane_id":pane,
+                        "foreground_process_group_id":current_pid,
+                        "foreground_processes":[{"pid":current_pid,"name":"codex","argv":["codex"],"cwd":tree.path}],
+                        "shell_pid":current_pid,
+                        "tty":"fixture"
+                    }
+                });
+            } else {
+                error =
+                    Some(json!({"code":"pane_not_found","message":"unknown process-info pane"}));
+            }
         }
         "agent.read" => {
             result =
                 json!({"type":"pane_read","read":{"text":"Please ask the human to choose A or B."}})
         }
-        "pane.close" => result = json!({"type":"pane_closed"}),
+        "pane.close" => {
+            let pane = request["params"]["pane_id"].as_str().unwrap().to_owned();
+            state.closed_panes.push(pane);
+            result = json!({"type":"pane_closed"});
+            if state.ambiguous_close_response {
+                error =
+                    Some(json!({"code":"response_lost","message":"simulated lost close response"}));
+            }
+        }
         _ => {
             error = Some(
                 json!({"code":"unsupported","message":format!("unsupported test method {method}")}),
@@ -277,6 +383,21 @@ fn success(output: Output) {
         "{}",
         String::from_utf8_lossy(&output.stderr)
     );
+}
+
+fn write_worker_result(run: &WorkerRun, result: Value) {
+    fs::write(
+        run.worktree.join(".wayfinder-result.json"),
+        serde_json::to_vec(&result).unwrap(),
+    )
+    .unwrap();
+}
+
+fn commit_worker_change(run: &WorkerRun, name: &str) -> String {
+    fs::write(run.worktree.join("implementation.txt"), format!("{name}\n")).unwrap();
+    git(&run.worktree, &["add", "implementation.txt"]);
+    git(&run.worktree, &["commit", "-m", name]);
+    git(&run.worktree, &["rev-parse", "HEAD"]).trim().to_owned()
 }
 
 #[test]
@@ -396,6 +517,441 @@ fn trust_failure_is_visible_and_does_not_change_repository_trust_or_retry_open()
             .count(),
         1
     );
+}
+
+#[test]
+fn ambiguous_agent_start_is_not_repeated_after_effect_then_lost_response() {
+    let f = Fixture::new();
+    f.herdr_state.lock().unwrap().ambiguous_start_response = true;
+    f.apply(RequestKind::Start);
+    let run = f.state().workers.runs[0].clone();
+    assert_eq!(run.status, WorkerStatus::Uncertain);
+    assert!(run.status.reserves_capacity());
+    assert_eq!(
+        f.herdr_state
+            .lock()
+            .unwrap()
+            .requests
+            .iter()
+            .filter(|request| request["method"] == "agent.start")
+            .count(),
+        1
+    );
+    success(f.once());
+    let records = f.herdr_state.lock().unwrap();
+    assert_eq!(
+        records
+            .requests
+            .iter()
+            .filter(|request| request["method"] == "agent.start")
+            .count(),
+        1
+    );
+    assert_eq!(
+        records
+            .requests
+            .iter()
+            .filter(|request| request["method"] == "agent.prompt")
+            .count(),
+        0
+    );
+}
+
+#[test]
+fn runtime_restart_reconnects_only_the_same_observed_agent_session() {
+    let f = Fixture::new();
+    f.apply(RequestKind::Start);
+    let run = f.state().workers.runs[0].clone();
+    assert_eq!(run.terminal_id.as_deref(), Some("terminal-owned"));
+    assert_eq!(
+        run.agent_session.as_ref().unwrap().value,
+        "conversation-pane-owned"
+    );
+
+    // Each `once` is a fresh CLI/runtime process. Exact pane, terminal, provider,
+    // and agent-session identity proves it is still this worker.
+    success(f.once());
+    assert_eq!(f.state().workers.runs[0].status, WorkerStatus::Running);
+    let requests = &f.herdr_state.lock().unwrap().requests;
+    assert_eq!(
+        requests
+            .iter()
+            .filter(|r| r["method"] == "agent.start")
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn cold_restored_or_replaced_agent_identity_becomes_uncertain_without_effects() {
+    let scenarios = [
+        (
+            Some(
+                json!({"source":"fixture","agent":"codex","kind":"id","value":"different-conversation"}),
+            ),
+            false,
+            false,
+            false,
+            false,
+        ),
+        (Some(Value::Null), false, false, false, false),
+        (None, false, true, false, false),
+        (Some(Value::Null), true, false, false, false),
+        (None, false, false, true, false),
+        (None, false, false, false, true),
+    ];
+    for (replacement, clear_saved_identity, replace_terminal, cold_host_restart, replace_process) in
+        scenarios
+    {
+        let f = Fixture::new();
+        f.apply(RequestKind::Start);
+        let mut queued = f.state();
+        queued.concurrency = 1;
+        if clear_saved_identity {
+            queued.workers.runs[0].terminal_id = None;
+            queued.workers.runs[0].agent_provider = None;
+            queued.workers.runs[0].agent_session = None;
+        }
+        if cold_host_restart {
+            queued.workers.runs[0]
+                .foreground_process
+                .as_mut()
+                .unwrap()
+                .boot_id = "previous-linux-boot-id".into();
+        }
+        if replace_process {
+            let process = queued.workers.runs[0].foreground_process.as_mut().unwrap();
+            process.pid = process.pid.saturating_add(1);
+            process.start_time_ticks = process.start_time_ticks.saturating_add(1);
+        }
+        queued.workers.runs.push(WorkerRun {
+            id: "run-00000000000000000099".into(),
+            ticket: 14,
+            role: "implementer".into(),
+            attempt: 1,
+            automatic_retries: 0,
+            rework_round: 0,
+            status: WorkerStatus::Queued,
+            worktree: f._temp.path().join("queued-worktree"),
+            workspace_id: None,
+            tab_id: None,
+            pane_id: None,
+            base_commit: None,
+            result_commit: None,
+            summary: None,
+            question: None,
+            human_response: None,
+            human_decision: None,
+            source_run: None,
+            claim_login: None,
+            context: None,
+            last_activity_ms: None,
+            terminal_id: None,
+            agent_provider: None,
+            agent_session: None,
+            foreground_process: None,
+            result_evidence: None,
+        });
+        store::atomic_json(&f.dir.join("state.json"), &queued).unwrap();
+        {
+            let mut herdr = f.herdr_state.lock().unwrap();
+            if let Some(replacement) = replacement {
+                herdr.sessions.insert("pane-owned".into(), replacement);
+            }
+            if replace_terminal {
+                herdr.agents.get_mut("pane-owned").unwrap()["terminal_id"] =
+                    json!("restored-terminal");
+            }
+        }
+
+        let run_id = queued.workers.runs[0].id.clone();
+        let denied = f
+            .cli()
+            .args(["stop-worker", "--map", MAP, "--run", &run_id])
+            .output()
+            .unwrap();
+        assert!(!denied.status.success());
+        assert_eq!(f.state().workers.runs[0].status, WorkerStatus::Uncertain);
+        success(f.once());
+        let state = f.state();
+        assert_eq!(state.workers.runs[0].status, WorkerStatus::Uncertain);
+        assert!(state.workers.runs[0].status.reserves_capacity());
+        assert_eq!(state.workers.runs[1].status, WorkerStatus::Queued);
+        let records = f.herdr_state.lock().unwrap();
+        assert_eq!(records.closed_panes.len(), 0);
+        assert_eq!(
+            records
+                .requests
+                .iter()
+                .filter(|r| r["method"] == "agent.start")
+                .count(),
+            1
+        );
+        assert_eq!(
+            records
+                .requests
+                .iter()
+                .filter(|r| r["method"] == "worktree.open")
+                .count(),
+            1
+        );
+    }
+}
+
+#[test]
+fn ambiguous_stop_after_effect_is_not_repeated_or_applied_to_replacement() {
+    let f = Fixture::new();
+    f.apply(RequestKind::Start);
+    let run = f.state().workers.runs[0].clone();
+    f.herdr_state.lock().unwrap().ambiguous_close_response = true;
+    let stopped = f
+        .cli()
+        .args(["stop-worker", "--map", MAP, "--run", &run.id])
+        .output()
+        .unwrap();
+    assert!(!stopped.status.success());
+    assert_eq!(f.state().workers.runs[0].status, WorkerStatus::Uncertain);
+    success(f.once());
+    let records = f.herdr_state.lock().unwrap();
+    assert_eq!(records.closed_panes, ["pane-owned"]);
+    assert_eq!(
+        records
+            .requests
+            .iter()
+            .filter(|r| r["method"] == "pane.close")
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn confirmed_worker_failures_create_exactly_two_automatic_retries() {
+    let f = Fixture::new();
+    f.apply(RequestKind::Start);
+    for failure_number in 0..=2 {
+        let run = f
+            .state()
+            .workers
+            .runs
+            .iter()
+            .filter(|run| run.role == "implementer")
+            .max_by_key(|run| run.attempt)
+            .unwrap()
+            .clone();
+        assert_eq!(run.status, WorkerStatus::Running);
+        let result = json!({
+            "format_version":1,
+            "run_id":run.id,
+            "ticket":run.ticket,
+            "role":run.role,
+            "status":"failed",
+            "summary":format!("confirmed failure {failure_number}")
+        });
+        fs::write(
+            run.worktree.join(".wayfinder-result.json"),
+            serde_json::to_vec(&result).unwrap(),
+        )
+        .unwrap();
+        f.herdr_state.lock().unwrap().agent_status = "idle".into();
+        success(f.once());
+        let state = f.state();
+        let current = state
+            .workers
+            .runs
+            .iter()
+            .find(|candidate| candidate.id == run.id)
+            .unwrap();
+        assert_eq!(current.status, WorkerStatus::Failed);
+        assert!(current.result_evidence.as_ref().unwrap().exists());
+        if failure_number < 2 {
+            let retry = state
+                .workers
+                .runs
+                .iter()
+                .find(|candidate| candidate.attempt == run.attempt + 1)
+                .unwrap();
+            assert_eq!(retry.automatic_retries, failure_number + 1);
+            assert_eq!(retry.status, WorkerStatus::Running);
+            f.herdr_state.lock().unwrap().agent_status = "working".into();
+        }
+    }
+    let state = f.state();
+    assert_eq!(state.workers.runs.len(), 3);
+    assert_eq!(
+        state
+            .workers
+            .runs
+            .iter()
+            .map(|run| run.automatic_retries)
+            .max(),
+        Some(2)
+    );
+    assert!(state.workers.runs.iter().all(|run| run.rework_round == 0));
+    assert!(
+        state.workers.runs[2]
+            .question
+            .as_deref()
+            .unwrap()
+            .contains("Two automatic retries were exhausted")
+    );
+}
+
+#[test]
+fn review_rework_budget_advances_independently_of_failure_retry_budget() {
+    let f = Fixture::new();
+    f.apply(RequestKind::Start);
+    for expected_round in 1..=2 {
+        let implementer = f
+            .state()
+            .workers
+            .runs
+            .iter()
+            .filter(|run| run.role == "implementer")
+            .max_by_key(|run| run.attempt)
+            .unwrap()
+            .clone();
+        let commit = commit_worker_change(&implementer, &format!("iteration-{expected_round}"));
+        write_worker_result(
+            &implementer,
+            json!({
+                "format_version":1,
+                "run_id":implementer.id,
+                "ticket":implementer.ticket,
+                "role":implementer.role,
+                "status":"completed",
+                "summary":"implementation ready for review",
+                "commit":commit
+            }),
+        );
+        f.herdr_state.lock().unwrap().agent_status = "idle".into();
+        success(f.once());
+
+        let reviewer = f
+            .state()
+            .workers
+            .runs
+            .iter()
+            .find(|run| run.role == "reviewer" && run.status == WorkerStatus::Running)
+            .unwrap()
+            .clone();
+        write_worker_result(
+            &reviewer,
+            json!({
+                "format_version":1,
+                "run_id":reviewer.id,
+                "ticket":reviewer.ticket,
+                "role":reviewer.role,
+                "status":"completed",
+                "summary":"changes are required",
+                "reviewed_commit":commit,
+                "verdict":"changes_requested"
+            }),
+        );
+        success(f.once());
+        let state = f.state();
+        let rework = state
+            .workers
+            .runs
+            .iter()
+            .filter(|run| run.role == "implementer")
+            .max_by_key(|run| run.attempt)
+            .unwrap();
+        assert_eq!(rework.status, WorkerStatus::Running);
+        assert_eq!(rework.rework_round, expected_round);
+        assert_eq!(rework.automatic_retries, 0);
+        f.herdr_state.lock().unwrap().agent_status = "working".into();
+    }
+}
+
+#[test]
+fn archived_result_allows_replay_but_unrelated_review_changes_still_block_acceptance() {
+    let f = Fixture::new();
+    f.apply(RequestKind::Start);
+    let implementer = f.state().workers.runs[0].clone();
+    fs::write(
+        implementer.worktree.join("implementation.txt"),
+        "committed output\n",
+    )
+    .unwrap();
+    git(&implementer.worktree, &["add", "implementation.txt"]);
+    git(&implementer.worktree, &["commit", "-m", "implementation"]);
+    let commit = git(&implementer.worktree, &["rev-parse", "HEAD"])
+        .trim()
+        .to_owned();
+    let result_path = implementer.worktree.join(".wayfinder-result.json");
+    fs::write(
+        &result_path,
+        serde_json::to_vec(&json!({
+            "format_version":1,
+            "run_id":implementer.id,
+            "ticket":implementer.ticket,
+            "role":implementer.role,
+            "status":"completed",
+            "summary":"implemented the feature",
+            "commit":commit
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    f.herdr_state.lock().unwrap().agent_status = "idle".into();
+    success(f.once());
+    assert!(
+        !result_path.exists(),
+        "the checkout protocol artifact was archived and removed"
+    );
+    let after_implementation = f.state();
+    assert_eq!(
+        after_implementation.workers.runs[0].status,
+        WorkerStatus::Completed
+    );
+    let implementation_evidence = after_implementation.workers.runs[0]
+        .result_evidence
+        .as_ref()
+        .unwrap();
+    assert!(implementation_evidence.exists());
+    assert!(
+        git(&implementer.worktree, &["status", "--porcelain"])
+            .trim()
+            .is_empty()
+    );
+    let reviewer = after_implementation.workers.runs[1].clone();
+    assert_eq!(reviewer.role, "reviewer");
+    assert_eq!(reviewer.status, WorkerStatus::Running);
+    assert_eq!(reviewer.base_commit.as_deref(), Some(commit.as_str()));
+
+    let reviewer_result = reviewer.worktree.join(".wayfinder-result.json");
+    fs::write(
+        &reviewer_result,
+        serde_json::to_vec(&json!({
+            "format_version":1,
+            "run_id":reviewer.id,
+            "ticket":reviewer.ticket,
+            "role":reviewer.role,
+            "status":"completed",
+            "summary":"reviewed the fixed implementation",
+            "reviewed_commit":commit,
+            "verdict":"approved"
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    fs::write(reviewer.worktree.join("unrelated.txt"), "human edit\n").unwrap();
+    success(f.once());
+    let held = f.state();
+    assert_eq!(held.workers.runs[1].status, WorkerStatus::Running);
+    let reviewer_evidence = held.workers.runs[1].result_evidence.as_ref().unwrap();
+    assert!(reviewer_evidence.exists());
+    assert!(!reviewer_result.exists());
+    assert!(git(&reviewer.worktree, &["status", "--porcelain"]).contains("unrelated.txt"));
+
+    // A process restart replays from the immutable archive after cleanup of only
+    // the owned protocol file; the independent dirty file remains the blocker.
+    fs::remove_file(reviewer.worktree.join("unrelated.txt")).unwrap();
+    success(f.once());
+    let accepted = f.state();
+    assert_eq!(accepted.workers.runs[1].status, WorkerStatus::Completed);
+    assert_eq!(accepted.workers.runs[0].status, WorkerStatus::Reviewed);
+    assert!(reviewer_evidence.exists());
 }
 
 #[test]
@@ -598,6 +1154,11 @@ fn insert_uncertain_run(f: &Fixture) -> WorkerRun {
         claim_login: Some("fixture-user".into()),
         context: None,
         last_activity_ms: None,
+        terminal_id: None,
+        agent_provider: None,
+        agent_session: None,
+        foreground_process: None,
+        result_evidence: None,
     };
     state.workers.next_run = 1;
     state.workers.runs.push(run.clone());

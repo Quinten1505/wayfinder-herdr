@@ -213,6 +213,11 @@ fn new_run(state: &mut State, request: NewRun<'_>) {
         claim_login: None,
         context,
         last_activity_ms: None,
+        terminal_id: None,
+        agent_provider: None,
+        agent_session: None,
+        foreground_process: None,
+        result_evidence: None,
     });
 }
 
@@ -277,6 +282,33 @@ fn reconcile_workers(
                 continue;
             }
         };
+        if let Err(error) = crate::herdr::verify_worker_identity(&info, &run) {
+            state.workers.runs[i].status = WorkerStatus::Uncertain;
+            state.workers.runs[i].question = Some(format!(
+                "The pane no longer proves this run's terminal and agent-session identity; no further effect was sent and capacity remains reserved: {error:#}"
+            ));
+            save(dir, state)?;
+            continue;
+        }
+        let process_info = match herdr.pane_process_info(pane) {
+            Ok(info) => info,
+            Err(error) => {
+                state.workers.runs[i].status = WorkerStatus::Uncertain;
+                state.workers.runs[i].question = Some(format!(
+                    "Could not verify the original foreground process; no effect was sent and capacity remains reserved: {error:#}"
+                ));
+                save(dir, state)?;
+                continue;
+            }
+        };
+        if let Err(error) = crate::herdr::verify_foreground_process(&process_info, &run) {
+            state.workers.runs[i].status = WorkerStatus::Uncertain;
+            state.workers.runs[i].question = Some(format!(
+                "The pane no longer proves this run's Linux process continuity; no effect was sent and capacity remains reserved: {error:#}"
+            ));
+            save(dir, state)?;
+            continue;
+        }
         match status(&info).unwrap_or("unknown") {
             "working" => {
                 state.workers.runs[i].last_activity_ms = Some(now_ms());
@@ -288,22 +320,13 @@ fn reconcile_workers(
                 save(dir, state)?;
             }
             "idle" | "done" => {
-                let result = read_result(&run.worktree.join(".wayfinder-result.json"));
-                let result = match result {
-                    Ok(result)
-                        if result.run_id == run.id
-                            && result.ticket == run.ticket
-                            && result.role == run.role =>
-                    {
+                let result = match capture_result(dir, &run) {
+                    Ok(Some((result, evidence))) => {
+                        state.workers.runs[i].result_evidence = Some(evidence);
+                        save(dir, state)?;
                         result
                     }
-                    Ok(_) => {
-                        state.workers.runs[i].status = WorkerStatus::Uncertain;
-                        state.workers.runs[i].question = Some("Worker result identity did not match this run; result was not accepted.".into());
-                        save(dir, state)?;
-                        continue;
-                    }
-                    Err(error) => {
+                    Ok(None) => {
                         let within_grace = run.last_activity_ms.is_some_and(|last| {
                             now_ms().saturating_sub(last) < SUBMITTED_IDLE_GRACE.as_millis() as u64
                         });
@@ -314,8 +337,14 @@ fn reconcile_workers(
                             continue;
                         }
                         state.workers.runs[i].status = WorkerStatus::Uncertain;
+                        state.workers.runs[i].question = Some("Worker remained idle/done without a result after the bounded submission grace; lifecycle status is not task success and the launch was not retried.".into());
+                        save(dir, state)?;
+                        continue;
+                    }
+                    Err(error) => {
+                        state.workers.runs[i].status = WorkerStatus::Uncertain;
                         state.workers.runs[i].question = Some(format!(
-                            "Worker remained idle/done without a valid result after the bounded submission grace; lifecycle status is not task success and the launch was not retried: {error:#}"
+                            "Worker result could not be validated or durably retained; it was not accepted: {error:#}"
                         ));
                         save(dir, state)?;
                         continue;
@@ -465,16 +494,103 @@ struct WorkerResult {
     #[serde(default)]
     verdict: Option<String>,
 }
-fn read_result(path: &Path) -> Result<WorkerResult> {
-    let value: WorkerResult = serde_json::from_slice(
-        &fs::read(path).with_context(|| format!("read {}", path.display()))?,
-    )
-    .context("decode worker result")?;
+fn decode_result(bytes: &[u8]) -> Result<WorkerResult> {
+    let value: WorkerResult = serde_json::from_slice(bytes).context("decode worker result")?;
     ensure!(
         value.format_version == 1 && !value.summary.trim().is_empty(),
         "unsupported or incomplete worker result"
     );
     Ok(value)
+}
+
+fn evidence_path(dir: &Path, run_id: &str) -> Result<std::path::PathBuf> {
+    let digits = run_id
+        .strip_prefix("run-")
+        .context("invalid worker run ID")?;
+    ensure!(
+        digits.len() == 20 && digits.bytes().all(|b| b.is_ascii_digit()),
+        "invalid worker run ID"
+    );
+    Ok(dir.join("worker-results").join(format!("{run_id}.json")))
+}
+
+/// Move a validated result out of the checkout before clean-tree validation. The
+/// archive is create-once and compared byte-for-byte on replay, so a crash between
+/// evidence creation and state commit cannot overwrite accepted evidence.
+fn capture_result(
+    dir: &Path,
+    run: &WorkerRun,
+) -> Result<Option<(WorkerResult, std::path::PathBuf)>> {
+    let source = run.worktree.join(".wayfinder-result.json");
+    let evidence = evidence_path(dir, &run.id)?;
+    let source_bytes = match fs::read(&source) {
+        Ok(bytes) => Some(bytes),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => return Err(error).with_context(|| format!("read {}", source.display())),
+    };
+    let archived_bytes = match fs::read(&evidence) {
+        Ok(bytes) => Some(bytes),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => return Err(error).with_context(|| format!("read {}", evidence.display())),
+    };
+    let bytes = match (source_bytes.as_ref(), archived_bytes.as_ref()) {
+        (None, None) => return Ok(None),
+        (Some(source), Some(archived)) => {
+            ensure!(
+                source == archived,
+                "source result differs from retained evidence"
+            );
+            archived.clone()
+        }
+        (Some(source), None) => source.clone(),
+        (None, Some(archived)) => archived.clone(),
+    };
+    let result = decode_result(&bytes)?;
+    ensure!(
+        result.run_id == run.id && result.ticket == run.ticket && result.role == run.role,
+        "worker result identity does not match the durable run"
+    );
+    if archived_bytes.is_none() {
+        persist_evidence(&evidence, &bytes)?;
+    }
+    if source_bytes.is_some() {
+        let current = fs::read(&source).context("recheck source result before removing it")?;
+        ensure!(
+            current == bytes,
+            "source result changed while being archived"
+        );
+        fs::remove_file(&source).context("remove archived result from source checkout")?;
+        if let Some(parent) = source.parent() {
+            fs::File::open(parent)?.sync_all()?;
+        }
+    }
+    Ok(Some((result, evidence)))
+}
+
+fn persist_evidence(path: &Path, bytes: &[u8]) -> Result<()> {
+    let parent = path.parent().context("result evidence has no parent")?;
+    store::private_dir(parent)?;
+    if path.exists() {
+        ensure!(
+            fs::read(path)? == bytes,
+            "retained result evidence already differs"
+        );
+        return Ok(());
+    }
+    let mut temp = tempfile::NamedTempFile::new_in(parent)?;
+    std::io::Write::write_all(&mut temp, bytes)?;
+    temp.as_file().sync_all()?;
+    match temp.persist_noclobber(path) {
+        Ok(_) => fs::File::open(parent)?.sync_all()?,
+        Err(error) if error.error.kind() == std::io::ErrorKind::AlreadyExists => {
+            ensure!(
+                fs::read(path)? == bytes,
+                "retained result evidence already differs"
+            );
+        }
+        Err(error) => return Err(error.error.into()),
+    }
+    Ok(())
 }
 
 fn accept_result(
@@ -789,18 +905,37 @@ fn launch_one(
         .context("Herdr worktree.open omitted root pane ID")?;
     let provider = state.workers.providers.for_role(&run.role).clone();
     let args = provider_args(&provider)?;
-    if let Err(error) = herdr.start_agent(
+    let started = match herdr.start_agent(
         &format!("wf-{}-{}", run.ticket, run.id),
         &provider.kind,
         &pane,
         &args,
     ) {
-        state.workers.runs[i].status = WorkerStatus::Uncertain;
-        state.workers.runs[i].question = Some(format!(
-            "Agent start may have taken effect; inspect pane {pane}: {error:#}"
-        ));
-        return save(dir, state);
-    }
+        Ok(started) => started,
+        Err(error) => {
+            state.workers.runs[i].status = WorkerStatus::Uncertain;
+            state.workers.runs[i].question = Some(format!(
+                "Agent start may have taken effect; inspect pane {pane}: {error:#}"
+            ));
+            return save(dir, state);
+        }
+    };
+    let (terminal_id, agent_provider, _) = match crate::herdr::capture_agent_identity(
+        &started,
+        &state.workers.runs[i],
+    ) {
+        Ok(identity) => identity,
+        Err(error) => {
+            state.workers.runs[i].status = WorkerStatus::Uncertain;
+            state.workers.runs[i].question = Some(format!(
+                "Agent start succeeded without verifiable pane/terminal identity; it was not repeated: {error:#}"
+            ));
+            return save(dir, state);
+        }
+    };
+    state.workers.runs[i].terminal_id = Some(terminal_id);
+    state.workers.runs[i].agent_provider = agent_provider;
+    save(dir, state)?;
     state.workers.runs[i].status = WorkerStatus::PromptIntent;
     save(dir, state)?;
     let prompt = worker_prompt(&state.workers.runs[i], state);
@@ -811,8 +946,43 @@ fn launch_one(
         ));
         return save(dir, state);
     }
+    let observed = match herdr
+        .agent(&pane)
+        .and_then(|info| crate::herdr::capture_agent_identity(&info, &state.workers.runs[i]))
+    {
+        Ok((terminal, provider, Some(session))) => (terminal, provider, session),
+        Ok((_, _, None)) => {
+            state.workers.runs[i].status = WorkerStatus::Uncertain;
+            state.workers.runs[i].question = Some("Prompt entered activity but Herdr did not expose an agent-session identity; the run was not relaunched.".into());
+            return save(dir, state);
+        }
+        Err(error) => {
+            state.workers.runs[i].status = WorkerStatus::Uncertain;
+            state.workers.runs[i].question = Some(format!(
+                "Prompt entered activity but the original agent identity could not be verified; the run was not relaunched: {error:#}"
+            ));
+            return save(dir, state);
+        }
+    };
     state.workers.runs[i].status = WorkerStatus::Running;
     state.workers.runs[i].last_activity_ms = Some(now_ms());
+    state.workers.runs[i].terminal_id = Some(observed.0);
+    state.workers.runs[i].agent_provider = observed.1;
+    state.workers.runs[i].agent_session = Some(observed.2);
+    let process = match herdr
+        .pane_process_info(&pane)
+        .and_then(|info| crate::herdr::capture_foreground_process(&info, &pane))
+    {
+        Ok(process) => process,
+        Err(error) => {
+            state.workers.runs[i].status = WorkerStatus::Uncertain;
+            state.workers.runs[i].question = Some(format!(
+                "Prompt entered activity but Linux process continuity could not be established; the run was not relaunched: {error:#}"
+            ));
+            return save(dir, state);
+        }
+    };
+    state.workers.runs[i].foreground_process = Some(process);
     state.workers.runs[i].question = None;
     save(dir, state)
 }

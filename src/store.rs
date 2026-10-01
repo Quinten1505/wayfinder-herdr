@@ -139,6 +139,36 @@ pub struct WorkerRun {
     /// snapshots after submission are not evidence that the launch is absent.
     #[serde(default)]
     pub last_activity_ms: Option<u64>,
+    /// Identity observed from Herdr after this prompt entered its first turn.
+    /// Missing legacy fields are not proof that a restored pane is this worker.
+    #[serde(default)]
+    pub terminal_id: Option<String>,
+    #[serde(default)]
+    pub agent_provider: Option<String>,
+    #[serde(default)]
+    pub agent_session: Option<AgentSessionIdentity>,
+    #[serde(default)]
+    pub foreground_process: Option<LinuxProcessIdentity>,
+    /// Durable output copy outside the source checkout.
+    #[serde(default)]
+    pub result_evidence: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct AgentSessionIdentity {
+    pub source: String,
+    pub agent: String,
+    pub kind: String,
+    pub value: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct LinuxProcessIdentity {
+    pub boot_id: String,
+    pub pid: u32,
+    pub start_time_ticks: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

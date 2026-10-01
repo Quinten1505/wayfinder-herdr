@@ -10,11 +10,179 @@ use std::{
     time::Duration,
 };
 
+use crate::store::{AgentSessionIdentity, LinuxProcessIdentity, WorkerRun};
+
 static REQUEST_ID: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Clone)]
 pub struct Client {
     socket: std::path::PathBuf,
+}
+
+/// Persist only identity facts present in the installed AgentInfo response. A pane
+/// ID or agent name by itself is not enough to identify a restored occupant.
+pub fn capture_agent_identity(
+    info: &Value,
+    run: &WorkerRun,
+) -> Result<(String, Option<String>, Option<AgentSessionIdentity>)> {
+    let agent = info
+        .get("agent")
+        .context("Herdr response omitted agent information")?;
+    ensure!(
+        field(agent, "workspace_id")? == run.workspace_id.as_deref().unwrap_or_default(),
+        "Herdr worker workspace changed"
+    );
+    ensure!(
+        field(agent, "tab_id")? == run.tab_id.as_deref().unwrap_or_default(),
+        "Herdr worker tab changed"
+    );
+    ensure!(
+        field(agent, "pane_id")? == run.pane_id.as_deref().unwrap_or_default(),
+        "Herdr worker pane changed"
+    );
+    let terminal_id = field(agent, "terminal_id")?.to_owned();
+    ensure!(!terminal_id.is_empty(), "Herdr worker terminal ID is empty");
+    if let Some(expected) = run.terminal_id.as_deref() {
+        ensure!(
+            terminal_id == expected,
+            "Herdr worker terminal changed during startup"
+        );
+    }
+    let provider = agent
+        .get("agent")
+        .and_then(Value::as_str)
+        .map(str::to_owned);
+    if let Some(expected) = run.agent_provider.as_deref() {
+        ensure!(
+            provider.as_deref() == Some(expected),
+            "Herdr worker provider identity changed"
+        );
+    }
+    let session = agent
+        .get("agent_session")
+        .filter(|value| !value.is_null())
+        .map(|session| -> Result<AgentSessionIdentity> {
+            Ok(AgentSessionIdentity {
+                source: field(session, "source")?.to_owned(),
+                agent: field(session, "agent")?.to_owned(),
+                kind: field(session, "kind")?.to_owned(),
+                value: field(session, "value")?.to_owned(),
+            })
+        })
+        .transpose()?;
+    if let (Some(expected), Some(observed)) = (run.agent_session.as_ref(), session.as_ref()) {
+        ensure!(observed == expected, "Herdr agent session identity changed");
+    }
+    Ok((terminal_id, provider, session))
+}
+
+/// Require full resource and observed agent-session identity before interpreting
+/// lifecycle state or issuing an effect against a pane.
+pub fn verify_worker_identity(info: &Value, run: &WorkerRun) -> Result<()> {
+    ensure!(
+        run.terminal_id.is_some(),
+        "worker has no persisted terminal identity"
+    );
+    ensure!(
+        run.agent_session.is_some(),
+        "worker has no persisted agent-session identity"
+    );
+    let (terminal, provider, session) = capture_agent_identity(info, run)?;
+    ensure!(
+        Some(terminal) == run.terminal_id,
+        "Herdr worker terminal identity changed"
+    );
+    ensure!(
+        provider == run.agent_provider,
+        "Herdr worker provider identity changed"
+    );
+    ensure!(
+        session == run.agent_session,
+        "Herdr agent session identity changed"
+    );
+    Ok(())
+}
+
+pub fn capture_foreground_process(info: &Value, pane_id: &str) -> Result<LinuxProcessIdentity> {
+    let process_info = info
+        .get("process_info")
+        .context("Herdr pane.process_info omitted process_info")?;
+    ensure!(
+        field(process_info, "pane_id")? == pane_id,
+        "Herdr process information belongs to another pane"
+    );
+    let group = process_info["foreground_process_group_id"]
+        .as_u64()
+        .context("Herdr did not identify the foreground process group")?;
+    let pid = process_info["foreground_processes"]
+        .as_array()
+        .context("Herdr omitted foreground process list")?
+        .iter()
+        .find(|process| process["pid"].as_u64() == Some(group))
+        .and_then(|process| process["pid"].as_u64())
+        .context("Herdr did not report the foreground process-group leader")?;
+    let pid = u32::try_from(pid).context("foreground process ID exceeded Linux PID range")?;
+    let start_time_ticks = linux_process_start_time(pid)?;
+    let boot_id = std::fs::read_to_string("/proc/sys/kernel/random/boot_id")?
+        .trim()
+        .to_owned();
+    ensure!(!boot_id.is_empty(), "Linux boot ID is empty");
+    Ok(LinuxProcessIdentity {
+        boot_id,
+        pid,
+        start_time_ticks,
+    })
+}
+
+pub fn verify_foreground_process(info: &Value, run: &WorkerRun) -> Result<()> {
+    let expected = run
+        .foreground_process
+        .as_ref()
+        .context("worker has no persisted foreground process identity")?;
+    let pane = run
+        .pane_id
+        .as_deref()
+        .context("worker has no persisted pane identity")?;
+    let current = capture_foreground_process(info, pane)?;
+    ensure!(
+        &current == expected,
+        "Herdr foreground process identity changed"
+    );
+    Ok(())
+}
+
+pub fn inspect_worker(client: &Client, run: &WorkerRun) -> Result<Value> {
+    let pane = run
+        .pane_id
+        .as_deref()
+        .context("worker has no persisted pane identity")?;
+    let agent = client.agent(pane)?;
+    verify_worker_identity(&agent, run)?;
+    let process = client.pane_process_info(pane)?;
+    verify_foreground_process(&process, run)?;
+    Ok(agent)
+}
+
+fn linux_process_start_time(pid: u32) -> Result<u64> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat"))
+        .with_context(|| format!("read Linux process identity for PID {pid}"))?;
+    let close = stat
+        .rfind(')')
+        .context("Linux process stat omitted command delimiter")?;
+    let fields: Vec<_> = stat[close + 1..].split_whitespace().collect();
+    // The suffix starts at proc stat field 3; starttime is field 22.
+    fields
+        .get(19)
+        .context("Linux process stat omitted starttime")?
+        .parse()
+        .context("Linux process starttime was not an integer")
+}
+
+fn field<'a>(value: &'a Value, key: &str) -> Result<&'a str> {
+    value
+        .get(key)
+        .and_then(Value::as_str)
+        .with_context(|| format!("Herdr identity omitted {key}"))
 }
 
 impl Client {
@@ -136,6 +304,10 @@ impl Client {
 
     pub fn agent(&self, pane_id: &str) -> Result<Value> {
         self.request("agent.get", json!({"target":pane_id}))
+    }
+
+    pub fn pane_process_info(&self, pane_id: &str) -> Result<Value> {
+        self.request("pane.process_info", json!({"pane_id":pane_id}))
     }
 
     pub fn read_recent(&self, pane_id: &str) -> Result<Value> {

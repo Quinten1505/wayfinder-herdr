@@ -11,7 +11,7 @@ use wayfinder_herdr::{
 #[derive(Parser)]
 #[command(
     version,
-    about = "Wayfinder GitHub map workflow and local runtime (worker dispatch not implemented)"
+    about = "Wayfinder GitHub map workflow and local worker runtime"
 )]
 struct Cli {
     /// Stable durable root. Defaults to $XDG_STATE_HOME/wayfinder-herdr.
@@ -382,33 +382,39 @@ fn run() -> Result<()> {
             let (_, dir) = tracker_context(&root, &map)?;
             let _lock = Lock::acquire(&dir.join("state.lock"))?;
             let mut state = store::read_state(&dir)?;
-            let worker = state
+            let i = state
                 .workers
                 .runs
-                .iter_mut()
-                .find(|worker| worker.id == run)
+                .iter()
+                .position(|worker| worker.id == run)
                 .context("worker run not found")?;
             ensure!(
-                worker.status == WorkerStatus::Running,
+                state.workers.runs[i].status == WorkerStatus::Running,
                 "only a confirmed running worker can be stopped; uncertain and blocked runs require reconciliation"
             );
+            let worker = state.workers.runs[i].clone();
             let pane = worker
                 .pane_id
                 .clone()
                 .context("running worker has no owned pane")?;
-            worker.status = WorkerStatus::StopRequested;
-            worker.question =
+            let herdr = Client::new(&state.binding.socket);
+            if let Err(error) = wayfinder_herdr::herdr::inspect_worker(&herdr, &worker) {
+                state.workers.runs[i].status = WorkerStatus::Uncertain;
+                state.workers.runs[i].question = Some(format!(
+                    "Worker identity/process continuity could not be verified; pane was not closed: {error:#}"
+                ));
+                store::atomic_json(&dir.join("state.json"), &state)?;
+                anyhow::bail!(
+                    "worker identity/process continuity could not be verified; pane was not closed: {error:#}"
+                );
+            }
+            state.workers.runs[i].status = WorkerStatus::StopRequested;
+            state.workers.runs[i].question =
                 Some("Stop requested by the human; claim and worktree will be retained.".into());
             store::atomic_json(&dir.join("state.json"), &state)?;
-            let herdr = Client::new(&state.binding.socket);
             match herdr.close_pane(&pane) {
                 Ok(_) => {
-                    let worker = state
-                        .workers
-                        .runs
-                        .iter_mut()
-                        .find(|worker| worker.id == run)
-                        .unwrap();
+                    let worker = &mut state.workers.runs[i];
                     worker.status = WorkerStatus::Stopped;
                     worker.human_decision =
                         Some("human requested stop; Herdr confirmed pane close".into());
@@ -416,12 +422,7 @@ fn run() -> Result<()> {
                     println!("Worker stop confirmed; claim and worktree remain retained.");
                 }
                 Err(error) => {
-                    let worker = state
-                        .workers
-                        .runs
-                        .iter_mut()
-                        .find(|worker| worker.id == run)
-                        .unwrap();
+                    let worker = &mut state.workers.runs[i];
                     worker.status = WorkerStatus::Uncertain;
                     worker.question = Some(format!(
                         "Stop outcome is uncertain; do not retry without confirming the worker is absent: {error:#}"
@@ -441,45 +442,62 @@ fn run() -> Result<()> {
             let (_, dir) = tracker_context(&root, &map)?;
             let _lock = Lock::acquire(&dir.join("state.lock"))?;
             let mut state = store::read_state(&dir)?;
-            let worker = state
+            let index = state
                 .workers
                 .runs
-                .iter_mut()
-                .find(|worker| worker.id == run)
+                .iter()
+                .position(|worker| worker.id == run)
                 .context("worker run not found")?;
             ensure!(
-                worker.status == WorkerStatus::NeedsHuman,
+                state.workers.runs[index].status == WorkerStatus::NeedsHuman,
                 "worker has no pending human question"
             );
+            let worker = state.workers.runs[index].clone();
             let pane = worker
                 .pane_id
                 .clone()
                 .context("blocked worker has no owned pane")?;
-            worker.human_response = Some(response.clone());
-            worker.status = WorkerStatus::AnswerIntent;
-            store::atomic_json(&dir.join("state.json"), &state)?;
             let herdr = Client::new(&state.binding.socket);
+            if let Err(error) = wayfinder_herdr::herdr::inspect_worker(&herdr, &worker) {
+                state.workers.runs[index].status = WorkerStatus::Uncertain;
+                state.workers.runs[index].question = Some(format!(
+                    "Worker identity/process continuity could not be verified; human response was not submitted: {error:#}"
+                ));
+                store::atomic_json(&dir.join("state.json"), &state)?;
+                anyhow::bail!(
+                    "worker identity could not be verified; response was not submitted: {error:#}"
+                );
+            }
+            state.workers.runs[index].human_response = Some(response.clone());
+            state.workers.runs[index].status = WorkerStatus::AnswerIntent;
+            store::atomic_json(&dir.join("state.json"), &state)?;
             match herdr.prompt(&pane, &response) {
                 Ok(_) => {
-                    let worker = state
-                        .workers
-                        .runs
-                        .iter_mut()
-                        .find(|worker| worker.id == run)
-                        .unwrap();
+                    let observed = wayfinder_herdr::herdr::inspect_worker(&herdr, &worker);
+                    if let Err(error) = observed {
+                        state.workers.runs[index].status = WorkerStatus::Uncertain;
+                        state.workers.runs[index].question = Some(format!(
+                            "Human response may have been submitted but worker identity changed; it was not repeated: {error:#}"
+                        ));
+                        store::atomic_json(&dir.join("state.json"), &state)?;
+                        anyhow::bail!("response outcome is retained as uncertain: {error:#}");
+                    }
+                    let worker = &mut state.workers.runs[index];
                     worker.status = WorkerStatus::Running;
+                    worker.last_activity_ms = Some(
+                        std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_millis()
+                            .min(u64::MAX as u128) as u64,
+                    );
                     worker.question = None;
                     worker.human_decision = Some("human response submitted".into());
                     store::atomic_json(&dir.join("state.json"), &state)?;
                     println!("Human response submitted to owned pane {pane}.");
                 }
                 Err(error) => {
-                    let worker = state
-                        .workers
-                        .runs
-                        .iter_mut()
-                        .find(|worker| worker.id == run)
-                        .unwrap();
+                    let worker = &mut state.workers.runs[index];
                     worker.status = WorkerStatus::Uncertain;
                     worker.question = Some(format!(
                         "Human response submission is ambiguous; it was not repeated: {error:#}"
@@ -545,7 +563,7 @@ fn run() -> Result<()> {
                 status: WorkerStatus::Queued, worktree, workspace_id: None, tab_id: None, pane_id: None,
                 base_commit: prior.result_commit.clone().or(prior.base_commit.clone()), result_commit: None,
                 summary: None, question: None, human_response: None, human_decision: None,
-                source_run: Some(prior.id), claim_login: prior.claim_login, context: Some("Human explicitly authorized this retry after the preceding worker was confirmed stopped or absent.".into()), last_activity_ms: None,
+                source_run: Some(prior.id), claim_login: prior.claim_login, context: Some("Human explicitly authorized this retry after the preceding worker was confirmed stopped or absent.".into()), last_activity_ms: None, terminal_id: None, agent_provider: None, agent_session: None, foreground_process: None, result_evidence: None,
             });
             store::atomic_json(&dir.join("state.json"), &state)?;
             println!(
