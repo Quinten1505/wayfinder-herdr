@@ -20,7 +20,7 @@ From this source checkout:
 
 This builds with `cargo build --release --locked`, copies the executable and manifest into `~/.local/lib/wayfinder-herdr`, links the plugin, installs `wayfinder-herdr@.service` in the user service directory, and reloads systemd. It does not attach, start, or enable a map runtime. `WAYFINDER_INSTALL_DIR` overrides the install directory. `XDG_CONFIG_HOME` and `XDG_STATE_HOME` are respected and recorded in the unit. The source checkout must remain available only for rebuilding, not for running the installed plugin.
 
-The manifest's build entry supports building the source package; use the installer above to also provision supervision. `sh scripts/build.sh` builds a development binary in `bin/` without linking it.
+Use the installer above to provision the plugin and supervision together. `sh scripts/build.sh` is a source build helper that creates a development binary in `bin/` without installing or linking it.
 
 ## Attach and explicitly Start
 

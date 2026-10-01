@@ -4,9 +4,6 @@ version = "0.1.0"
 min_herdr_version = "0.9.3"
 platforms = ["linux"]
 
-[[build]]
-command = ["sh", "scripts/build.sh"]
-
 [[startup]]
 command = ["./bin/wayfinder-herdr", "reconcile"]
 
