@@ -89,6 +89,8 @@ struct HerdrState {
     agent_status: String,
     ambiguous_open_response: bool,
     fail_open_without_resource: bool,
+    ambiguous_split_response: bool,
+    omit_split_pane_id: bool,
     ambiguous_start_response: bool,
     ambiguous_close_response: bool,
     ambiguous_prompt_response: bool,
@@ -278,6 +280,31 @@ impl Fixture {
             .output()
             .unwrap()
     }
+    fn recover_interrupted_chat(&self, confirm_replacement: bool, confirm_absent: bool) -> Output {
+        let state = self.state();
+        let mut command = self.cli();
+        command.arg("recover-chat").args(["--map", MAP]);
+        if confirm_replacement {
+            command.arg("--confirm-replacement");
+        }
+        if confirm_absent {
+            command.arg("--confirm-launch-absent-or-stopped");
+        }
+        command
+            .env("HERDR_SOCKET_PATH", state.binding.socket)
+            .env(
+                "HERDR_PLUGIN_CONTEXT_JSON",
+                json!({
+                    "workspace_cwd":state.binding.repository,
+                    "workspace_id":"origin-workspace",
+                    "tab_id":"origin-tab",
+                    "focused_pane_id":"origin-pane"
+                })
+                .to_string(),
+            )
+            .output()
+            .unwrap()
+    }
     fn resolve_chat_message(&self, id: &str, delivered: bool) -> Output {
         let mut command = self.cli();
         command.args(["resolve-chat-delivery", "--map", MAP, "--message", id]);
@@ -366,6 +393,15 @@ fn handle_request(mut stream: std::os::unix::net::UnixStream, state: &Arc<Mutex<
             };
             state.chat_panes.insert(pane_id, pane.clone());
             result = json!({"type":"pane_info","pane":{"pane_id":pane.pane,"workspace_id":pane.workspace,"tab_id":pane.tab,"terminal_id":pane.terminal,"cwd":pane.path}});
+            if state.omit_split_pane_id {
+                state.omit_split_pane_id = false;
+                result["pane"].as_object_mut().unwrap().remove("pane_id");
+            } else if state.ambiguous_split_response {
+                state.ambiguous_split_response = false;
+                error = Some(
+                    json!({"code":"response_lost","message":"simulated lost pane.split response"}),
+                );
+            }
         }
         "worktree.open" => {
             if state.fail_first_open_without_resource {
@@ -444,6 +480,7 @@ fn handle_request(mut stream: std::os::unix::net::UnixStream, state: &Arc<Mutex<
                 state.agents.insert(pane.clone(), info.clone());
                 result = json!({"type":"agent_started","agent":info,"argv":[]});
                 if state.ambiguous_start_response {
+                    state.ambiguous_start_response = false;
                     error = Some(
                         json!({"code":"response_lost","message":"simulated lost agent.start response"}),
                     );
@@ -751,6 +788,7 @@ fn one_orchestrator_chat_uses_configured_provider_and_delivers_grouped_linked_qu
         "without proving termination, releasing uncertain capacity, or deleting artifacts"
     ));
     assert!(initial_prompt.contains("recover-chat --map example/project#42 --confirm-replacement"));
+    assert!(initial_prompt.contains("--confirm-launch-absent-or-stopped"));
     assert!(
         initial_prompt
             .contains("resolve-chat-delivery --map example/project#42 --message MESSAGE_ID")
@@ -1096,6 +1134,387 @@ fn explicit_chat_recovery_can_replace_a_missing_agent_only_after_confirmation() 
 }
 
 #[test]
+fn interrupted_chat_launch_stages_require_explicit_absence_and_preserve_pending_questions() {
+    for stage in [
+        store::OrchestratorStatus::PaneIntent,
+        store::OrchestratorStatus::AgentIntent,
+        store::OrchestratorStatus::PromptIntent,
+        store::OrchestratorStatus::Uncertain,
+    ] {
+        let f = Fixture::new();
+        let before = record_pending_worker_question(&f);
+        success(f.chat());
+        let mut state = f.state();
+        let saved = state.orchestrator.as_mut().unwrap();
+        saved.status = stage;
+        if stage == store::OrchestratorStatus::PaneIntent {
+            saved.pane_id.clear();
+            saved.terminal_id = None;
+            saved.session = None;
+        } else if stage == store::OrchestratorStatus::AgentIntent {
+            saved.session = None;
+        }
+        let old = saved.clone();
+        store::atomic_json(&f.dir.join("state.json"), &state).unwrap();
+        let held_outbox = br#"{"format_version":1,"messages":[{"id":"held-message","text":"retain delivery evidence","status":"uncertain","resolution_history":[]}]}"#;
+        fs::write(f.dir.join("chat-outbox.json"), held_outbox).unwrap();
+        {
+            let mut herdr = f.herdr_state.lock().unwrap();
+            herdr.requests.clear();
+            if old.pane_id.is_empty() {
+                let panes: Vec<_> = herdr.chat_panes.keys().cloned().collect();
+                for pane in panes {
+                    herdr.agents.remove(&pane);
+                    herdr.sessions.remove(&pane);
+                }
+            } else {
+                herdr.agents.remove(&old.pane_id);
+                herdr.sessions.remove(&old.pane_id);
+            }
+        }
+
+        let held = f.chat();
+        assert!(!success_status(held), "Chat held {stage:?}");
+        assert_eq!(
+            f.herdr_state.lock().unwrap().requests.len(),
+            0,
+            "Chat does not automatically repeat any {stage:?} effect"
+        );
+        assert!(!success_status(f.recover_interrupted_chat(true, false)));
+        assert_eq!(f.herdr_state.lock().unwrap().requests.len(), 0);
+
+        success(f.recover_interrupted_chat(true, true));
+        let recovered = f.state();
+        assert_eq!(recovered.orchestrator_history.len(), 1);
+        assert_eq!(recovered.orchestrator_history[0].binding.status, stage);
+        assert_eq!(
+            recovered.workers.runs[0].human_request_id, before.workers.runs[0].human_request_id,
+            "pending question survives {stage:?} replacement"
+        );
+        assert_eq!(
+            recovered.workers.runs[0].answer_history,
+            before.workers.runs[0].answer_history
+        );
+        assert_eq!(
+            fs::read(f.dir.join("chat-outbox.json")).unwrap(),
+            held_outbox,
+            "chat recovery preserves delivery evidence for {stage:?}"
+        );
+        assert_eq!(
+            recovered.orchestrator.as_ref().unwrap().status,
+            store::OrchestratorStatus::Running
+        );
+        let herdr = f.herdr_state.lock().unwrap();
+        assert_eq!(
+            herdr
+                .requests
+                .iter()
+                .filter(|r| r["method"] == "pane.split")
+                .count(),
+            1,
+            "recovery creates one fresh pane after confirming {stage:?} stopped"
+        );
+        assert_eq!(
+            herdr
+                .requests
+                .iter()
+                .filter(|r| r["method"] == "agent.start")
+                .count(),
+            1
+        );
+        assert_eq!(
+            herdr
+                .requests
+                .iter()
+                .filter(|r| r["method"] == "agent.prompt")
+                .count(),
+            1
+        );
+        assert!(herdr.requests.iter().all(|r| r["method"] != "pane.close"));
+        assert!(herdr.requests.iter().all(|r| {
+            !matches!(
+                r["method"].as_str(),
+                Some("agent.prompt" | "agent.start" | "agent.focus")
+            ) || r["params"]["target"] != old.pane_id && r["params"]["pane_id"] != old.pane_id
+        }));
+    }
+}
+
+#[test]
+fn acknowledged_agent_intent_resumes_only_the_not_yet_attempted_prompt() {
+    let f = Fixture::new();
+    success(f.chat());
+    let before = record_pending_worker_question(&f);
+    let workspace = "origin-workspace";
+    let tab = "origin-tab";
+    let pane = "acknowledged-start-pane";
+    let terminal = "acknowledged-start-terminal";
+    let session = json!({"source":"fixture","agent":"codex","kind":"id","value":"acknowledged-before-prompt"});
+    {
+        let mut herdr = f.herdr_state.lock().unwrap();
+        herdr.chat_panes.insert(
+            pane.into(),
+            OpenedWorktree {
+                path: f.state().binding.repository.to_string_lossy().into_owned(),
+                workspace: workspace.into(),
+                tab: tab.into(),
+                pane: pane.into(),
+                terminal: terminal.into(),
+            },
+        );
+        herdr.agents.insert(
+            pane.into(),
+            json!({"agent":"codex","agent_session":session,"agent_status":"idle","terminal_id":terminal,"workspace_id":workspace,"tab_id":tab,"pane_id":pane}),
+        );
+        herdr.sessions.insert(pane.into(), session.clone());
+        herdr.requests.clear();
+    }
+    let mut state = f.state();
+    let binding = state.orchestrator.as_mut().unwrap();
+    binding.status = store::OrchestratorStatus::AgentIntent;
+    binding.workspace_id = workspace.into();
+    binding.tab_id = tab.into();
+    binding.pane_id = pane.into();
+    binding.terminal_id = Some(terminal.into());
+    binding.session = Some(store::AgentSessionIdentity {
+        source: "fixture".into(),
+        agent: "codex".into(),
+        kind: "id".into(),
+        value: "acknowledged-before-prompt".into(),
+    });
+    store::atomic_json(&f.dir.join("state.json"), &state).unwrap();
+
+    success(f.chat());
+    let current = f.state();
+    assert_eq!(
+        current.orchestrator.unwrap().status,
+        store::OrchestratorStatus::Running
+    );
+    assert_eq!(
+        current.workers.runs[0].human_request_id,
+        before.workers.runs[0].human_request_id
+    );
+    let herdr = f.herdr_state.lock().unwrap();
+    assert_eq!(
+        herdr
+            .requests
+            .iter()
+            .filter(|r| r["method"] == "agent.start")
+            .count(),
+        0
+    );
+    assert_eq!(
+        herdr
+            .requests
+            .iter()
+            .filter(|r| r["method"] == "pane.split")
+            .count(),
+        0
+    );
+    assert_eq!(
+        herdr
+            .requests
+            .iter()
+            .filter(|r| r["method"] == "agent.prompt")
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn lost_chat_launch_responses_never_repeat_split_start_or_prompt() {
+    for failure in ["split", "start", "prompt"] {
+        let f = Fixture::new();
+        let before = record_pending_worker_question(&f);
+        {
+            let mut herdr = f.herdr_state.lock().unwrap();
+            match failure {
+                "split" => herdr.ambiguous_split_response = true,
+                "start" => herdr.ambiguous_start_response = true,
+                "prompt" => herdr.ambiguous_prompt_response = true,
+                _ => unreachable!(),
+            }
+        }
+        assert!(
+            !success_status(f.chat()),
+            "simulated lost {failure} response"
+        );
+        let saved = f.state();
+        let old = saved.orchestrator.as_ref().unwrap().clone();
+        assert_eq!(
+            saved.workers.runs[0].human_request_id,
+            before.workers.runs[0].human_request_id
+        );
+        let initial_counts = {
+            let herdr = f.herdr_state.lock().unwrap();
+            ["pane.split", "agent.start", "agent.prompt"].map(|method| {
+                herdr
+                    .requests
+                    .iter()
+                    .filter(|r| r["method"] == method)
+                    .count()
+            })
+        };
+        assert!(!success_status(f.chat()));
+        assert_eq!(
+            ["pane.split", "agent.start", "agent.prompt"].map(|method| {
+                f.herdr_state
+                    .lock()
+                    .unwrap()
+                    .requests
+                    .iter()
+                    .filter(|r| r["method"] == method)
+                    .count()
+            }),
+            initial_counts,
+            "Chat never repeats a launch effect after an ambiguous {failure} response"
+        );
+        assert!(!success_status(f.recover_interrupted_chat(true, false)));
+        if failure != "split" {
+            // A matching provider in the recorded terminal is still the possibly-live
+            // interrupted launch, so the human must stop it before replacement.
+            assert!(!success_status(f.recover_interrupted_chat(true, true)));
+            let mut herdr = f.herdr_state.lock().unwrap();
+            if !old.pane_id.is_empty() {
+                herdr.agents.remove(&old.pane_id);
+                herdr.sessions.remove(&old.pane_id);
+            }
+        }
+        success(f.recover_interrupted_chat(true, true));
+        let final_state = f.state();
+        assert_eq!(final_state.orchestrator_history.len(), 1);
+        assert_eq!(
+            final_state.orchestrator_history[0].binding.status,
+            old.status
+        );
+        assert_eq!(
+            final_state.workers.runs[0].human_request_id,
+            before.workers.runs[0].human_request_id
+        );
+        let herdr = f.herdr_state.lock().unwrap();
+        assert_eq!(
+            ["pane.split", "agent.start", "agent.prompt"].map(|method| {
+                herdr
+                    .requests
+                    .iter()
+                    .filter(|r| r["method"] == method)
+                    .count()
+            }),
+            [
+                initial_counts[0] + 1,
+                initial_counts[1] + 1,
+                initial_counts[2] + 1
+            ]
+        );
+        assert!(herdr.requests.iter().all(|r| r["method"] != "pane.close"));
+    }
+}
+
+#[test]
+fn missing_split_pane_id_is_recoverable_only_after_explicit_confirmation() {
+    let f = Fixture::new();
+    {
+        let mut herdr = f.herdr_state.lock().unwrap();
+        herdr.omit_split_pane_id = true;
+    }
+    assert!(!success_status(f.chat()));
+    let state = f.state();
+    let old = state.orchestrator.unwrap();
+    assert_eq!(old.status, store::OrchestratorStatus::PaneIntent);
+    assert!(old.pane_id.is_empty());
+    let before = f.herdr_state.lock().unwrap().requests.len();
+    assert!(!success_status(f.chat()));
+    assert_eq!(f.herdr_state.lock().unwrap().requests.len(), before);
+    assert!(!success_status(f.recover_interrupted_chat(true, false)));
+    assert_eq!(f.herdr_state.lock().unwrap().requests.len(), before);
+    success(f.recover_interrupted_chat(true, true));
+    let state = f.state();
+    assert_eq!(
+        state.orchestrator_history[0].binding.status,
+        store::OrchestratorStatus::PaneIntent
+    );
+    assert!(state.orchestrator_history[0].binding.pane_id.is_empty());
+    assert_eq!(
+        state.orchestrator.as_ref().unwrap().pane_id,
+        "orchestrator-pane-2"
+    );
+    let herdr = f.herdr_state.lock().unwrap();
+    assert_eq!(
+        herdr
+            .requests
+            .iter()
+            .filter(|r| r["method"] == "pane.split")
+            .count(),
+        2
+    );
+    assert_eq!(
+        herdr
+            .requests
+            .iter()
+            .find(|r| r["method"] == "agent.start")
+            .unwrap()["params"]["pane_id"],
+        "orchestrator-pane-2",
+        "recovery never starts an agent in an unrecorded pane"
+    );
+    assert_eq!(
+        herdr
+            .requests
+            .iter()
+            .find(|r| r["method"] == "agent.prompt")
+            .unwrap()["params"]["target"],
+        "orchestrator-pane-2"
+    );
+    assert!(herdr.requests.iter().all(|r| r["method"] != "pane.close"));
+}
+
+#[test]
+fn prompt_accepted_chat_reconnects_without_duplicate_initial_prompt() {
+    let f = Fixture::new();
+    success(f.chat());
+    let before = record_pending_worker_question(&f);
+    let mut state = f.state();
+    state.orchestrator.as_mut().unwrap().status = store::OrchestratorStatus::PromptAccepted;
+    store::atomic_json(&f.dir.join("state.json"), &state).unwrap();
+    f.herdr_state.lock().unwrap().requests.clear();
+
+    success(f.chat());
+    let recovered = f.state();
+    assert_eq!(
+        recovered.orchestrator.unwrap().status,
+        store::OrchestratorStatus::Running
+    );
+    assert_eq!(
+        recovered.workers.runs[0].human_request_id,
+        before.workers.runs[0].human_request_id
+    );
+    let herdr = f.herdr_state.lock().unwrap();
+    assert_eq!(
+        herdr
+            .requests
+            .iter()
+            .filter(|r| r["method"] == "agent.prompt")
+            .count(),
+        0
+    );
+    assert_eq!(
+        herdr
+            .requests
+            .iter()
+            .filter(|r| r["method"] == "agent.start")
+            .count(),
+        0
+    );
+    assert_eq!(
+        herdr
+            .requests
+            .iter()
+            .filter(|r| r["method"] == "agent.focus")
+            .count(),
+        1
+    );
+}
+
+#[test]
 fn uncertain_chat_delivery_stays_held_across_recovery_until_human_resolution() {
     let f = Fixture::new();
     success(f.chat());
@@ -1236,7 +1655,7 @@ fn scheduler_decision_notice_reaches_chat_without_worker_input() {
     for _ in 0..3 {
         orchestration::reconcile(
             &f.dir,
-            &state,
+            &mut state,
             &herdr,
             &github,
             &[],

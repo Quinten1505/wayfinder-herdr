@@ -83,6 +83,8 @@ pub enum OrchestratorStatus {
     PaneIntent,
     AgentIntent,
     PromptIntent,
+    /// Herdr acknowledged the initial prompt and its resulting agent identity was persisted.
+    PromptAccepted,
     Running,
     Uncertain,
 }

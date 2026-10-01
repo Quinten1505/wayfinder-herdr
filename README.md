@@ -65,6 +65,8 @@ wayfinder-herdr stop-worker --map OWNER/REPOSITORY#NUMBER --run RUN_ID
 wayfinder-herdr retry-worker --map OWNER/REPOSITORY#NUMBER --run RUN_ID --confirmed-absent-or-stopped
 wayfinder-herdr abandon-worker --map OWNER/REPOSITORY#NUMBER --run RUN_ID
 wayfinder-herdr recover-chat --map OWNER/REPOSITORY#NUMBER --confirm-replacement
+wayfinder-herdr recover-chat --map OWNER/REPOSITORY#NUMBER \
+  --confirm-replacement --confirm-launch-absent-or-stopped
 wayfinder-herdr chat-outbox --map OWNER/REPOSITORY#NUMBER
 wayfinder-herdr resolve-chat-delivery --map OWNER/REPOSITORY#NUMBER \
   --message MESSAGE_ID --confirmed-not-delivered
@@ -72,7 +74,7 @@ wayfinder-herdr resolve-chat-delivery --map OWNER/REPOSITORY#NUMBER \
 
 `answer-worker` requires the exact pending request ID and type shown by `status`. For a recorded worker question (`worker_question`), it submits the provided human response through Herdr's occupant-pinned `agent.prompt` API, after verifying worker identity. If Herdr reports that the worker has entered a recognized approval or question UI (`herdr_blocked_ui`), `answer-worker` retains the supplied answer and request evidence but does not send input. Open the named Herdr pane, inspect and answer that UI directly, then run `reconcile`; the worker keeps its capacity and retained evidence until its later state can be observed. A worker question that races into a blocked UI gets a fresh manual-interaction request, and the earlier answer is retained without replay. Ambiguous answer or stop outcomes are not resent automatically. Retrying an uncertain worker requires the caller to explicitly confirm that the prior worker is absent or stopped. Abandoning records the human decision but does not prove termination, release uncertain capacity, or delete retained work.
 
-If the orchestrator pane or agent identity is missing or changed, inspect the previous pane and choose the **Replace Wayfinder Chat** action from the original Herdr workspace (or run `recover-chat --map OWNER/REPOSITORY#NUMBER --confirm-replacement` there). Recovery archives the prior identity and starts in a fresh pane; it never focuses, prompts, closes, or reuses the old pane. Inspect ambiguous chat deliveries with `chat-outbox --map OWNER/REPOSITORY#NUMBER`. After checking the prior chat history, resolve each uncertain message explicitly with `resolve-chat-delivery --map OWNER/REPOSITORY#NUMBER --message MESSAGE_ID --confirmed-delivered` or `--confirmed-not-delivered`; only the latter permits a replay.
+If the orchestrator pane or agent identity is missing or changed, inspect the previous pane and choose the **Recover Wayfinder Chat** action from the original Herdr workspace (or run `recover-chat --map OWNER/REPOSITORY#NUMBER --confirm-replacement` there). Acknowledged launch stages reconnect without repeating an agent start or prompt. For an interrupted or uncertain stage, first inspect Herdr and confirm the old launch is absent or stop it manually; then include `--confirm-launch-absent-or-stopped`. Recovery archives the prior binding and starts in a fresh pane; it never focuses, prompts, closes, or reuses the old pane. Unknown panes are left untouched. Inspect ambiguous chat deliveries with `chat-outbox --map OWNER/REPOSITORY#NUMBER`. After checking the prior chat history, resolve each uncertain message explicitly with `resolve-chat-delivery --map OWNER/REPOSITORY#NUMBER --message MESSAGE_ID --confirmed-delivered` or `--confirmed-not-delivered`; only the latter permits a replay.
 
 ## GitHub map and ticket workflow
 

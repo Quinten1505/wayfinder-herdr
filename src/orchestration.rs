@@ -73,32 +73,53 @@ pub fn open_chat(root: &Path, requested_map: Option<&str>) -> Result<()> {
     let (map, key) = resolve_map(root, requested_map)?;
     let dir = store::map_dir(root, &key)?;
     let _lock = Lock::acquire(&dir.join("state.lock"))?;
-    let state = store::read_state(&dir)?;
+    let mut state = store::read_state(&dir)?;
     let binding = &state.binding;
     host::check(binding)?;
     let socket = binding.socket.clone();
     let client = Client::new(&socket);
 
-    if let Some(orchestrator) = state.orchestrator.as_ref() {
-        if orchestrator.status == OrchestratorStatus::Running {
-            if let Err(error) = verify_orchestrator(&client, orchestrator) {
+    if let Some(orchestrator) = state.orchestrator.clone() {
+        match orchestrator.status {
+            OrchestratorStatus::Running => {
+                if let Err(error) = verify_orchestrator(&client, &orchestrator) {
+                    anyhow::bail!(
+                        "saved orchestrator identity no longer verifies: {error:#}. Inspect the old pane, then use the explicit Herdr action or `wayfinder-herdr recover-chat --map {map} --confirm-replacement` to archive it and create a fresh isolated chat; the old pane will not be stopped or reused"
+                    );
+                }
+                client.focus_agent(&orchestrator.pane_id)?;
+                println!(
+                    "Focused the existing Wayfinder orchestrator chat in pane {} for {}.",
+                    orchestrator.pane_id, map
+                );
+                return Ok(());
+            }
+            OrchestratorStatus::AgentIntent if orchestrator.session.is_some() => {
+                resume_acknowledged_agent(&dir, &map, root, &client, &mut state)?;
+                let resumed = state.orchestrator.as_ref().unwrap();
+                client.focus_agent(&resumed.pane_id)?;
+                println!(
+                    "Resumed the acknowledged Wayfinder orchestrator launch in pane {} for {}.",
+                    resumed.pane_id, map
+                );
+                return Ok(());
+            }
+            OrchestratorStatus::PromptAccepted => {
+                mark_prompt_accepted_running(&dir, &mut state, &client)?;
+                let resumed = state.orchestrator.as_ref().unwrap();
+                client.focus_agent(&resumed.pane_id)?;
+                println!(
+                    "Reconnected to the acknowledged Wayfinder orchestrator chat in pane {} for {}.",
+                    resumed.pane_id, map
+                );
+                return Ok(());
+            }
+            status => {
                 anyhow::bail!(
-                    "saved orchestrator identity no longer verifies: {error:#}. Inspect the old pane, then use the explicit Herdr action or `wayfinder-herdr recover-chat --map {map} --confirm-replacement` to archive it and create a fresh isolated chat; the old pane will not be stopped or reused"
+                    "orchestrator launch state is {status:?}; use `recover-chat --map {map} --confirm-replacement --confirm-launch-absent-or-stopped` only after confirming that the interrupted launch is absent or stopped. Unknown panes are left untouched"
                 );
             }
-            client.focus_agent(&orchestrator.pane_id)?;
-            println!(
-                "Focused the existing Wayfinder orchestrator chat in pane {} for {}.",
-                orchestrator.pane_id, map
-            );
-            return Ok(());
         }
-        anyhow::bail!(
-            "orchestrator launch state is {:?}; inspect map {} and pane {:?} before any retry. Ambiguous chat launches are never duplicated",
-            orchestrator.status,
-            map,
-            orchestrator.pane_id
-        );
     }
     let context = action_context(&client, binding)?;
     launch_chat(
@@ -117,7 +138,12 @@ pub fn open_chat(root: &Path, requested_map: Option<&str>) -> Result<()> {
 
 /// Replace only a positively stale/changed binding after an explicit human action.
 /// A fresh pane is split; neither the previous nor the caller pane is reused.
-pub fn recover_chat(root: &Path, requested_map: Option<&str>, confirmed: bool) -> Result<()> {
+pub fn recover_chat(
+    root: &Path,
+    requested_map: Option<&str>,
+    confirmed: bool,
+    confirmed_old_absent_or_stopped: bool,
+) -> Result<()> {
     ensure!(
         confirmed,
         "recovery requires an explicit human replacement decision; use the Replace Wayfinder Chat action or --confirm-replacement"
@@ -133,23 +159,54 @@ pub fn recover_chat(root: &Path, requested_map: Option<&str>, confirmed: bool) -
         .orchestrator
         .clone()
         .context("there is no saved orchestrator chat to recover")?;
-    ensure!(
-        old.status == OrchestratorStatus::Running,
-        "saved chat launch state is {:?}; it may have created an unobserved agent, so automatic replacement is unsafe; inspect Herdr and reconcile this state manually",
-        old.status
-    );
-    match client.agent(&old.pane_id) {
-        Ok(observed) => {
-            if verify_agent_record(&observed, &old).is_ok() {
-                anyhow::bail!(
-                    "the saved orchestrator chat still has the same verified identity; use Chat to focus it instead of replacing it"
-                );
-            }
-            // A different or incomplete occupant is treated as changed. It is never
-            // focused, prompted, closed, or otherwise touched by recovery.
+
+    if matches!(
+        old.status,
+        OrchestratorStatus::PromptAccepted | OrchestratorStatus::AgentIntent
+    ) && (old.status == OrchestratorStatus::PromptAccepted || old.session.is_some())
+        && matching_orchestrator_agent(&client, &old)?.is_some()
+    {
+        let context = action_context(&client, &state.binding)?;
+        ensure!(
+            context.workspace_id == old.workspace_id,
+            "recover the chat from its original Herdr workspace; no mutation was made"
+        );
+        if old.status == OrchestratorStatus::PromptAccepted {
+            mark_prompt_accepted_running(&dir, &mut state, &client)?;
+            println!("Reconciled the acknowledged chat prompt without resubmitting it.");
+        } else {
+            resume_acknowledged_agent(&dir, &map, root, &client, &mut state)?;
+            println!("Reconciled the acknowledged launch without repeating agent.start.");
         }
-        Err(error) if is_missing_agent_target(&error) => {}
-        Err(error) => return Err(error).context("could not verify the old chat identity"),
+        return Ok(());
+    }
+    match old.status {
+        OrchestratorStatus::Running => {
+            match client.agent(&old.pane_id) {
+                Ok(observed) => {
+                    if verify_agent_record(&observed, &old).is_ok() {
+                        anyhow::bail!(
+                            "the saved orchestrator chat still has the same verified identity; use Chat to focus it instead of replacing it"
+                        );
+                    }
+                    // A different or incomplete occupant is treated as changed. It is never
+                    // focused, prompted, closed, or otherwise touched by recovery.
+                }
+                Err(error) if is_missing_agent_target(&error) => {}
+                Err(error) => return Err(error).context("could not verify the old chat identity"),
+            }
+        }
+        OrchestratorStatus::PaneIntent
+        | OrchestratorStatus::AgentIntent
+        | OrchestratorStatus::PromptIntent
+        | OrchestratorStatus::PromptAccepted
+        | OrchestratorStatus::Uncertain => {
+            ensure!(
+                confirmed_old_absent_or_stopped,
+                "launch recovery requires the human to confirm the interrupted launch is absent or stopped; inspect Herdr, stop it manually if still live, then use --confirm-launch-absent-or-stopped"
+            );
+            confirm_interrupted_launch_not_live(&client, &old)?;
+        }
     }
     let context = action_context(&client, &state.binding)?;
     ensure!(
@@ -173,7 +230,7 @@ pub fn recover_chat(root: &Path, requested_map: Option<&str>, confirmed: bool) -
             client: &client,
             context,
             recovery_note: Some(
-                "Human explicitly replaced the stale chat binding. The archived pane is evidence only: do not inspect, focus, stop, or send input to that old pane. Uncertain outbox messages were not replayed; ask the human to inspect prior chat history and use the explicit delivery-resolution command only after deciding whether each was seen.",
+                "The human explicitly authorized recovery after confirming the prior launch absent or stopped. The archived binding and any panes not selected as the new launch are evidence only: do not focus, stop, reuse, or send input to them. Uncertain outbox messages were not replayed; ask the human to inspect prior chat history and use the explicit delivery-resolution command only after deciding whether each was seen.",
             ),
         },
     )
@@ -284,6 +341,8 @@ fn launch_chat(mut state: State, launch: ChatLaunch<'_>) -> Result<()> {
         &provider.kind,
     )?;
     verify_agent_record(&observed, state.orchestrator.as_ref().unwrap())?;
+    state.orchestrator.as_mut().unwrap().status = OrchestratorStatus::PromptAccepted;
+    store::atomic_json(&dir.join("state.json"), &state)?;
     state.orchestrator.as_mut().unwrap().status = OrchestratorStatus::Running;
     store::atomic_json(&dir.join("state.json"), &state)?;
     println!(
@@ -297,6 +356,131 @@ fn launch_chat(mut state: State, launch: ChatLaunch<'_>) -> Result<()> {
             .unwrap_or_default(),
     );
     Ok(())
+}
+
+/// Complete only the start stage whose acknowledgement and complete process identity
+/// were durably saved. AgentIntent is written before any prompt request, so one
+/// initial prompt is safe to submit from this exact state.
+fn resume_acknowledged_agent(
+    dir: &Path,
+    map: &str,
+    root: &Path,
+    client: &Client,
+    state: &mut State,
+) -> Result<()> {
+    let binding = state
+        .orchestrator
+        .as_ref()
+        .context("orchestrator intent missing")?;
+    ensure!(
+        binding.status == OrchestratorStatus::AgentIntent && binding.session.is_some(),
+        "only an acknowledged agent start with a saved session identity can resume automatically"
+    );
+    verify_orchestrator(client, binding)?;
+    let provider = state.workers.providers.for_role("orchestrator").clone();
+    ensure!(
+        provider.kind == binding.provider,
+        "configured orchestrator provider changed during launch recovery"
+    );
+    let (_, model, effort) = provider_args(&provider)?;
+    state.orchestrator.as_mut().unwrap().status = OrchestratorStatus::PromptIntent;
+    store::atomic_json(&dir.join("state.json"), state)?;
+    let prompt = initial_prompt(map, root, &provider, model.as_deref(), effort.as_deref());
+    let pane_id = state.orchestrator.as_ref().unwrap().pane_id.clone();
+    if let Err(error) = client.prompt(&pane_id, &prompt) {
+        state.orchestrator.as_mut().unwrap().status = OrchestratorStatus::Uncertain;
+        store::atomic_json(&dir.join("state.json"), state)?;
+        anyhow::bail!(
+            "recovered initial prompt outcome is uncertain and will not be repeated: {error:#}"
+        );
+    }
+    persist_prompt_acceptance(dir, state, client)
+}
+
+/// Record Herdr's acknowledged prompt only after the resulting agent identity is
+/// observed and saved. A crash before this durable marker is treated as ambiguous.
+fn persist_prompt_acceptance(dir: &Path, state: &mut State, client: &Client) -> Result<()> {
+    let pane_id = state
+        .orchestrator
+        .as_ref()
+        .context("orchestrator intent missing")?
+        .pane_id
+        .clone();
+    let observed = client.agent(&pane_id)?;
+    let provider = state.orchestrator.as_ref().unwrap().provider.clone();
+    bind_agent(
+        state,
+        observed
+            .get("agent")
+            .context("Herdr omitted orchestrator identity")?,
+        &provider,
+    )?;
+    verify_agent_record(&observed, state.orchestrator.as_ref().unwrap())?;
+    state.orchestrator.as_mut().unwrap().status = OrchestratorStatus::PromptAccepted;
+    store::atomic_json(&dir.join("state.json"), state)?;
+    mark_prompt_accepted_running(dir, state, client)
+}
+
+fn mark_prompt_accepted_running(dir: &Path, state: &mut State, client: &Client) -> Result<()> {
+    let binding = state
+        .orchestrator
+        .as_ref()
+        .context("orchestrator intent missing")?;
+    ensure!(
+        binding.status == OrchestratorStatus::PromptAccepted,
+        "orchestrator prompt has not been durably acknowledged"
+    );
+    verify_orchestrator(client, binding)?;
+    state.orchestrator.as_mut().unwrap().status = OrchestratorStatus::Running;
+    store::atomic_json(&dir.join("state.json"), state)
+}
+
+/// A confirmed replacement can proceed only if Herdr no longer reports the
+/// interrupted process in its original terminal. Any different pane occupant is
+/// left alone; a possibly live original launch must be stopped by the human first.
+fn confirm_interrupted_launch_not_live(client: &Client, old: &OrchestratorBinding) -> Result<()> {
+    if old.pane_id.is_empty() {
+        // The split may have succeeded before its pane ID was persisted. There is
+        // no owned identifier to query or reuse, so require the explicit human gate
+        // and leave all unrecorded panes untouched.
+        return Ok(());
+    }
+    match client.agent(&old.pane_id) {
+        Err(error) if is_missing_agent_target(&error) => Ok(()),
+        Err(error) => Err(error).context("could not inspect interrupted chat before replacement"),
+        Ok(observed) => {
+            let info = observed
+                .get("agent")
+                .context("Herdr omitted agent identity while checking interrupted launch")?;
+            let same_terminal = info["workspace_id"].as_str() == Some(old.workspace_id.as_str())
+                && info["tab_id"].as_str() == Some(old.tab_id.as_str())
+                && info["pane_id"].as_str() == Some(old.pane_id.as_str())
+                && old
+                    .terminal_id
+                    .as_deref()
+                    .is_some_and(|terminal| info["terminal_id"].as_str() == Some(terminal));
+            let same_provider = info["agent"].as_str() == Some(old.provider.as_str());
+            let has_observed_session = info
+                .get("agent_session")
+                .is_some_and(|session| !session.is_null());
+            let same_session = old.session.as_ref().is_some_and(|session| {
+                info["agent_session"]["source"].as_str() == Some(session.source.as_str())
+                    && info["agent_session"]["agent"].as_str() == Some(session.agent.as_str())
+                    && info["agent_session"]["kind"].as_str() == Some(session.kind.as_str())
+                    && info["agent_session"]["value"].as_str() == Some(session.value.as_str())
+            });
+            let session_could_match =
+                old.session.is_none() || !has_observed_session || same_session;
+            ensure!(
+                !(same_terminal && same_provider && session_could_match),
+                "the interrupted orchestrator may still be live in pane {}; stop it manually and verify it is absent before replacement",
+                old.pane_id
+            );
+            // A different identity is not modified or reused. The human's explicit
+            // absence/stopped confirmation applies to the saved launch identity.
+            Ok(())
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -349,12 +533,25 @@ fn action_context(client: &Client, binding: &crate::store::Binding) -> Result<Ac
 
 pub fn reconcile(
     dir: &Path,
-    state: &State,
+    state: &mut State,
     herdr: &Client,
     github: &GitHub,
     ticket_milestones: &[String],
     scheduler_decisions: &[SchedulerDecisionNotice],
 ) -> Result<()> {
+    let Some(binding) = state.orchestrator.as_ref() else {
+        return Ok(());
+    };
+    if binding.status == OrchestratorStatus::PromptAccepted {
+        mark_prompt_accepted_running(dir, state, herdr)?;
+    } else if binding.status == OrchestratorStatus::AgentIntent && binding.session.is_some() {
+        let root = dir
+            .parent()
+            .and_then(Path::parent)
+            .context("map state directory is not below a state root")?;
+        let map = state.map.clone();
+        resume_acknowledged_agent(dir, &map, root, herdr, state)?;
+    }
     let Some(binding) = state.orchestrator.as_ref() else {
         return Ok(());
     };
@@ -788,6 +985,20 @@ fn verify_orchestrator(client: &Client, binding: &OrchestratorBinding) -> Result
     Ok(observed)
 }
 
+/// Return an observation only when it proves the exact persisted session identity.
+/// Missing or changed identities are recoverable by the separate human-gated path.
+fn matching_orchestrator_agent(
+    client: &Client,
+    binding: &OrchestratorBinding,
+) -> Result<Option<Value>> {
+    match client.agent(&binding.pane_id) {
+        Ok(observed) if verify_agent_record(&observed, binding).is_ok() => Ok(Some(observed)),
+        Ok(_) => Ok(None),
+        Err(error) if is_missing_agent_target(&error) => Ok(None),
+        Err(error) => Err(error).context("could not inspect saved orchestrator identity"),
+    }
+}
+
 fn verify_agent_record(agent: &Value, binding: &OrchestratorBinding) -> Result<()> {
     let info = agent
         .get("agent")
@@ -868,7 +1079,7 @@ fn initial_prompt(
     effort: Option<&str>,
 ) -> String {
     format!(
-        "You are the one human-facing Wayfinder orchestrator chat for map {map} at https://github.com/{}/issues/{}.\n\nFirst load and follow the Wayfinder skill at `$HOME/.agents/skills/wayfinder/SKILL.md`. Read AGENTS.md and docs/agents/issue-tracker.md. Inspect the canonical map and linked spec with `gh issue view NUMBER --repo OWNER/REPO --json title,body,comments`; include comments and use them to determine accepted scope and decisions. GitHub Issues is canonical. Never use a worker response as a human answer.\n\nWayfinding is planning by default. Opening this chat does not grant execution authorization. Inspect the accepted map Notes for an explicit execution override, and follow its actual value; do not claim or assume that it exists. Even when a map has an execution override, worker dispatch also requires Wayfinder's durable explicit Start and an unpaused runtime. Never start workers or claim execution is authorized unless the accepted map authorization and runtime state both permit it.\n\nFollow the map and specification. Give brief milestone summaries in this chat while detailed worker/reviewer output stays in their Herdr panes. Group independent pending human questions into a round, provide grounded recommendations, name the linked work each answer unblocks, and continue unaffected work. Never answer for the human. Wait for the human to respond naturally in this chat. For a `worker_question`, only after a genuine human response, invoke the attached Wayfinder binary with `--state-dir {state_root} answer-worker --map {map} --run RUN --request-id REQUEST_ID --request-type worker_question --response RESPONSE`, preserving the exact response and request correlation. The durable state root is `{state_root}`; this Wayfinder executable is `{binary}`. For `herdr_blocked_ui`, preserve the accepted manual path: have the human inspect and interact directly with the named pane, and never send raw pane input.\n\nWorker controls require actual human intent. `pause --map {map}` prevents future dispatch but does not stop active workers. Use `stop-worker --map {map} --run RUN` only after a clear human stop request; claims and artifacts remain retained. `retry-worker --map {map} --run RUN` resumes a confirmed stopped or failed attempt; for uncertain or human-blocked work, first inspect status and the named pane, then require the human to confirm the prior worker is absent or stopped and pass `--confirmed-absent-or-stopped`. Never retry a running or stop-requested worker. `abandon-worker --map {map} --run RUN` requires a clear human decision and applies only to retained or settled work; it records abandonment without proving termination, releasing uncertain capacity, or deleting artifacts. The human controls merges. To operate controls, use the same executable: `start --map {map}` only after explicit human authorization, `resume --map {map}`, and `status --map {map}`.\n\nIf the saved orchestrator identity is missing or changed, do not start another chat or interact with the old pane. Explain that the human must inspect the old session and explicitly choose replacement. Only after that genuine human decision, use `recover-chat --map {map} --confirm-replacement` from the original Herdr workspace; it creates a fresh isolated pane and archives the old binding without stopping, focusing, or prompting the old occupant. For delivery uncertainty, `chat-outbox --map {map}` lists durable messages. After checking the old chat history, the human may run `resolve-chat-delivery --map {map} --message MESSAGE_ID --confirmed-delivered` or `--confirmed-not-delivered`; the latter permits one replay. Never replay an uncertain message without that explicit human decision.\n\nA scheduler-decision notice is not a worker question. Briefly frame the linked ticket title and the exhausted review/conflict choice; ask the human to choose continuation, scope change, or abandonment. Use retained review/conflict evidence for a recommendation, while detailed evidence stays in reviewer/worker panes. Wait for a real human response, then record that exact response with the issue's `answer-decision --map {map} --request-id REQUEST_ID --response RESPONSE` command. This records the scheduler decision locally and never sends input to a completed or stale worker.\n\nOrchestrator provider: {}{}{}. Use the existing attached runtime for status and controls. Do not create a second orchestrating chat.",
+        "You are the one human-facing Wayfinder orchestrator chat for map {map} at https://github.com/{}/issues/{}.\n\nFirst load and follow the Wayfinder skill at `$HOME/.agents/skills/wayfinder/SKILL.md`. Read AGENTS.md and docs/agents/issue-tracker.md. Inspect the canonical map and linked spec with `gh issue view NUMBER --repo OWNER/REPO --json title,body,comments`; include comments and use them to determine accepted scope and decisions. GitHub Issues is canonical. Never use a worker response as a human answer.\n\nWayfinding is planning by default. Opening this chat does not grant execution authorization. Inspect the accepted map Notes for an explicit execution override, and follow its actual value; do not claim or assume that it exists. Even when a map has an execution override, worker dispatch also requires Wayfinder's durable explicit Start and an unpaused runtime. Never start workers or claim execution is authorized unless the accepted map authorization and runtime state both permit it.\n\nFollow the map and specification. Give brief milestone summaries in this chat while detailed worker/reviewer output stays in their Herdr panes. Group independent pending human questions into a round, provide grounded recommendations, name the linked work each answer unblocks, and continue unaffected work. Never answer for the human. Wait for the human to respond naturally in this chat. For a `worker_question`, only after a genuine human response, invoke the attached Wayfinder binary with `--state-dir {state_root} answer-worker --map {map} --run RUN --request-id REQUEST_ID --request-type worker_question --response RESPONSE`, preserving the exact response and request correlation. The durable state root is `{state_root}`; this Wayfinder executable is `{binary}`. For `herdr_blocked_ui`, preserve the accepted manual path: have the human inspect and interact directly with the named pane, and never send raw pane input.\n\nWorker controls require actual human intent. `pause --map {map}` prevents future dispatch but does not stop active workers. Use `stop-worker --map {map} --run RUN` only after a clear human stop request; claims and artifacts remain retained. `retry-worker --map {map} --run RUN` resumes a confirmed stopped or failed attempt; for uncertain or human-blocked work, first inspect status and the named pane, then require the human to confirm the prior worker is absent or stopped and pass `--confirmed-absent-or-stopped`. Never retry a running or stop-requested worker. `abandon-worker --map {map} --run RUN` requires a clear human decision and applies only to retained or settled work; it records abandonment without proving termination, releasing uncertain capacity, or deleting artifacts. The human controls merges. To operate controls, use the same executable: `start --map {map}` only after explicit human authorization, `resume --map {map}`, and `status --map {map}`.\n\nIf an interrupted orchestrator launch is in PaneIntent, AgentIntent without saved session identity, PromptIntent, or Uncertain, never repeat pane creation, agent start, or prompt automatically. Tell the human to inspect Herdr and confirm the old launch is absent or stop it manually. Only after both that confirmation and the human replacement decision, use `recover-chat --map {map} --confirm-replacement --confirm-launch-absent-or-stopped` from the original workspace; recovery archives its prior binding and leaves all unknown/replacement panes untouched. For an acknowledged AgentIntent with a persisted session, Chat safely submits its not-yet-attempted initial prompt once. For PromptAccepted, Chat verifies the saved identity and reconnects without resubmitting it. A missing or changed Running identity still requires the human replacement decision; do not focus, stop, reuse, or send input to the old pane. For delivery uncertainty, `chat-outbox --map {map}` lists durable messages. After checking the old chat history, the human may run `resolve-chat-delivery --map {map} --message MESSAGE_ID --confirmed-delivered` or `--confirmed-not-delivered`; the latter permits one replay. Never replay an uncertain message without that explicit human decision.\n\nA scheduler-decision notice is not a worker question. Briefly frame the linked ticket title and the exhausted review/conflict choice; ask the human to choose continuation, scope change, or abandonment. Use retained review/conflict evidence for a recommendation, while detailed evidence stays in reviewer/worker panes. Wait for a real human response, then record that exact response with the issue's `answer-decision --map {map} --request-id REQUEST_ID --response RESPONSE` command. This records the scheduler decision locally and never sends input to a completed or stale worker.\n\nOrchestrator provider: {}{}{}. Use the existing attached runtime for status and controls. Do not create a second orchestrating chat.",
         MapRef::parse(map)
             .map(|reference| format!("{}/{}", reference.owner, reference.repository))
             .unwrap_or_else(|_| "OWNER/REPO".into()),

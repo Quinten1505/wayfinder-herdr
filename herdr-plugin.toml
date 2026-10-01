@@ -39,9 +39,9 @@ command = ["./bin/wayfinder-herdr", "chat"]
 
 [[actions]]
 id = "recover-chat"
-title = "Replace a missing or changed Wayfinder chat (leave old pane untouched)"
+title = "Recover Wayfinder chat (confirm any interrupted launch is stopped)"
 contexts = ["workspace"]
-command = ["./bin/wayfinder-herdr", "recover-chat", "--confirm-replacement"]
+command = ["./bin/wayfinder-herdr", "recover-chat", "--confirm-replacement", "--confirm-launch-absent-or-stopped"]
 
 [[events]]
 on = "pane.agent_status_changed"

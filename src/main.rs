@@ -63,12 +63,15 @@ enum CommandName {
         #[arg(long)]
         map: Option<String>,
     },
-    /// Replace a missing or changed chat after an explicit human decision; leaves old panes untouched.
+    /// Recover an interrupted or changed chat after explicit human confirmation.
     RecoverChat {
         #[arg(long)]
         map: Option<String>,
         #[arg(long)]
         confirm_replacement: bool,
+        /// Confirm the prior interrupted launch is absent or has been stopped by the human.
+        #[arg(long)]
+        confirm_launch_absent_or_stopped: bool,
     },
     /// Inspect durable chat delivery state before resolving an uncertain message.
     ChatOutbox {
@@ -358,7 +361,13 @@ fn run() -> Result<()> {
         CommandName::RecoverChat {
             map,
             confirm_replacement,
-        } => orchestration::recover_chat(&root, map.as_deref(), confirm_replacement)?,
+            confirm_launch_absent_or_stopped,
+        } => orchestration::recover_chat(
+            &root,
+            map.as_deref(),
+            confirm_replacement,
+            confirm_launch_absent_or_stopped,
+        )?,
         CommandName::ChatOutbox { map } => orchestration::list_deliveries(&root, &map)?,
         CommandName::ResolveChatDelivery {
             map,
