@@ -11,6 +11,7 @@ use serde::{Deserialize, Serialize};
 use std::{
     collections::BTreeMap,
     fs,
+    hash::{Hash, Hasher},
     io::Write,
     path::{Path, PathBuf},
     process::{Command, Stdio},
@@ -74,6 +75,10 @@ pub struct TicketDelivery {
     pub last_error: Option<String>,
     #[serde(default)]
     pub conflict_base: Option<String>,
+    /// Exact candidate whose required checks failed; review and diagnostics
+    /// remain attached to this record through the bounded repair lifecycle.
+    #[serde(default)]
+    pub check_failure_commit: Option<String>,
     #[serde(default)]
     pub superseded_by: Option<String>,
     #[serde(default)]
@@ -91,6 +96,33 @@ pub struct ReviewSummary {
     pub summary: String,
     pub unresolved_findings: Vec<String>,
     pub known_limitations: Vec<String>,
+}
+
+/// Correlation fields required for a complete-feature review to authorize PR
+/// readiness. Ticket reviewers may omit this block; final-feature reviewers may not.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct FinalFeatureReviewScope {
+    pub scope: String,
+    pub map: String,
+    pub base_ref: String,
+    pub base_commit: String,
+    pub reviewed_commit: String,
+    /// Canonical linked spec URL, or `none-linked` when the map has no spec.
+    pub spec: String,
+    pub accepted_decisions_reviewed: bool,
+}
+
+impl FinalFeatureReviewScope {
+    pub fn matches(&self, expected_map: &str, expected_base: &str, expected_commit: &str) -> bool {
+        self.scope == "complete_feature"
+            && self.map == expected_map
+            && self.base_ref == "origin/develop"
+            && self.base_commit == expected_base
+            && self.reviewed_commit == expected_commit
+            && (self.spec == "none-linked" || self.spec.starts_with("https://github.com/"))
+            && self.accepted_decisions_reviewed
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -144,6 +176,8 @@ struct ArchivedReview {
     verdict: String,
     unresolved_findings: Option<Vec<String>>,
     known_limitations: Option<Vec<String>>,
+    #[serde(default)]
+    final_feature_review: Option<FinalFeatureReviewScope>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -180,6 +214,11 @@ pub enum Outcome {
         base_commit: String,
         detail: String,
     },
+    CheckFailure {
+        run_id: String,
+        commit: String,
+        detail: String,
+    },
     Held {
         run_id: String,
         detail: String,
@@ -193,6 +232,34 @@ pub fn read(dir: &Path) -> Result<DeliveryState> {
     }
     let bytes = fs::read(&path)?;
     serde_json::from_slice(&bytes).context("decode delivery state")
+}
+
+/// Retain the exact failed-check ancestry once its bounded implementer repair
+/// has been durably queued. The reviewed commit and approval remain archived.
+pub fn record_check_failure_rework(
+    dir: &Path,
+    source_run: &str,
+    rework_run: &str,
+    commit: &str,
+) -> Result<()> {
+    let _lock = Lock::acquire(&dir.join("integration.lock"))?;
+    let mut delivery = read(dir)?;
+    let entry = delivery
+        .tickets
+        .get_mut(source_run)
+        .context("required-check failure delivery record disappeared")?;
+    ensure!(
+        entry.check_failure_commit.as_deref() == Some(commit),
+        "required-check rework does not match the retained failed candidate"
+    );
+    if entry.superseded_by.is_none() {
+        entry.superseded_by = Some(rework_run.to_owned());
+        entry.superseded_reason = Some(format!(
+            "required checks failed on exact candidate {commit}; bounded rework {} was queued",
+            rework_run
+        ));
+    }
+    save(dir, &delivery)
 }
 
 fn archived_review(run: &crate::store::WorkerRun, expected_commit: &str) -> Result<ArchivedReview> {
@@ -225,6 +292,32 @@ fn archived_review(run: &crate::store::WorkerRun, expected_commit: &str) -> Resu
         "review evidence omitted required unresolved_findings or known_limitations"
     );
     Ok(review)
+}
+
+pub fn final_feature_review_scope_matches(
+    run: &crate::store::WorkerRun,
+    expected_map: &str,
+    expected_base: &str,
+    expected_commit: &str,
+) -> bool {
+    if !run.is_final_feature_review()
+        || run.role != "reviewer"
+        || run.status != WorkerStatus::Completed
+        || run.base_commit.as_deref() != Some(expected_commit)
+    {
+        return false;
+    }
+    let Ok(review) = archived_review(run, expected_commit) else {
+        return false;
+    };
+    let Some(scope) = review.final_feature_review else {
+        return false;
+    };
+    let observed_base = git(&run.worktree, &["rev-parse", "refs/remotes/origin/develop"])
+        .ok()
+        .map(|value| value.trim().to_owned());
+    scope.matches(expected_map, expected_base, expected_commit)
+        && observed_base.as_deref() == Some(expected_base)
 }
 
 fn approved_review(run: &crate::store::WorkerRun, expected_commit: &str) -> Result<ReviewSummary> {
@@ -558,14 +651,7 @@ fn reconcile_readiness_intent(
                 let number = intent.pr_number.to_string();
                 let mutation = gh_text(
                     gh,
-                    &[
-                        "api",
-                        "--method",
-                        "PATCH",
-                        &format!("repos/{repository}/pulls/{number}"),
-                        "-F",
-                        "draft=true",
-                    ],
+                    &["pr", "ready", &number, "--undo", "--repo", repository],
                 );
                 let after = match observe_pr(gh, repository, intent.pr_number) {
                     Ok(observed) => observed,
@@ -812,25 +898,27 @@ fn mark_ready_with(
         .iter()
         .find(|run| run.id == review_run)
         .context("final reviewer run disappeared")?;
-    let review_source = reviewer
-        .source_run
-        .as_deref()
-        .and_then(|source_id| workers.workers.runs.iter().find(|run| run.id == source_id))
+    let review_source = crate::store::implementation_source(&workers.workers.runs, reviewer)
         .context("final reviewer source run disappeared")?;
     ensure!(
         reviewer.role == "reviewer"
             && review_source.role == "implementer"
             && review_source.ticket == reviewer.ticket
-            && reviewer
-                .context
-                .as_deref()
-                .is_some_and(|text| text.starts_with("wayfinder-final-feature-review")),
+            && reviewer.is_final_feature_review(),
         "PR readiness requires the independent final feature reviewer"
     );
     ensure!(
         reviewer.base_commit.as_deref() == Some(commit)
             && reviewer.status == WorkerStatus::Completed,
         "final reviewer did not complete against the current feature commit"
+    );
+    let review_base = delivery
+        .pr_base_commit
+        .as_deref()
+        .context("final feature review has no recorded develop base")?;
+    ensure!(
+        final_feature_review_scope_matches(reviewer, map, review_base, commit),
+        "final review evidence does not correlate a complete-feature scope, map, accepted decisions, origin/develop base, and pinned commit"
     );
     let review_summary = approved_review(reviewer, commit)?;
     ensure!(
@@ -912,13 +1000,29 @@ pub fn reconcile(dir: &Path, state: &State, children: &[ChildTicket]) -> Result<
         .cloned()
         .collect();
     save(dir, &delivery)?;
-    let Some(run) = state
-        .workers
-        .runs
-        .iter()
-        .rev()
-        .find(|run| run.role == "implementer" && run.status == WorkerStatus::Reviewed)
-    else {
+    let delivery_snapshot = read(dir)?;
+    let Some(run) = state.workers.runs.iter().rev().find(|run| {
+        if run.role != "implementer" || run.status != WorkerStatus::Reviewed {
+            return false;
+        }
+        let Some(record) = delivery_snapshot.tickets.get(&run.id) else {
+            return true;
+        };
+        if record.superseded_by.is_some() {
+            return false;
+        }
+        record
+            .check_failure_commit
+            .as_deref()
+            .is_none_or(|failed_commit| {
+                !state.workers.runs.iter().any(|child| {
+                    child.role == "implementer"
+                        && child.ticket == run.ticket
+                        && child.source_run.as_deref() == Some(&run.id)
+                        && child.base_commit.as_deref() == Some(failed_commit)
+                })
+            })
+    }) else {
         return Ok(Outcome::Nothing);
     };
     let Some(reviewed_commit) = run.result_commit.as_deref() else {
@@ -957,7 +1061,8 @@ pub fn reconcile(dir: &Path, state: &State, children: &[ChildTicket]) -> Result<
     let reviewer = state.workers.runs.iter().rev().find(|candidate| {
         candidate.role == "reviewer"
             && candidate.ticket == run.ticket
-            && candidate.source_run.as_deref() == Some(&run.id)
+            && crate::store::implementation_source(&state.workers.runs, candidate)
+                .is_some_and(|implementation| implementation.id == run.id)
             && candidate.status == WorkerStatus::Completed
             && candidate.base_commit.as_deref() == Some(expected_review)
     });
@@ -991,10 +1096,16 @@ pub fn reconcile(dir: &Path, state: &State, children: &[ChildTicket]) -> Result<
         None => {
             let current = git(&repository, &["branch", "--show-current"])?;
             let branch = current.trim().to_owned();
-            ensure!(
-                !branch.is_empty() && branch.starts_with("feature/"),
-                "bound checkout must be on the map feature branch before ticket integration"
-            );
+            if branch.is_empty() || !branch.starts_with("feature/") {
+                let detail =
+                    "bound checkout must be on the map feature branch before ticket integration";
+                entry.last_error = Some(detail.into());
+                save(dir, &delivery)?;
+                return Ok(Outcome::Held {
+                    run_id: run.id.clone(),
+                    detail: detail.into(),
+                });
+            }
             delivery.feature_branch = Some(branch.clone());
             branch
         }
@@ -1014,10 +1125,39 @@ pub fn reconcile(dir: &Path, state: &State, children: &[ChildTicket]) -> Result<
                 .unwrap_or_else(|| "previous rebase conflict remains unresolved".into()),
         });
     }
-    let base = run
-        .base_commit
-        .as_deref()
-        .context("implementation run has no recorded base commit")?;
+    let base = if let Some(base) = run.base_commit.as_deref() {
+        base.to_owned()
+    } else {
+        match git(&repository, &["merge-base", &target, reviewed_commit]) {
+            Ok(base) if !base.trim().is_empty() => {
+                let base = base.trim().to_owned();
+                entry.candidate_base = Some(base.clone());
+                base
+            }
+            Ok(_) => {
+                let detail = format!(
+                    "implementation run omitted its base and feature target {target} has no common ancestor with reviewed candidate {reviewed_commit}"
+                );
+                entry.last_error = Some(detail.clone());
+                save(dir, &delivery)?;
+                return Ok(Outcome::Held {
+                    run_id: run.id.clone(),
+                    detail,
+                });
+            }
+            Err(error) => {
+                let detail = format!(
+                    "could not derive the omitted implementation base from the feature target and reviewed candidate: {error:#}"
+                );
+                entry.last_error = Some(detail.clone());
+                save(dir, &delivery)?;
+                return Ok(Outcome::Held {
+                    run_id: run.id.clone(),
+                    detail,
+                });
+            }
+        }
+    };
     let mut candidate = entry.candidate_commit.clone();
     let mut check_path = run.worktree.clone();
     let needs_rebase = match candidate.as_deref() {
@@ -1049,7 +1189,7 @@ pub fn reconcile(dir: &Path, state: &State, children: &[ChildTicket]) -> Result<
             )?;
         }
         entry.integration_worktree = Some(path.clone());
-        let old_base = entry.candidate_base.as_deref().unwrap_or(base);
+        let old_base = entry.candidate_base.as_deref().unwrap_or(&base);
         let old_commit = entry.candidate_commit.as_deref().unwrap_or(reviewed_commit);
         let checkout = if git(&path, &["rev-parse", "HEAD"]).is_ok() {
             git_result(&path, &["checkout", "--detach", old_commit])
@@ -1096,7 +1236,8 @@ pub fn reconcile(dir: &Path, state: &State, children: &[ChildTicket]) -> Result<
     if let Some(candidate_commit) = candidate.as_ref() {
         let latest_review = state.workers.runs.iter().rev().find(|candidate_run| {
             candidate_run.role == "reviewer"
-                && candidate_run.source_run.as_deref() == Some(&run.id)
+                && crate::store::implementation_source(&state.workers.runs, candidate_run)
+                    .is_some_and(|implementation| implementation.id == run.id)
                 && candidate_run.status == WorkerStatus::Completed
                 && candidate_run.base_commit.as_deref() == Some(candidate_commit)
         });
@@ -1131,16 +1272,37 @@ pub fn reconcile(dir: &Path, state: &State, children: &[ChildTicket]) -> Result<
     entry.checks.clear();
     let checks = match required_checks(&check_path) {
         Ok(checks) => checks,
-        Err(error) => {
-            entry.last_error = Some(format!("required checks failed: {error:#}"));
+        Err(error)
+            if matches!(
+                error.downcast_ref::<RequiredCheckError>(),
+                Some(RequiredCheckError::Launch { .. })
+            ) =>
+        {
+            entry.last_error = Some(format!("required check could not be launched: {error}"));
             save(dir, &delivery)?;
             return Ok(Outcome::Held {
                 run_id: run.id.clone(),
                 detail: format!(
-                    "required checks failed; worktree and evidence retained: {error:#}"
+                    "required-check environment could not start the command; candidate and evidence retained: {error}"
                 ),
             });
         }
+        Err(error)
+            if matches!(
+                error.downcast_ref::<RequiredCheckError>(),
+                Some(RequiredCheckError::Failed { .. })
+            ) =>
+        {
+            entry.last_error = Some(format!("required checks failed: {error:#}"));
+            entry.check_failure_commit = Some(candidate.clone());
+            save(dir, &delivery)?;
+            return Ok(Outcome::CheckFailure {
+                run_id: run.id.clone(),
+                commit: candidate,
+                detail: format!("required checks failed: {error:#}"),
+            });
+        }
+        Err(error) => return Err(error),
     };
     entry.checks = checks;
     ensure!(
@@ -1160,7 +1322,7 @@ pub fn reconcile(dir: &Path, state: &State, children: &[ChildTicket]) -> Result<
         is_ancestor(&repository, &target, &candidate)?,
         "candidate cannot fast-forward the feature branch"
     );
-    update_ref(&repository, &reference, &candidate, &target)?;
+    advance_feature_branch(&repository, &reference, &candidate, &target)?;
     entry.integrated_commit = Some(candidate.clone());
     entry.candidate_commit = Some(candidate.clone());
     entry.last_error = None;
@@ -1220,7 +1382,11 @@ fn supersedable_ancestors(
                     } else if record.candidate_commit.as_deref() == run.base_commit.as_deref() {
                         if let Some(reviewer) = state.workers.runs.iter().find(|candidate| {
                             candidate.role == "reviewer"
-                                && candidate.source_run.as_deref() == Some(&ancestor.id)
+                                && crate::store::implementation_source(
+                                    &state.workers.runs,
+                                    candidate,
+                                )
+                                .is_some_and(|implementation| implementation.id == ancestor.id)
                                 && candidate.base_commit.as_deref() == run.base_commit.as_deref()
                                 && candidate.status == WorkerStatus::Completed
                         }) {
@@ -1266,22 +1432,16 @@ fn feature_review_outcome(
     source: &crate::store::WorkerRun,
     children: &[ChildTicket],
 ) -> Result<Outcome> {
-    let final_review_in_flight = state.workers.runs.iter().any(|run| {
-        run.role == "reviewer"
-            && run
-                .context
-                .as_deref()
-                .is_some_and(|text| text.starts_with("wayfinder-final-feature-review"))
-            && run.reserves_capacity()
-    });
-    let pending_implementation_or_human_work = state.workers.runs.iter().any(|run| {
-        run.reserves_capacity()
-            && !(run.role == "reviewer"
-                && run
-                    .context
-                    .as_deref()
-                    .is_some_and(|text| text.starts_with("wayfinder-final-feature-review")))
-    });
+    let final_review_in_flight = state
+        .workers
+        .runs
+        .iter()
+        .any(|run| run.is_final_feature_review() && run.reserves_capacity());
+    let pending_implementation_or_human_work = state
+        .workers
+        .runs
+        .iter()
+        .any(|run| run.reserves_capacity() && !run.is_final_feature_review());
     let pending_scheduler_decision = state
         .scheduler_decisions
         .iter()
@@ -1316,16 +1476,18 @@ fn feature_review_outcome(
     let head = git(&repository, &["rev-parse", &format!("refs/heads/{branch}")])?
         .trim()
         .to_owned();
+    let review_base = delivery.pr_base_commit.as_deref();
     let final_review = state.workers.runs.iter().rev().find(|candidate| {
         candidate.role == "reviewer"
             && candidate.ticket == source.ticket
-            && candidate.source_run.as_deref() == Some(&source.id)
-            && candidate
-                .context
-                .as_deref()
-                .is_some_and(|text| text.starts_with("wayfinder-final-feature-review"))
+            && crate::store::implementation_source(&state.workers.runs, candidate)
+                .is_some_and(|implementation| implementation.id == source.id)
+            && candidate.is_final_feature_review()
             && candidate.base_commit.as_deref() == Some(&head)
             && candidate.status == WorkerStatus::Completed
+            && review_base.is_some_and(|base| {
+                final_feature_review_scope_matches(candidate, &state.map, base, &head)
+            })
     });
     let Some(final_review) = final_review else {
         return Ok(Outcome::FinalReviewNeeded {
@@ -1511,10 +1673,31 @@ fn ensure_draft_pr_with_gh(
                 },
             )?;
         }
+        let complete_review_present =
+            delivery
+                .ready_commit
+                .as_deref()
+                .is_some_and(|ready_commit| {
+                    workers.workers.runs.iter().any(|run| {
+                        crate::store::implementation_source(&workers.workers.runs, run).is_some()
+                            && final_feature_review_scope_matches(
+                                run,
+                                map,
+                                delivery
+                                    .pr_base_commit
+                                    .as_deref()
+                                    .unwrap_or(observed_base.as_str()),
+                                ready_commit,
+                            )
+                    })
+                });
+        let ready_missing_scope =
+            !existing_pr.draft && delivery.ready_commit.is_some() && !complete_review_present;
         let ready_invalid = !existing_pr.draft
             && (delivery.ready_commit.as_deref() != Some(observed_head.as_str())
                 || delivery.pr_base_commit.as_deref() != Some(observed_base.as_str())
-                || !is_ancestor(repository, &observed_base, &observed_head)?);
+                || !is_ancestor(repository, &observed_base, &observed_head)?
+                || ready_missing_scope);
         let ready_without_verified_evidence = !existing_pr.draft && delivery.ready_commit.is_none();
         let readiness_commit = delivery
             .ready_commit
@@ -1527,6 +1710,8 @@ fn ensure_draft_pr_with_gh(
         if ready_invalid || ready_without_verified_evidence {
             let reason = if ready_without_verified_evidence {
                 "GitHub reports a ready PR without a locally verified readiness record".to_owned()
+            } else if ready_missing_scope {
+                "feature head or develop target changed, or the recorded final review lacks correlated complete-feature scope evidence; renew the review before readiness".to_owned()
             } else {
                 "feature head or develop target changed after final review".to_owned()
             };
@@ -2166,8 +2351,45 @@ fn cleanup_merged_worktrees(
     Ok(())
 }
 
+#[derive(Debug)]
+enum RequiredCheckError {
+    Launch {
+        command: String,
+        source: std::io::Error,
+    },
+    Failed {
+        command: String,
+        detail: String,
+    },
+}
+
+impl std::fmt::Display for RequiredCheckError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Launch { command, source } => {
+                write!(f, "could not launch {command}: {source}")
+            }
+            Self::Failed { command, detail } => write!(f, "{command} failed: {detail}"),
+        }
+    }
+}
+
+impl std::error::Error for RequiredCheckError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Launch { source, .. } => Some(source),
+            Self::Failed { .. } => None,
+        }
+    }
+}
+
 fn required_checks(path: &Path) -> Result<Vec<CheckEvidence>> {
     let commit = git(path, &["rev-parse", "HEAD"])?.trim().to_owned();
+    let target_dir = std::env::var_os("CARGO_TARGET_DIR")
+        .map(PathBuf::from)
+        .map(Ok)
+        .unwrap_or_else(|| check_target_dir(path, &commit))?;
+    fs::create_dir_all(&target_dir).context("create isolated required-check target directory")?;
     let commands: [(&str, &[&str]); 3] = [
         ("cargo", &["fmt", "--all", "--", "--check"]),
         (
@@ -2186,27 +2408,48 @@ fn required_checks(path: &Path) -> Result<Vec<CheckEvidence>> {
     commands
         .into_iter()
         .map(|(program, args)| {
+            let command = format!("{program} {}", args.join(" "));
             let output = Command::new(program)
                 .args(args)
                 .current_dir(path)
+                .env("CARGO_TARGET_DIR", &target_dir)
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped())
                 .output()
-                .with_context(|| format!("launch {program} {}", args.join(" ")))?;
-            ensure!(
-                output.status.success(),
-                "{program} {} failed: {}{}",
-                args.join(" "),
-                String::from_utf8_lossy(&output.stdout),
-                String::from_utf8_lossy(&output.stderr)
-            );
+                .map_err(|source| {
+                    anyhow::Error::new(RequiredCheckError::Launch {
+                        command: command.clone(),
+                        source,
+                    })
+                })?;
+            if !output.status.success() {
+                return Err(anyhow::Error::new(RequiredCheckError::Failed {
+                    command,
+                    detail: format!(
+                        "exit {}\nstdout:\n{}\nstderr:\n{}",
+                        output.status,
+                        String::from_utf8_lossy(&output.stdout),
+                        String::from_utf8_lossy(&output.stderr)
+                    ),
+                }));
+            }
             Ok(CheckEvidence {
                 commit: commit.clone(),
-                command: format!("{program} {}", args.join(" ")),
+                command,
                 result: format!("passed (exit {})", output.status),
             })
         })
         .collect()
+}
+
+fn check_target_dir(path: &Path, commit: &str) -> Result<PathBuf> {
+    let canonical = fs::canonicalize(path).context("resolve required-check checkout")?;
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    canonical.hash(&mut hasher);
+    Ok(std::env::temp_dir()
+        .join("wayfinder-herdr-required-check-targets")
+        .join(format!("{:016x}", hasher.finish()))
+        .join(commit))
 }
 
 fn run(path: &Path, program: &str, args: &[&str]) -> Result<()> {
@@ -2274,6 +2517,58 @@ fn update_ref(repository: &Path, reference: &str, new: &str, expected_old: &str)
         .context("feature branch changed before serialized fast-forward")?;
     Ok(())
 }
+
+/// Advance an integration target and its checkout together. A bound repository
+/// commonly has the feature branch checked out; updating only its ref would
+/// leave the index and files at the prior commit while reporting integration.
+fn advance_feature_branch(
+    repository: &Path,
+    reference: &str,
+    new: &str,
+    expected_old: &str,
+) -> Result<()> {
+    let current = git(repository, &["branch", "--show-current"])?;
+    let current_ref = format!("refs/heads/{}", current.trim());
+    if current_ref == reference {
+        ensure!(
+            git(repository, &["rev-parse", "HEAD"])?.trim() == expected_old,
+            "checked-out feature branch moved before integration"
+        );
+        ensure!(
+            git(repository, &["rev-parse", reference])?.trim() == expected_old,
+            "feature ref changed before checked-out fast-forward"
+        );
+        let output = Command::new("git")
+            .args(["-C"])
+            .arg(repository)
+            // Git otherwise replaces ignored files when the incoming commit
+            // starts tracking their path. Those files are invisible to
+            // status/porcelain, so require an explicit refusal before moving
+            // either the branch or the checked-out files.
+            .args([
+                "merge",
+                "--ff-only",
+                "--no-edit",
+                "--no-overwrite-ignore",
+                new,
+            ])
+            .output()
+            .context("fast-forward checked-out feature branch")?;
+        ensure!(
+            output.status.success(),
+            "checked-out feature branch fast-forward failed safely: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+        ensure!(
+            git(repository, &["rev-parse", "HEAD"])?.trim() == new
+                && git(repository, &["rev-parse", reference])?.trim() == new,
+            "checked-out feature branch did not reach the reviewed integration commit"
+        );
+    } else {
+        update_ref(repository, reference, new, expected_old)?;
+    }
+    Ok(())
+}
 fn validate_worktree(repository: &Path, path: &Path) -> Result<()> {
     let expected = fs::canonicalize(path)?;
     let root = git(path, &["rev-parse", "--show-toplevel"])?;
@@ -2331,6 +2626,60 @@ mod tests {
 
     impl Fixture {
         fn new(conflicting_target: bool, stale_evidence: bool) -> Self {
+            Self::build(conflicting_target, stale_evidence, true, false)
+        }
+
+        fn missing_lockfile() -> Self {
+            Self::build(false, false, false, true)
+        }
+
+        fn check_ready() -> Self {
+            let mut fixture = Self::build(false, false, false, false);
+            let worktree = &fixture.state.workers.runs[0].worktree;
+            fs::create_dir_all(worktree.join("src")).unwrap();
+            fs::write(
+                worktree.join("Cargo.toml"),
+                "[package]\nname = \"locked-check-fixture\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+            )
+            .unwrap();
+            fs::write(
+                worktree.join("src/lib.rs"),
+                "pub fn value() -> u8 {\n    1\n}\n",
+            )
+            .unwrap();
+            fs::write(
+                worktree.join("Cargo.lock"),
+                "version = 4\n\n[[package]]\nname = \"locked-check-fixture\"\nversion = \"0.1.0\"\n",
+            )
+            .unwrap();
+            command(worktree, &["add", "Cargo.toml", "Cargo.lock", "src"]);
+            command(
+                worktree,
+                &["commit", "--quiet", "-m", "locked check fixture"],
+            );
+            let candidate = command(worktree, &["rev-parse", "HEAD"]);
+            let reviewer = &fixture.state.workers.runs[1].worktree;
+            command(reviewer, &["checkout", "--detach", &candidate]);
+            fixture.state.workers.runs[0].result_commit = Some(candidate.clone());
+            fixture.state.workers.runs[1].base_commit = Some(candidate.clone());
+            let review_path = fixture.state.workers.runs[1]
+                .result_evidence
+                .as_ref()
+                .unwrap();
+            let mut evidence: serde_json::Value =
+                serde_json::from_slice(&fs::read(review_path).unwrap()).unwrap();
+            evidence["reviewed_commit"] = json!(candidate);
+            fs::write(review_path, serde_json::to_vec(&evidence).unwrap()).unwrap();
+            fixture.implementation = candidate;
+            fixture
+        }
+
+        fn build(
+            conflicting_target: bool,
+            stale_evidence: bool,
+            advance_target: bool,
+            missing_lockfile: bool,
+        ) -> Self {
             let temp = tempfile::tempdir().unwrap();
             let repo = temp.path().join("repo");
             fs::create_dir(&repo).unwrap();
@@ -2357,6 +2706,26 @@ mod tests {
             );
             fs::write(implementation_path.join("shared.txt"), "implementation\n").unwrap();
             command(&implementation_path, &["add", "shared.txt"]);
+            if missing_lockfile {
+                fs::create_dir_all(implementation_path.join("src")).unwrap();
+                fs::create_dir_all(implementation_path.join("tests")).unwrap();
+                fs::write(
+                    implementation_path.join("Cargo.toml"),
+                    "[package]\nname = \"check-failure-fixture\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+                )
+                .unwrap();
+                fs::write(
+                    implementation_path.join("src/lib.rs"),
+                    "pub fn value() -> u8 {\n    1\n}\n",
+                )
+                .unwrap();
+                fs::write(
+                    implementation_path.join("tests/check.rs"),
+                    "#[test]\nfn check() {\n    assert_eq!(check_failure_fixture::value(), 1);\n}\n",
+                )
+                .unwrap();
+                command(&implementation_path, &["add", "Cargo.toml", "src", "tests"]);
+            }
             command(
                 &implementation_path,
                 &["commit", "--quiet", "-m", "implementation"],
@@ -2403,15 +2772,17 @@ mod tests {
                 &target_path,
                 &["commit", "--quiet", "-m", "advance feature target"],
             );
-            command(
-                &repo,
-                &[
-                    "update-ref",
-                    "refs/heads/feature/delivery-test",
-                    &command(&target_path, &["rev-parse", "HEAD"]),
-                    &base,
-                ],
-            );
+            if advance_target {
+                command(
+                    &repo,
+                    &[
+                        "update-ref",
+                        "refs/heads/feature/delivery-test",
+                        &command(&target_path, &["rev-parse", "HEAD"]),
+                        &base,
+                    ],
+                );
+            }
 
             let implementer = json!({"id":"run-00000000000000000001","ticket":15,"role":"implementer","attempt":1,"rework_round":0,"status":"reviewed","worktree":implementation_path,"workspace_id":null,"tab_id":null,"pane_id":null,"base_commit":base,"result_commit":implementation,"summary":"implemented","question":null,"source_run":null,"claim_login":"fixture","context":null,"last_activity_ms":null,"terminal_id":null,"agent_provider":null,"agent_session":null,"foreground_process":null,"result_evidence":null});
             let reviewer = json!({"id":"run-00000000000000000002","ticket":15,"role":"reviewer","attempt":1,"rework_round":0,"status":"completed","worktree":reviewer_path,"workspace_id":null,"tab_id":null,"pane_id":null,"base_commit":implementation,"result_commit":null,"summary":"approved","question":null,"source_run":"run-00000000000000000001","claim_login":"fixture","context":null,"last_activity_ms":null,"terminal_id":null,"agent_provider":null,"agent_session":null,"foreground_process":null,"result_evidence":evidence});
@@ -2445,6 +2816,267 @@ mod tests {
                 .contains("stale for the expected exact commit")
         );
         assert!(read(&f.dir).unwrap().tickets.is_empty());
+    }
+
+    #[test]
+    fn required_check_failure_retains_approval_and_exact_candidate_for_rework() {
+        let f = Fixture::missing_lockfile();
+        let outcome = reconcile(&f.dir, &f.state, &[]).unwrap();
+        let Outcome::CheckFailure {
+            run_id,
+            commit,
+            detail,
+        } = outcome
+        else {
+            panic!("expected a confirmed required-check failure, got {outcome:?}")
+        };
+        assert_eq!(run_id, "run-00000000000000000001");
+        assert_eq!(commit, f.implementation);
+        assert!(
+            detail.contains("cargo clippy --locked --all-targets"),
+            "{detail}"
+        );
+        assert!(detail.contains("Cargo.lock"), "{detail}");
+        let delivery = read(&f.dir).unwrap();
+        let ticket = delivery.tickets.get(&run_id).unwrap();
+        assert_eq!(
+            ticket.check_failure_commit.as_deref(),
+            Some(commit.as_str())
+        );
+        assert_eq!(ticket.review.as_ref().unwrap().commit, commit);
+        assert!(ticket.last_error.as_deref().unwrap().contains(&detail));
+        assert!(ticket.integrated_commit.is_none());
+        assert!(
+            !f.state.workers.runs[0].worktree.join("target").exists(),
+            "Cargo output stays outside the worker checkout even on check failure"
+        );
+        assert_eq!(
+            git(&f.repo, &["rev-parse", "refs/heads/feature/delivery-test"])
+                .unwrap()
+                .trim(),
+            f.state
+                .workers
+                .runs
+                .iter()
+                .find(|run| run.role == "implementer")
+                .unwrap()
+                .base_commit
+                .as_deref()
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn required_checks_use_owned_external_target_and_integrate_clean_candidate() {
+        let f = Fixture::check_ready();
+        let outcome = reconcile(&f.dir, &f.state, &[]).unwrap();
+        assert!(
+            matches!(&outcome, Outcome::Integrated { commit, .. } if commit == &f.implementation),
+            "locked checks should integrate the exact approved candidate: {outcome:?}"
+        );
+        assert!(
+            !f.state.workers.runs[0].worktree.join("target").exists(),
+            "required checks must not dirty the owned implementation checkout"
+        );
+        let worktree = &f.state.workers.runs[0].worktree;
+        let check_target = std::env::var_os("CARGO_TARGET_DIR")
+            .map(PathBuf::from)
+            .map(Ok)
+            .unwrap_or_else(|| check_target_dir(worktree, &f.implementation))
+            .unwrap();
+        assert!(check_target.exists());
+        assert!(
+            !check_target.starts_with(worktree),
+            "required-check build outputs must stay outside the owned checkout"
+        );
+        let delivery = read(&f.dir).unwrap();
+        let ticket = delivery.tickets.values().next().unwrap();
+        assert_eq!(
+            ticket.integrated_commit.as_deref(),
+            Some(f.implementation.as_str())
+        );
+        assert_eq!(ticket.checks.len(), 3);
+        assert!(ticket.checks.iter().all(|check| {
+            check.commit == f.implementation && check.result.starts_with("passed")
+        }));
+        assert_eq!(
+            git(&f.repo, &["rev-parse", "refs/heads/feature/delivery-test"])
+                .unwrap()
+                .trim(),
+            f.implementation
+        );
+        assert_eq!(
+            git(&f.repo, &["rev-parse", "HEAD"]).unwrap().trim(),
+            f.implementation,
+            "checked-out feature branch HEAD must follow the integrated ref"
+        );
+        assert!(git(&f.repo, &["status", "--porcelain"]).unwrap().is_empty());
+        assert_eq!(
+            git(&f.repo, &["write-tree"]).unwrap().trim(),
+            command(&f.repo, &["rev-parse", "HEAD^{tree}"]),
+            "the checked-out index must match the integrated commit tree"
+        );
+        assert_eq!(
+            fs::read(f.repo.join("Cargo.lock")).unwrap(),
+            git(&f.repo, &["show", "HEAD:Cargo.lock"])
+                .unwrap()
+                .into_bytes()
+        );
+    }
+
+    #[test]
+    fn approval_from_retried_reviewer_resolves_through_original_implementation() {
+        let mut f = Fixture::check_ready();
+        let prior_reviewer = &mut f.state.workers.runs[1];
+        prior_reviewer.status = WorkerStatus::Stopped;
+        let reviewer_path = f._temp.path().join("reviewer-retry");
+        command(
+            &f.repo,
+            &[
+                "worktree",
+                "add",
+                "--detach",
+                reviewer_path.to_str().unwrap(),
+                &f.implementation,
+            ],
+        );
+        let report = f._temp.path().join("reviewer-retry-result.json");
+        fs::write(
+            &report,
+            serde_json::to_vec(&json!({
+                "format_version":1,
+                "run_id":"run-review-retry",
+                "ticket":15,
+                "role":"reviewer",
+                "status":"completed",
+                "summary":"approved the same exact candidate after restart recovery",
+                "reviewed_commit":f.implementation,
+                "verdict":"approved",
+                "unresolved_findings":[],
+                "known_limitations":[]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let mut retry = f.state.workers.runs[1].clone();
+        retry.id = "run-review-retry".into();
+        retry.attempt = 2;
+        retry.status = WorkerStatus::Completed;
+        retry.worktree = reviewer_path;
+        retry.source_run = Some("run-00000000000000000002".into());
+        retry.result_evidence = Some(report);
+        f.state.workers.runs.push(retry);
+
+        let outcome = reconcile(&f.dir, &f.state, &[]).unwrap();
+        assert!(
+            matches!(&outcome, Outcome::Integrated { commit, .. } if commit == &f.implementation),
+            "a retried reviewer must approve the implementation ancestor, not be orphaned: {outcome:?}"
+        );
+        let delivery = read(&f.dir).unwrap();
+        assert_eq!(
+            delivery
+                .tickets
+                .values()
+                .next()
+                .and_then(|ticket| ticket.integrated_commit.as_deref()),
+            Some(f.implementation.as_str())
+        );
+    }
+
+    #[test]
+    fn checked_out_fast_forward_preserves_unrelated_untracked_user_file() {
+        let f = Fixture::check_ready();
+        let note = f.repo.join("human-notes.txt");
+        fs::write(&note, "retain unrelated user content\n").unwrap();
+        let outcome = reconcile(&f.dir, &f.state, &[]).unwrap();
+        assert!(matches!(outcome, Outcome::Integrated { .. }));
+        assert_eq!(
+            fs::read_to_string(&note).unwrap(),
+            "retain unrelated user content\n"
+        );
+        assert_eq!(
+            git(&f.repo, &["rev-parse", "HEAD"]).unwrap().trim(),
+            f.implementation
+        );
+        assert!(
+            git(&f.repo, &["status", "--porcelain"])
+                .unwrap()
+                .contains("?? human-notes.txt")
+        );
+    }
+
+    #[test]
+    fn checked_out_fast_forward_preserves_ignored_user_file_at_new_candidate_path() {
+        let f = Fixture::check_ready();
+        let ignored = f.repo.join("Cargo.lock");
+        fs::write(f.repo.join(".git/info/exclude"), "Cargo.lock\n").unwrap();
+        fs::write(&ignored, "human's local ignored content\n").unwrap();
+        assert!(command(&f.repo, &["check-ignore", "Cargo.lock"]).contains("Cargo.lock"));
+
+        let error = reconcile(&f.dir, &f.state, &[]).unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("checked-out feature branch fast-forward failed safely"),
+            "integration should retain a visible refusal: {error:#}"
+        );
+        assert_eq!(
+            fs::read_to_string(&ignored).unwrap(),
+            "human's local ignored content\n",
+            "a reviewed candidate must not overwrite ignored local data"
+        );
+        assert_ne!(
+            git(&f.repo, &["rev-parse", "HEAD"]).unwrap().trim(),
+            f.implementation,
+            "the checked-out ref must remain at its old commit when Git refuses"
+        );
+        assert_ne!(
+            git(&f.repo, &["rev-parse", "refs/heads/feature/delivery-test"])
+                .unwrap()
+                .trim(),
+            f.implementation,
+            "the feature ref must not advance when checkout preservation fails"
+        );
+    }
+
+    #[test]
+    fn checked_out_fast_forward_refuses_a_stale_expected_target() {
+        let f = Fixture::check_ready();
+        let error = advance_feature_branch(
+            &f.repo,
+            "refs/heads/feature/delivery-test",
+            &f.implementation,
+            "0000000000000000000000000000000000000000",
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("moved before integration"));
+        assert_eq!(
+            git(&f.repo, &["rev-parse", "HEAD"]).unwrap().trim(),
+            f.state.workers.runs[0].base_commit.as_deref().unwrap()
+        );
+        assert!(git(&f.repo, &["status", "--porcelain"]).unwrap().is_empty());
+    }
+
+    #[test]
+    fn legacy_reviewed_run_without_base_uses_exact_common_ancestor_for_checking() {
+        let mut f = Fixture::missing_lockfile();
+        f.state.workers.runs[0].base_commit = None;
+        let outcome = reconcile(&f.dir, &f.state, &[]).unwrap();
+        assert!(
+            matches!(&outcome, Outcome::CheckFailure { commit, .. } if commit == &f.implementation),
+            "legacy missing-base candidate should reach the required checks: {outcome:?}"
+        );
+        let delivery = read(&f.dir).unwrap();
+        let ticket = delivery.tickets.values().next().unwrap();
+        assert_eq!(
+            ticket.candidate_base.as_deref(),
+            Some(
+                git(&f.repo, &["rev-parse", "refs/heads/feature/delivery-test"])
+                    .unwrap()
+                    .trim()
+            )
+        );
     }
 
     #[test]
@@ -2526,6 +3158,27 @@ mod tests {
     }
 
     #[test]
+    fn wrong_bound_branch_holds_delivery_without_aborting_runtime_reconciliation() {
+        let f = Fixture::new(false, false);
+        command(&f.repo, &["checkout", "develop"]);
+        let outcome = reconcile(&f.dir, &f.state, &[]).unwrap();
+        assert!(
+            matches!(outcome, Outcome::Held { detail, .. } if detail.contains("feature branch"))
+        );
+        let ticket = read(&f.dir).unwrap().tickets;
+        assert!(ticket.values().any(|entry| {
+            entry
+                .last_error
+                .as_deref()
+                .is_some_and(|detail| detail.contains("feature branch"))
+        }));
+        assert_eq!(
+            git(&f.repo, &["branch", "--show-current"]).unwrap().trim(),
+            "develop"
+        );
+    }
+
+    #[test]
     fn rebase_conflict_is_retained_and_repeated_hook_does_not_retry_it() {
         let f = Fixture::new(true, false);
         let first = reconcile(&f.dir, &f.state, &[]).unwrap();
@@ -2582,8 +3235,22 @@ mod tests {
             "external closure without verified integration evidence must block final review"
         );
         children.pop();
-        let ready = feature_review_outcome(&f.state, &delivery, source, &children).unwrap();
-        assert!(matches!(ready, Outcome::FinalReviewNeeded { .. }));
+        let ready_while_open =
+            feature_review_outcome(&f.state, &delivery, source, &children).unwrap();
+        assert!(matches!(
+            ready_while_open,
+            Outcome::FinalReviewNeeded { .. }
+        ));
+        children[0].state = "closed".into();
+        let ready_after_natural_closure =
+            feature_review_outcome(&f.state, &delivery, source, &children).unwrap();
+        assert!(
+            matches!(
+                ready_after_natural_closure,
+                Outcome::FinalReviewNeeded { .. }
+            ),
+            "a naturally closed task with verified integration evidence must allow final review"
+        );
     }
 
     #[test]
@@ -2967,7 +3634,7 @@ elif args[:2] == ['pr','create']:
 elif args[:2] == ['pr','edit']:
     state['edits'] += 1
     json.dump(state,open(path,'w'))
-elif args[:2] == ['pr','ready']:
+elif args[:2] == ['pr','ready'] and '--undo' not in args:
     state['pr']['isDraft']=False
     if state.get('ready_head_override'):
         state['pr']['headRefOid']=state['ready_head_override']
@@ -2989,7 +3656,7 @@ elif args[:2] == ['pr','view']:
         sys.stderr.write('simulated post-ready view failure\n')
         sys.exit(1)
     print(json.dumps(state['pr']))
-elif args[:3] == ['api','--method','PATCH'] and args[-2:] == ['-F','draft=true']:
+elif args[:2] == ['pr','ready'] and '--undo' in args:
     if state.get('redraft_fail_before_effect',0) > 0:
         state['redraft_fail_before_effect'] -= 1
         json.dump(state,open(path,'w'))
@@ -3090,18 +3757,62 @@ else:
             ],
         );
         let evidence = temp.path().join("final-review.json");
+        let review_base = command(&repo, &["rev-parse", "refs/remotes/origin/develop"]);
         fs::write(
             &evidence,
             serde_json::to_vec(&json!({
                 "format_version":1,"run_id":"run-final-review","ticket":15,"role":"reviewer",
                 "status":"completed","summary":"Final review found the integration boundaries correct.",
                 "reviewed_commit":head,"verdict":"approved","unresolved_findings":[],
-                "known_limitations":["The test used a disposable local GitHub endpoint."]
+                "known_limitations":["The test used a disposable local GitHub endpoint."],
+                "final_feature_review":{
+                    "scope":"complete_feature","map":"example/project#42",
+                    "base_ref":"origin/develop","base_commit":review_base,
+                    "reviewed_commit":head,"spec":"none-linked",
+                    "accepted_decisions_reviewed":true
+                }
             })).unwrap(),
         )
         .unwrap();
-        let reviewer = json!({"id":"run-final-review","ticket":15,"role":"reviewer","attempt":1,"rework_round":0,"status":"completed","worktree":reviewer_path,"workspace_id":null,"tab_id":null,"pane_id":null,"base_commit":head,"result_commit":null,"summary":"feature approved","question":null,"source_run":"run-1","claim_login":"fixture","context":"wayfinder-final-feature-review","last_activity_ms":null,"terminal_id":null,"agent_provider":null,"agent_session":null,"foreground_process":null,"result_evidence":evidence});
-        let mut ready_workers: State = serde_json::from_value(json!({"format_version":1,"map":"example/project#42","binding":{"repository":repo,"herdr_binary":"/bin/true","socket":"/tmp/test.sock","herdr_config":null},"authorization":"started","poll_seconds":30,"concurrency":3,"reconciled":true,"suspension":"","history":[],"workers":{"next_run":3,"runs":[reviewer,{"id":"run-1","ticket":15,"role":"implementer","attempt":1,"status":"reviewed","worktree":repo,"base_commit":head,"result_commit":head}],"providers":{}}})).unwrap();
+        let reviewer = json!({"id":"run-final-review","ticket":15,"role":"reviewer","attempt":2,"rework_round":0,"status":"completed","worktree":reviewer_path,"workspace_id":null,"tab_id":null,"pane_id":null,"base_commit":head,"result_commit":null,"summary":"feature approved","question":null,"source_run":"run-final-first","purpose":"final_feature_review","claim_login":null,"context":"Human explicitly authorized this retry after the preceding worker was confirmed stopped or absent.","last_activity_ms":null,"terminal_id":null,"agent_provider":null,"agent_session":null,"foreground_process":null,"result_evidence":evidence});
+        let retry_parent = json!({"id":"run-final-first","ticket":15,"role":"reviewer","attempt":1,"status":"stopped","worktree":repo,"base_commit":head,"source_run":"run-1","purpose":"final_feature_review","context":"Human explicitly authorized this retry after the preceding worker was confirmed stopped or absent."});
+        let mut ready_workers: State = serde_json::from_value(json!({"format_version":1,"map":"example/project#42","binding":{"repository":repo,"herdr_binary":"/bin/true","socket":"/tmp/test.sock","herdr_config":null},"authorization":"started","poll_seconds":30,"concurrency":3,"reconciled":true,"suspension":"","history":[],"workers":{"next_run":4,"runs":[reviewer,retry_parent,{"id":"run-1","ticket":15,"role":"implementer","attempt":1,"status":"reviewed","worktree":repo,"base_commit":head,"result_commit":head}],"providers":{}}})).unwrap();
+        let reviewer_run = &ready_workers.workers.runs[0];
+        assert!(final_feature_review_scope_matches(
+            reviewer_run,
+            "example/project#42",
+            &review_base,
+            &head
+        ));
+        let mut missing_scope: serde_json::Value =
+            serde_json::from_slice(&fs::read(&evidence).unwrap()).unwrap();
+        missing_scope
+            .as_object_mut()
+            .unwrap()
+            .remove("final_feature_review");
+        fs::write(&evidence, serde_json::to_vec(&missing_scope).unwrap()).unwrap();
+        assert!(!final_feature_review_scope_matches(
+            reviewer_run,
+            "example/project#42",
+            &review_base,
+            &head
+        ));
+        fs::write(
+            &evidence,
+            serde_json::to_vec(&json!({
+                "format_version":1,"run_id":"run-final-review","ticket":15,"role":"reviewer",
+                "status":"completed","summary":"Final review found the integration boundaries correct.",
+                "reviewed_commit":head,"verdict":"approved","unresolved_findings":[],
+                "known_limitations":["The test used a disposable local GitHub endpoint."],
+                "final_feature_review":{
+                    "scope":"complete_feature","map":"example/project#42",
+                    "base_ref":"origin/develop","base_commit":review_base,
+                    "reviewed_commit":head,"spec":"none-linked",
+                    "accepted_decisions_reviewed":true
+                }
+            })).unwrap(),
+        )
+        .unwrap();
         let mut requested_changes: serde_json::Value =
             serde_json::from_slice(&fs::read(&evidence).unwrap()).unwrap();
         requested_changes["verdict"] = json!("changes_requested");
@@ -3223,8 +3934,46 @@ else:
         let ready = read(&state_dir).unwrap();
         assert_eq!(ready.final_checks.len(), 1);
 
+        // A legacy/narrow final review cannot keep a ready PR. The durable
+        // readiness intent returns it to draft and verifies GitHub's result.
+        let accepted_review_evidence = fs::read(&evidence).unwrap();
+        let mut narrow_review: serde_json::Value =
+            serde_json::from_slice(&accepted_review_evidence).unwrap();
+        narrow_review
+            .as_object_mut()
+            .unwrap()
+            .remove("final_feature_review");
+        fs::write(&evidence, serde_json::to_vec(&narrow_review).unwrap()).unwrap();
+        ensure_draft_pr_with_gh(&state_dir, &repo, "example/project#42", &ready_workers, &gh)
+            .unwrap();
+        let invalidated = read(&state_dir).unwrap();
+        assert!(invalidated.ready_commit.is_none());
+        assert!(invalidated.final_review_commit.is_none());
+        assert!(invalidated.readiness_intent.is_none());
+        assert!(invalidated.draft_pr.as_ref().unwrap().draft);
         let mut remote: serde_json::Value =
             serde_json::from_slice(&fs::read(&gh_state_path).unwrap()).unwrap();
+        assert_eq!(remote["pr"]["isDraft"], true);
+        fs::write(&evidence, accepted_review_evidence).unwrap();
+        mark_ready_with(
+            &state_dir,
+            &repo,
+            "example/project#42",
+            &ready_workers,
+            "run-final-review",
+            &head,
+            |_| {
+                Ok(vec![CheckEvidence {
+                    commit: head.clone(),
+                    command: "cargo test --locked --all-targets".into(),
+                    result: "passed (exit 0)".into(),
+                }])
+            },
+            &gh,
+        )
+        .unwrap();
+
+        remote = serde_json::from_slice(&fs::read(&gh_state_path).unwrap()).unwrap();
         remote["pr"]["isDraft"] = json!(true);
         remote["pr"]["headRefOid"] = json!(head);
         remote["ready_head_override"] = json!("concurrent-head-change");

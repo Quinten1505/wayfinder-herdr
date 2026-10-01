@@ -1,0 +1,35 @@
+{
+  "authorization": "started",
+  "suspension": "Host and GitHub reconciled; 0/2 worker slots reserved; orchestrator chat is held for explicit reconciliation: herdr agent.get failed: agent target w2:p6 not found (agent_not_found)",
+  "orchestrator": {
+    "pane_id": "w2:p6",
+    "terminal_id": "term_65cce662e5cbb10",
+    "status": "running",
+    "session": {
+      "source": "herdr:codex",
+      "agent": "codex",
+      "kind": "id",
+      "value": "01a0f972-3c6d-7421-ba37-de3bbebd14b9"
+    },
+    "foreground_process": {
+      "boot_id": "a093fcea-966d-46f2-8931-2d79488ce85b",
+      "pid": 1188931,
+      "start_time_ticks": 4883656
+    },
+    "initial_prompt_attempted": true
+  },
+  "history_count": 241,
+  "history_last_id": "request-00000000000000000241",
+  "history_ids_unchanged": true,
+  "sequence_next": 242,
+  "inbox_files": [],
+  "inbox_unchanged": true,
+  "outbox_messages": 77,
+  "outbox_delivered": 77,
+  "outbox_pending": 0,
+  "run21_result_sha256": "0dd2ff7ab39b7bccf1d8490c6d93399eee03e0859373b07a32ce906e59a1e39e",
+  "run_count": 21,
+  "history_ids_sha256": "3bce74d47a79fcdfc5cee9e1194f5197a7cd0065a9a191eb624b62143290b0ca",
+  "history_ids_equal_before": true,
+  "evidence_method": "The service state after the isolated 38-second timer interval was read and compared with every ID in issue-16-missed-hook-before.json; count, last ID, sequence counter, and empty inbox were unchanged."
+}

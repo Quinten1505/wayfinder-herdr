@@ -449,7 +449,7 @@ fn run() -> Result<()> {
             if let Some(concurrency) = concurrency {
                 ensure!((1..=32).contains(&concurrency), "concurrency must be 1..32");
             }
-            let _lock = Lock::acquire(&dir.join("state.lock"))?;
+            let _lock = Lock::acquire_wait(&dir.join("state.lock"))?;
             let mut state = store::read_state(&dir)?;
             let provider = Provider {
                 kind,
@@ -472,7 +472,7 @@ fn run() -> Result<()> {
         }
         CommandName::StopWorker { map, run } => {
             let (_, dir) = tracker_context(&root, &map)?;
-            let _lock = Lock::acquire(&dir.join("state.lock"))?;
+            let _lock = Lock::acquire_wait(&dir.join("state.lock"))?;
             let mut state = store::read_state(&dir)?;
             let i = state
                 .workers
@@ -483,9 +483,14 @@ fn run() -> Result<()> {
             let worker = state.workers.runs[i].clone();
             let confirmed_blocked = worker.status == WorkerStatus::NeedsHuman
                 && worker.human_request_kind == Some(HumanRequestKind::HerdrBlockedUi);
+            let confirmed_unsent = worker.status == WorkerStatus::Uncertain
+                && worker.initial_prompt_pending
+                && worker.initial_prompt_attempted == Some(false)
+                && !worker.initial_prompt_acknowledged
+                && worker.result_evidence.is_none();
             ensure!(
-                worker.status == WorkerStatus::Running || confirmed_blocked,
-                "only a confirmed running worker or identity-verified Herdr-blocked worker can be stopped"
+                worker.status == WorkerStatus::Running || confirmed_blocked || confirmed_unsent,
+                "only a confirmed running worker, identity-verified Herdr-blocked worker, or exact unsent pre-prompt worker can be stopped"
             );
             let pane = worker.pane_id.clone().context("worker has no owned pane")?;
             let herdr = Client::new(&state.binding.socket);
@@ -555,7 +560,7 @@ fn run() -> Result<()> {
                 "human response cannot be empty"
             );
             let (_, dir) = tracker_context(&root, &map)?;
-            let _lock = Lock::acquire(&dir.join("state.lock"))?;
+            let _lock = Lock::acquire_wait(&dir.join("state.lock"))?;
             let mut state = store::read_state(&dir)?;
             let index = state
                 .workers
@@ -761,7 +766,7 @@ fn run() -> Result<()> {
             disposition,
         } => {
             let (_, dir) = tracker_context(&root, &map)?;
-            let _lock = Lock::acquire(&dir.join("state.lock"))?;
+            let _lock = Lock::acquire_wait(&dir.join("state.lock"))?;
             let mut state = store::read_state(&dir)?;
             let disposition = match disposition.as_str() {
                 "continue" => SchedulerDecisionDisposition::Continue,
@@ -786,7 +791,7 @@ fn run() -> Result<()> {
             confirmed_absent_or_stopped,
         } => {
             let (_, dir) = tracker_context(&root, &map)?;
-            let _lock = Lock::acquire(&dir.join("state.lock"))?;
+            let _lock = Lock::acquire_wait(&dir.join("state.lock"))?;
             let mut state = store::read_state(&dir)?;
             let old = state
                 .workers
@@ -819,6 +824,7 @@ fn run() -> Result<()> {
             }
             state.workers.next_run = state.workers.next_run.saturating_add(1);
             let number = state.workers.next_run;
+            let purpose = prior.effective_purpose();
             let map_ref = MapRef::parse(&state.map)?;
             let worktree = state
                 .binding
@@ -837,7 +843,7 @@ fn run() -> Result<()> {
                 human_request_seq: 0, human_request_id: None, human_request_kind: None,
                 human_request_fingerprint: None, answer_request_id: None, answer_request_kind: None,
                 answer_history: Vec::new(),
-                source_run: Some(prior.id), claim_login: prior.claim_login, context: Some("Human explicitly authorized this retry after the preceding worker was confirmed stopped or absent.".into()), last_activity_ms: None, terminal_id: None, agent_provider: None, agent_session: None, foreground_process: None, result_evidence: None, initial_prompt_pending: false, initial_prompt_acknowledged: false, initial_prompt_reconnect_pending: false, known_prelaunch_failure: false,
+                source_run: Some(prior.id), claim_login: prior.claim_login, context: Some("Human explicitly authorized this retry after the preceding worker was confirmed stopped or absent.".into()), purpose: Some(purpose), last_activity_ms: None, terminal_id: None, agent_provider: None, agent_session: None, foreground_process: None, result_evidence: None, result_evidence_history: Vec::new(), initial_prompt_pending: false, initial_prompt_acknowledged: false, initial_prompt_attempted: None, initial_prompt_reconnect_pending: false, known_prelaunch_failure: false,
             });
             store::atomic_json(&dir.join("state.json"), &state)?;
             println!(
@@ -847,7 +853,7 @@ fn run() -> Result<()> {
         }
         CommandName::AbandonWorker { map, run } => {
             let (_, dir) = tracker_context(&root, &map)?;
-            let _lock = Lock::acquire(&dir.join("state.lock"))?;
+            let _lock = Lock::acquire_wait(&dir.join("state.lock"))?;
             let mut state = store::read_state(&dir)?;
             let worker = state
                 .workers

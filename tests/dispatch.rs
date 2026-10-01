@@ -18,7 +18,7 @@ use tempfile::TempDir;
 use wayfinder_herdr::delivery::{DeliveryState, TicketDelivery};
 use wayfinder_herdr::store::{
     self, AnswerDisposition, Authorization, Binding, HumanAnswerEvidence, HumanRequestKind,
-    Provider, RequestKind, WorkerRun, WorkerStatus,
+    Provider, RequestKind, RunPurpose, WorkerRun, WorkerStatus,
 };
 
 const MAP: &str = "example/project#42";
@@ -93,14 +93,20 @@ else: sys.stderr.write('unhandled fake gh route: '+path+'\n'); sys.exit(2)
 struct HerdrState {
     requests: Vec<Value>,
     agent_status: String,
+    agent_start_status: Option<String>,
+    omit_start_provider: bool,
+    process_info_sequence: Vec<(u32, String)>,
+    process_info_reads: usize,
     ambiguous_open_response: bool,
     fail_open_without_resource: bool,
     ambiguous_split_response: bool,
     omit_split_pane_id: bool,
     ambiguous_start_response: bool,
+    fail_agent_start_with_busy: bool,
     ambiguous_close_response: bool,
     ambiguous_prompt_response: bool,
     ambiguous_prompt_before_effect: bool,
+    reject_next_chat_prompt_as_not_ready: bool,
     reject_next_prompt_as_blocked: bool,
     fail_first_open_without_resource: bool,
     fail_next_read: bool,
@@ -377,6 +383,9 @@ fn handle_request(mut stream: std::os::unix::net::UnixStream, state: &Arc<Mutex<
                 result = json!({"type":"pane_info","pane":{"pane_id":"origin-pane","workspace_id":"origin-workspace","tab_id":"origin-tab","terminal_id":"origin-terminal","agent_status":"working"}});
             } else if let Some(chat) = state.chat_panes.get(pane) {
                 result = json!({"type":"pane_info","pane":{"pane_id":chat.pane,"workspace_id":chat.workspace,"tab_id":chat.tab,"terminal_id":chat.terminal,"agent_status":"idle"}});
+            } else if let Some(tree) = state.opened_worktrees.iter().find(|tree| tree.pane == pane)
+            {
+                result = json!({"type":"pane_info","pane":{"pane_id":tree.pane,"workspace_id":tree.workspace,"tab_id":tree.tab,"terminal_id":tree.terminal,"cwd":tree.path,"agent_status":"unknown"}});
             } else {
                 error = Some(json!({"code":"pane_not_found","message":"unknown pane"}));
             }
@@ -475,6 +484,18 @@ fn handle_request(mut stream: std::os::unix::net::UnixStream, state: &Arc<Mutex<
             let pane = request["params"]["pane_id"].as_str().unwrap().to_owned();
             let name = request["params"]["name"].as_str().unwrap().to_owned();
             let provider = request["params"]["kind"].as_str().unwrap().to_owned();
+            if state.fail_agent_start_with_busy {
+                state.fail_agent_start_with_busy = false;
+                error = Some(
+                    json!({"code":"agent_pane_busy","message":"simulated shell readiness race"}),
+                );
+                stream
+                    .write_all(
+                        format!("{}\n", json!({"id":request["id"],"error":error})).as_bytes(),
+                    )
+                    .unwrap();
+                return;
+            }
             if let Some(tree) = state
                 .opened_worktrees
                 .iter()
@@ -482,10 +503,18 @@ fn handle_request(mut stream: std::os::unix::net::UnixStream, state: &Arc<Mutex<
                 .cloned()
                 .or_else(|| state.chat_panes.get(&pane).cloned())
             {
-                state.agent_status = "idle".into();
-                let info = json!({"agent":provider,"agent_session":null,"agent_status":"idle","name":name,"terminal_id":tree.terminal,"workspace_id":tree.workspace,"tab_id":tree.tab,"pane_id":tree.pane});
+                let agent_status = state
+                    .agent_start_status
+                    .take()
+                    .unwrap_or_else(|| "idle".into());
+                state.agent_status = agent_status.clone();
+                let info = json!({"agent":provider,"agent_session":null,"agent_status":agent_status,"name":name,"terminal_id":tree.terminal,"workspace_id":tree.workspace,"tab_id":tree.tab,"pane_id":tree.pane});
                 state.agents.insert(pane.clone(), info.clone());
-                result = json!({"type":"agent_started","agent":info,"argv":[]});
+                let mut started_info = info.clone();
+                if state.omit_start_provider {
+                    started_info["agent"] = Value::Null;
+                }
+                result = json!({"type":"agent_started","agent":started_info,"argv":[]});
                 if state.ambiguous_start_response {
                     state.ambiguous_start_response = false;
                     error = Some(
@@ -498,7 +527,12 @@ fn handle_request(mut stream: std::os::unix::net::UnixStream, state: &Arc<Mutex<
         }
         "agent.prompt" => {
             let pane = request["params"]["target"].as_str().unwrap().to_owned();
-            if state.ambiguous_prompt_before_effect {
+            if state.reject_next_chat_prompt_as_not_ready && state.chat_panes.contains_key(&pane) {
+                state.reject_next_chat_prompt_as_not_ready = false;
+                error = Some(
+                    json!({"code":"agent_not_ready","message":"agent is not an active named agent"}),
+                );
+            } else if state.ambiguous_prompt_before_effect {
                 state.ambiguous_prompt_before_effect = false;
                 error = Some(
                     json!({"code":"response_lost","message":"simulated lost request before effect"}),
@@ -550,13 +584,36 @@ fn handle_request(mut stream: std::os::unix::net::UnixStream, state: &Arc<Mutex<
         "pane.process_info" => {
             let pane = request["params"]["pane_id"].as_str().unwrap();
             let current_pid = std::process::id();
-            if let Some(tree) = state.opened_worktrees.iter().find(|tree| tree.pane == pane) {
+            if let Some(tree) = state
+                .opened_worktrees
+                .iter()
+                .find(|tree| tree.pane == pane)
+                .cloned()
+                .or_else(|| state.chat_panes.get(pane).cloned())
+            {
+                let (pid, name) = if state.process_info_sequence.is_empty() {
+                    (
+                        current_pid,
+                        state
+                            .agents
+                            .get(pane)
+                            .and_then(|agent| agent["agent"].as_str())
+                            .unwrap_or("bash")
+                            .to_owned(),
+                    )
+                } else {
+                    let index = state
+                        .process_info_reads
+                        .min(state.process_info_sequence.len() - 1);
+                    state.process_info_reads += 1;
+                    state.process_info_sequence[index].clone()
+                };
                 result = json!({
                     "type":"pane_process_info",
                     "process_info":{
                         "pane_id":pane,
-                        "foreground_process_group_id":current_pid,
-                        "foreground_processes":[{"pid":current_pid,"name":"codex","argv":["codex"],"cwd":tree.path}],
+                        "foreground_process_group_id":pid,
+                        "foreground_processes":[{"pid":pid,"name":name,"argv":[name],"cwd":tree.path}],
                         "shell_pid":current_pid,
                         "tty":"fixture"
                     }
@@ -660,13 +717,26 @@ fn cli_dispatch_creates_a_detached_ticket_worktree_and_uses_explicit_herdr_ids()
     f.apply(RequestKind::Start);
     let state = f.state();
     let run = state.workers.runs.iter().find(|r| r.ticket == 13).unwrap();
-    assert_eq!(run.status, WorkerStatus::Running);
+    assert_eq!(run.status, WorkerStatus::Running, "{run:#?}");
+    let pinned_base = run.base_commit.as_deref().expect(
+        "dispatch must durably pin the resolved repository commit before worktree creation",
+    );
+    assert_eq!(
+        pinned_base,
+        git(&state.binding.repository, &["rev-parse", "HEAD"]).trim(),
+        "worker base is the exact commit resolved before checkout and launch"
+    );
     assert_eq!(run.workspace_id.as_deref(), Some("workspace-owned"));
     assert_eq!(run.tab_id.as_deref(), Some("tab-owned"));
     assert_eq!(run.pane_id.as_deref(), Some("pane-owned"));
     assert_eq!(
         git(&run.worktree, &["rev-parse", "--show-toplevel"]).trim(),
         run.worktree.to_str().unwrap()
+    );
+    assert_eq!(
+        git(&run.worktree, &["rev-parse", "HEAD"]).trim(),
+        pinned_base,
+        "detached worker checkout starts at its durably recorded base"
     );
     assert!(
         !Command::new("git")
@@ -717,6 +787,169 @@ fn cli_dispatch_creates_a_detached_ticket_worktree_and_uses_explicit_herdr_ids()
     assert!(!prompt.contains("wayfinder-herdr/issues/18"));
     assert!(prompt.contains("$HOME/.agents/skills/implement/SKILL.md"));
     assert!(prompt.contains("Do not invent, infer, or answer a human response"));
+    assert!(prompt.contains("request `require_escalated` for that exact command"));
+    assert!(prompt.contains("do not ask the human to reauthenticate"));
+}
+
+#[test]
+fn dispatched_implementation_review_and_integration_update_the_bound_checkout_cleanly() {
+    let f = Fixture::new();
+    let mut state = f.state();
+    let repository = state.binding.repository.clone();
+    git(
+        &repository,
+        &["checkout", "-b", "feature/issue-16-regression"],
+    );
+    fs::create_dir_all(repository.join("src")).unwrap();
+    fs::create_dir_all(repository.join("tests")).unwrap();
+    fs::write(
+        repository.join("Cargo.toml"),
+        "[package]\nname = \"dispatched-integration-fixture\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+    )
+    .unwrap();
+    fs::write(
+        repository.join("Cargo.lock"),
+        "version = 4\n\n[[package]]\nname = \"dispatched-integration-fixture\"\nversion = \"0.1.0\"\n",
+    )
+    .unwrap();
+    fs::write(
+        repository.join("src/lib.rs"),
+        "pub fn value() -> u8 {\n    1\n}\n",
+    )
+    .unwrap();
+    fs::write(
+        repository.join("tests/value.rs"),
+        "#[test]\nfn exact_value() {\n    assert_eq!(dispatched_integration_fixture::value(), 2);\n}\n",
+    )
+    .unwrap();
+    git(
+        &repository,
+        &["add", "Cargo.toml", "Cargo.lock", "src", "tests"],
+    );
+    git(
+        &repository,
+        &["commit", "--quiet", "-m", "seed locked fixture"],
+    );
+    let base = git(&repository, &["rev-parse", "HEAD"]).trim().to_owned();
+    store::atomic_json(&f.dir.join("state.json"), &state).unwrap();
+
+    f.apply(RequestKind::Start);
+    state = f.state();
+    let implementer = state
+        .workers
+        .runs
+        .iter()
+        .find(|run| run.ticket == 13)
+        .unwrap()
+        .clone();
+    assert_eq!(implementer.base_commit.as_deref(), Some(base.as_str()));
+    assert_eq!(
+        git(&implementer.worktree, &["rev-parse", "HEAD"]).trim(),
+        base,
+        "the initial detached checkout must begin at the already persisted base"
+    );
+    fs::write(
+        implementer.worktree.join("src/lib.rs"),
+        "pub fn value() -> u8 {\n    2\n}\n",
+    )
+    .unwrap();
+    git(&implementer.worktree, &["add", "src/lib.rs"]);
+    git(
+        &implementer.worktree,
+        &["commit", "--quiet", "-m", "implement ticket"],
+    );
+    let candidate = git(&implementer.worktree, &["rev-parse", "HEAD"])
+        .trim()
+        .to_owned();
+    fs::write(
+        implementer.worktree.join(".wayfinder-result.json"),
+        serde_json::to_vec(&json!({
+            "format_version":1,
+            "run_id":implementer.id,
+            "ticket":implementer.ticket,
+            "role":"implementer",
+            "status":"completed",
+            "summary":"implemented exact value",
+            "commit":candidate
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    f.herdr_state.lock().unwrap().agent_status = "idle".into();
+    success(f.once());
+    let reviewed_state = f.state();
+    let reviewer = reviewed_state
+        .workers
+        .runs
+        .iter()
+        .find(|run| run.role == "reviewer" && run.source_run.as_deref() == Some(&implementer.id))
+        .unwrap()
+        .clone();
+    assert_eq!(reviewer.base_commit.as_deref(), Some(candidate.as_str()));
+    assert_eq!(
+        git(&reviewer.worktree, &["rev-parse", "HEAD"]).trim(),
+        candidate
+    );
+    fs::write(
+        reviewer.worktree.join(".wayfinder-result.json"),
+        serde_json::to_vec(&json!({
+            "format_version":1,
+            "run_id":reviewer.id,
+            "ticket":reviewer.ticket,
+            "role":"reviewer",
+            "status":"completed",
+            "summary":"reviewed exact implementation commit",
+            "reviewed_commit":candidate,
+            "verdict":"approved",
+            "unresolved_findings":[],
+            "known_limitations":[]
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    f.herdr_state.lock().unwrap().agent_status = "idle".into();
+    success(f.once());
+
+    let final_state = f.state();
+    assert_eq!(
+        final_state
+            .workers
+            .runs
+            .iter()
+            .find(|run| run.id == implementer.id)
+            .unwrap()
+            .status,
+        WorkerStatus::Reviewed
+    );
+    let delivery = fs::read_to_string(f.dir.join("delivery.json")).unwrap();
+    let delivery: DeliveryState = serde_json::from_str(&delivery).unwrap();
+    let integrated = delivery
+        .tickets
+        .values()
+        .find(|ticket| ticket.issue == 13)
+        .unwrap()
+        .integrated_commit
+        .as_deref();
+    assert_eq!(
+        integrated,
+        Some(candidate.as_str()),
+        "runtime did not integrate after real initial dispatch, implementation completion, and reviewer completion; suspension={:?}; delivery={delivery:#?}",
+        final_state.suspension
+    );
+    assert_eq!(git(&repository, &["rev-parse", "HEAD"]).trim(), candidate);
+    assert_eq!(
+        git(&repository, &["write-tree"]).trim(),
+        git(&repository, &["rev-parse", "HEAD^{tree}"]).trim()
+    );
+    assert!(
+        git(&repository, &["status", "--porcelain"])
+            .trim()
+            .is_empty()
+    );
+    assert_eq!(
+        fs::read(repository.join("src/lib.rs")).unwrap(),
+        git(&repository, &["show", "HEAD:src/lib.rs"]).into_bytes()
+    );
 }
 
 #[test]
@@ -779,6 +1012,9 @@ fn one_orchestrator_chat_uses_configured_provider_and_delivers_grouped_linked_qu
         .unwrap();
     assert_eq!(start["params"]["pane_id"], "orchestrator-pane");
     assert_eq!(start["params"]["kind"], "codex");
+    let agent_name = start["params"]["name"].as_str().unwrap();
+    assert!(agent_name.len() <= 32);
+    assert!(agent_name.starts_with("wf-orch-"));
     assert!(
         start["params"]["args"]
             .as_array()
@@ -812,8 +1048,10 @@ fn one_orchestrator_chat_uses_configured_provider_and_delivers_grouped_linked_qu
     assert!(initial_prompt.contains(
         "without proving termination, releasing uncertain capacity, or deleting artifacts"
     ));
-    assert!(initial_prompt.contains("recover-chat --map example/project#42 --confirm-replacement"));
-    assert!(initial_prompt.contains("--confirm-launch-absent-or-stopped"));
+    assert!(initial_prompt.contains("Herdr's Recover Wayfinder chat action"));
+    assert!(initial_prompt.contains("verified socket and source-pane context"));
+    assert!(!initial_prompt.contains("recover-chat --map example/project#42"));
+    assert!(initial_prompt.contains("absent or stop it manually"));
     assert!(
         initial_prompt
             .contains("resolve-chat-delivery --map example/project#42 --message MESSAGE_ID")
@@ -931,6 +1169,170 @@ fn one_orchestrator_chat_uses_configured_provider_and_delivers_grouped_linked_qu
         repeated, 1,
         "the same durable decision round was not redelivered"
     );
+}
+
+#[test]
+fn chat_start_waits_for_exact_provider_process_before_sending_initial_prompt() {
+    let f = Fixture::new();
+    f.herdr_state.lock().unwrap().omit_start_provider = true;
+
+    success(f.chat());
+    let binding = f.state().orchestrator.unwrap();
+    assert_eq!(binding.status, store::OrchestratorStatus::Running);
+    assert!(binding.foreground_process.is_some());
+    assert!(binding.session.is_some());
+    let calls = f.herdr_state.lock().unwrap().requests.clone();
+    assert_eq!(
+        calls
+            .iter()
+            .filter(|call| call["method"] == "agent.start")
+            .count(),
+        1
+    );
+    assert_eq!(
+        calls
+            .iter()
+            .filter(|call| call["method"] == "agent.prompt")
+            .count(),
+        1,
+        "the initial prompt is sent once, after Herdr reports the configured foreground process"
+    );
+}
+
+#[test]
+fn orchestrator_outbox_delivers_the_exact_correlated_human_answer_once() {
+    let f = Fixture::new();
+    success(f.chat());
+    let pending = record_pending_worker_question(&f);
+    let run = pending
+        .workers
+        .runs
+        .iter()
+        .find(|run| run.ticket == 13)
+        .unwrap()
+        .clone();
+    f.herdr_state.lock().unwrap().agent_status = "idle".into();
+    let answer = "Accept and trim (Recommended)";
+    let submitted = answer_cli(&f, &run, "worker_question", answer);
+    assert!(
+        submitted.status.success(),
+        "{}",
+        String::from_utf8_lossy(&submitted.stderr)
+    );
+    // The fixture shares a single status value for all fake panes. Restore the
+    // orchestrator's idle state after its separate worker receives the answer.
+    for _ in 0..3 {
+        f.herdr_state.lock().unwrap().agent_status = "idle".into();
+        success(f.once());
+    }
+
+    let binding = f.state().orchestrator.unwrap();
+    let calls = f.herdr_state.lock().unwrap().requests.clone();
+    let delivery = calls
+        .iter()
+        .filter(|request| {
+            request["method"] == "agent.prompt" && request["params"]["target"] == binding.pane_id
+        })
+        .filter_map(|request| request["params"]["text"].as_str())
+        .find(|text| text.contains(answer))
+        .expect("the exact recorded answer is included in the orchestrator outbox delivery");
+    assert!(delivery.contains(run.human_request_id.as_deref().unwrap()));
+    assert!(delivery.contains("asking this answered request again"));
+    assert_eq!(
+        calls
+            .iter()
+            .filter(|request| {
+                request["method"] == "agent.prompt"
+                    && request["params"]["target"] == binding.pane_id
+                    && request["params"]["text"]
+                        .as_str()
+                        .is_some_and(|text| text.contains(answer))
+            })
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn definite_not_ready_rejection_keeps_prompt_unattempted_for_same_process_retry() {
+    let f = Fixture::new();
+    f.herdr_state
+        .lock()
+        .unwrap()
+        .reject_next_chat_prompt_as_not_ready = true;
+
+    let first = f.chat();
+    assert!(!first.status.success());
+    let held = f.state().orchestrator.unwrap();
+    assert_eq!(held.status, store::OrchestratorStatus::AgentIntent);
+    assert_eq!(held.initial_prompt_attempted, Some(false));
+    assert!(held.foreground_process.is_some());
+    assert_eq!(
+        f.herdr_state
+            .lock()
+            .unwrap()
+            .requests
+            .iter()
+            .filter(|request| request["method"] == "agent.prompt")
+            .count(),
+        1
+    );
+
+    success(f.once());
+    let resumed = f.state().orchestrator.unwrap();
+    assert_eq!(resumed.status, store::OrchestratorStatus::Running);
+    assert_eq!(resumed.initial_prompt_attempted, Some(true));
+    assert_eq!(
+        f.herdr_state
+            .lock()
+            .unwrap()
+            .requests
+            .iter()
+            .filter(|request| request["method"] == "agent.prompt")
+            .count(),
+        2,
+        "the retry is allowed only after Herdr's definitive pre-effect rejection and exact process verification"
+    );
+}
+
+#[test]
+fn cold_chat_recovery_never_adopts_a_replacement_process_from_the_same_pane() {
+    let f = Fixture::new();
+    success(f.chat());
+    let original = f.state().orchestrator.unwrap();
+    assert!(original.foreground_process.is_some());
+
+    let mut child = Command::new("sleep").arg("60").spawn().unwrap();
+    let mut state = f.state();
+    let binding = state.orchestrator.as_mut().unwrap();
+    binding.status = store::OrchestratorStatus::AgentIntent;
+    binding.session = None;
+    binding.initial_prompt_attempted = Some(false);
+    store::atomic_json(&f.dir.join("state.json"), &state).unwrap();
+    f.herdr_state
+        .lock()
+        .unwrap()
+        .process_info_sequence
+        .push((child.id(), "codex".into()));
+
+    let output = f.chat();
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("foreground process identity changed")
+    );
+    assert_eq!(
+        f.herdr_state
+            .lock()
+            .unwrap()
+            .requests
+            .iter()
+            .filter(|request| request["method"] == "agent.prompt")
+            .count(),
+        1,
+        "the prior prompt is not replayed to a different foreground process"
+    );
+    child.kill().unwrap();
+    child.wait().unwrap();
 }
 
 #[test]
@@ -1309,6 +1711,7 @@ fn acknowledged_agent_intent_resumes_only_the_not_yet_attempted_prompt() {
         kind: "id".into(),
         value: "acknowledged-before-prompt".into(),
     });
+    binding.initial_prompt_attempted = Some(false);
     store::atomic_json(&f.dir.join("state.json"), &state).unwrap();
 
     success(f.chat());
@@ -1987,14 +2390,17 @@ fn recovered_open_intent_starts_the_agent_once_without_reopening_the_worktree() 
         source_run: None,
         claim_login: Some("fixture-user".into()),
         context: None,
+        purpose: None,
         last_activity_ms: None,
         terminal_id: None,
         agent_provider: None,
         agent_session: None,
         foreground_process: None,
         result_evidence: None,
+        result_evidence_history: Vec::new(),
         initial_prompt_pending: false,
         initial_prompt_acknowledged: false,
+        initial_prompt_attempted: None,
         initial_prompt_reconnect_pending: false,
         known_prelaunch_failure: false,
     };
@@ -3037,35 +3443,25 @@ fn invalid_provider_arguments_are_known_prelaunch_and_release_capacity() {
 }
 
 #[test]
-fn refused_git_detached_checkout_is_held_for_explicit_human_retry() {
+fn missing_dispatch_base_holds_before_claim_checkout_or_worker_launch() {
     let f = Fixture::new();
     let repository = f.state().binding.repository;
     fs::remove_dir_all(repository.join(".git")).unwrap();
     success(f.once());
     f.apply(RequestKind::Start);
-    for _ in 0..3 {
-        success(f.once());
-    }
+    success(f.once());
     let state = f.state();
-    assert_eq!(state.workers.runs.len(), 1);
-    assert_eq!(state.workers.runs[0].status, WorkerStatus::NeedsHuman);
-    assert!(state.workers.runs[0].status.reserves_capacity());
+    assert!(state.workers.runs.is_empty());
+    assert!(!state.reconciled);
+    assert!(state.suspension.contains("rev-parse HEAD failed"));
+    let gh = fs::read_to_string(&f.gh_state).unwrap();
     assert!(
-        state.workers.runs[0]
-            .question
-            .as_deref()
+        serde_json::from_str::<Value>(&gh).unwrap()["claim_attempts"]
+            .as_array()
             .unwrap()
-            .contains("retry-worker --confirmed-absent-or-stopped")
+            .is_empty()
     );
-    assert!(!state.workers.runs[0].worktree.exists());
-    assert!(
-        f.herdr_state
-            .lock()
-            .unwrap()
-            .requests
-            .iter()
-            .all(|r| r["method"] != "worktree.open")
-    );
+    assert!(f.herdr_state.lock().unwrap().requests.is_empty());
 }
 
 #[test]
@@ -3104,6 +3500,242 @@ fn ambiguous_agent_start_is_not_repeated_after_effect_then_lost_response() {
             .count(),
         0
     );
+}
+
+#[test]
+fn explicit_busy_retries_only_while_exact_empty_shell_identity_is_unchanged() {
+    let f = Fixture::new();
+    f.herdr_state.lock().unwrap().fail_agent_start_with_busy = true;
+
+    f.apply(RequestKind::Start);
+    let run = f.state().workers.runs[0].clone();
+    assert_eq!(run.status, WorkerStatus::Running);
+    assert!(!run.known_prelaunch_failure);
+    assert!(run.initial_prompt_attempted.unwrap());
+    let requests = f.herdr_state.lock().unwrap().requests.clone();
+    assert_eq!(
+        requests
+            .iter()
+            .filter(|r| r["method"] == "agent.start")
+            .count(),
+        2
+    );
+    assert_eq!(
+        requests
+            .iter()
+            .filter(|r| r["method"] == "agent.prompt")
+            .count(),
+        1
+    );
+
+    f.apply(RequestKind::Reconcile);
+    let requests = f.herdr_state.lock().unwrap().requests.clone();
+    assert_eq!(
+        requests
+            .iter()
+            .filter(|r| r["method"] == "agent.start")
+            .count(),
+        2
+    );
+    assert_eq!(
+        requests
+            .iter()
+            .filter(|r| r["method"] == "agent.prompt")
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn replacement_process_after_agent_start_error_is_not_adopted_or_prompted() {
+    let f = Fixture::new();
+    let mut replacement = Command::new("sleep").arg("30").spawn().unwrap();
+    let replacement_pid = replacement.id();
+    {
+        let mut herdr = f.herdr_state.lock().unwrap();
+        herdr.fail_agent_start_with_busy = true;
+        herdr.process_info_sequence = vec![
+            (std::process::id(), "bash".into()),
+            (replacement_pid, "codex".into()),
+        ];
+    }
+
+    f.apply(RequestKind::Start);
+    let run = f.state().workers.runs[0].clone();
+    assert_eq!(run.status, WorkerStatus::Uncertain);
+    assert!(!run.known_prelaunch_failure);
+    assert_ne!(
+        run.foreground_process.as_ref().unwrap().pid,
+        replacement_pid
+    );
+    assert_eq!(run.initial_prompt_attempted, None);
+    let requests = f.herdr_state.lock().unwrap().requests.clone();
+    assert_eq!(
+        requests
+            .iter()
+            .filter(|r| r["method"] == "agent.start")
+            .count(),
+        1
+    );
+    assert_eq!(
+        requests
+            .iter()
+            .filter(|r| r["method"] == "agent.prompt")
+            .count(),
+        0
+    );
+
+    success(f.once());
+    assert_eq!(
+        f.herdr_state
+            .lock()
+            .unwrap()
+            .requests
+            .iter()
+            .filter(|r| r["method"] == "agent.start")
+            .count(),
+        1
+    );
+    replacement.kill().unwrap();
+    replacement.wait().unwrap();
+}
+
+#[test]
+fn launcher_shell_is_not_saved_as_worker_process_identity() {
+    let f = Fixture::new();
+    let mut replacement = Command::new("sleep").arg("30").spawn().unwrap();
+    let provider_pid = replacement.id();
+    {
+        let mut herdr = f.herdr_state.lock().unwrap();
+        herdr.process_info_sequence = vec![
+            (std::process::id(), "bash".into()),
+            (provider_pid, "codex".into()),
+        ];
+    }
+
+    f.apply(RequestKind::Start);
+    let run = f.state().workers.runs[0].clone();
+    assert_eq!(run.status, WorkerStatus::Running);
+    assert_eq!(run.foreground_process.as_ref().unwrap().pid, provider_pid);
+    assert_eq!(
+        f.herdr_state
+            .lock()
+            .unwrap()
+            .requests
+            .iter()
+            .filter(|request| request["method"] == "agent.prompt")
+            .count(),
+        1
+    );
+    replacement.kill().unwrap();
+    replacement.wait().unwrap();
+}
+
+#[test]
+fn startup_waits_for_herdr_to_report_the_configured_provider() {
+    let f = Fixture::new();
+    f.herdr_state.lock().unwrap().omit_start_provider = true;
+    f.apply(RequestKind::Start);
+    let run = f.state().workers.runs[0].clone();
+    assert_eq!(run.status, WorkerStatus::Running, "{run:#?}");
+    assert_eq!(run.agent_provider.as_deref(), Some("codex"));
+    assert_eq!(
+        f.herdr_state
+            .lock()
+            .unwrap()
+            .requests
+            .iter()
+            .filter(|request| request["method"] == "agent.prompt")
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn never_attempted_prompt_resumes_only_after_exact_launch_identity_is_idle() {
+    let f = Fixture::new();
+    f.herdr_state.lock().unwrap().agent_start_status = Some("unknown".into());
+    f.apply(RequestKind::Start);
+    let waiting = f.state().workers.runs[0].clone();
+    assert_eq!(waiting.status, WorkerStatus::Uncertain);
+    assert!(waiting.initial_prompt_pending);
+    assert_eq!(waiting.initial_prompt_attempted, Some(false));
+    assert_eq!(
+        waiting.foreground_process.as_ref().unwrap().pid,
+        std::process::id()
+    );
+    assert_eq!(
+        f.herdr_state
+            .lock()
+            .unwrap()
+            .requests
+            .iter()
+            .filter(|request| request["method"] == "agent.prompt")
+            .count(),
+        0
+    );
+
+    f.herdr_state.lock().unwrap().agent_status = "idle".into();
+    store::enqueue(&f.dir, RequestKind::Reconcile).unwrap();
+    success(f.once());
+    let resumed = f.state().workers.runs[0].clone();
+    assert_eq!(resumed.status, WorkerStatus::Running);
+    assert_eq!(resumed.initial_prompt_attempted, Some(true));
+    assert_eq!(
+        f.herdr_state
+            .lock()
+            .unwrap()
+            .requests
+            .iter()
+            .filter(|request| request["method"] == "agent.prompt")
+            .count(),
+        1
+    );
+    store::enqueue(&f.dir, RequestKind::Reconcile).unwrap();
+    success(f.once());
+    assert_eq!(
+        f.herdr_state
+            .lock()
+            .unwrap()
+            .requests
+            .iter()
+            .filter(|request| request["method"] == "agent.prompt")
+            .count(),
+        1,
+        "reconciliation must not repeat an acknowledged prompt"
+    );
+}
+
+#[test]
+fn replacement_process_with_same_pane_and_terminal_never_receives_uncertain_prompt() {
+    let f = Fixture::new();
+    f.herdr_state.lock().unwrap().agent_start_status = Some("unknown".into());
+    f.apply(RequestKind::Start);
+    let original = f.state().workers.runs[0].clone();
+    let mut replacement = Command::new("sleep").arg("30").spawn().unwrap();
+    {
+        let mut herdr = f.herdr_state.lock().unwrap();
+        herdr.agent_status = "idle".into();
+        herdr.process_info_sequence = vec![(replacement.id(), "codex".into())];
+    }
+    store::enqueue(&f.dir, RequestKind::Reconcile).unwrap();
+    success(f.once());
+    let retained = f.state().workers.runs[0].clone();
+    assert_eq!(retained.status, WorkerStatus::Uncertain);
+    assert_eq!(retained.foreground_process, original.foreground_process);
+    assert_eq!(retained.initial_prompt_attempted, Some(false));
+    assert_eq!(
+        f.herdr_state
+            .lock()
+            .unwrap()
+            .requests
+            .iter()
+            .filter(|request| request["method"] == "agent.prompt")
+            .count(),
+        0
+    );
+    replacement.kill().unwrap();
+    replacement.wait().unwrap();
 }
 
 #[test]
@@ -3351,14 +3983,17 @@ fn cold_restored_or_replaced_agent_identity_becomes_uncertain_without_effects() 
             source_run: None,
             claim_login: None,
             context: None,
+            purpose: None,
             last_activity_ms: None,
             terminal_id: None,
             agent_provider: None,
             agent_session: None,
             foreground_process: None,
             result_evidence: None,
+            result_evidence_history: Vec::new(),
             initial_prompt_pending: false,
             initial_prompt_acknowledged: false,
+            initial_prompt_attempted: None,
             initial_prompt_reconnect_pending: false,
             known_prelaunch_failure: false,
         });
@@ -3993,6 +4628,20 @@ fn archived_result_allows_replay_but_unrelated_review_changes_still_block_accept
         .unwrap(),
     )
     .unwrap();
+    let mut state = f.state();
+    state.orchestrator = Some(store::OrchestratorBinding {
+        status: store::OrchestratorStatus::Uncertain,
+        workspace_id: "workspace-parent".into(),
+        tab_id: "chat-tab".into(),
+        pane_id: "chat-pane".into(),
+        terminal_id: Some("chat-terminal".into()),
+        provider: "codex".into(),
+        session: None,
+        foreground_process: None,
+        initial_prompt_attempted: Some(false),
+        source_pane_id: "source-pane".into(),
+    });
+    store::atomic_json(&f.dir.join("state.json"), &state).unwrap();
     f.herdr_state.lock().unwrap().agent_status = "idle".into();
     success(f.once());
     assert!(
@@ -4018,6 +4667,11 @@ fn archived_result_allows_replay_but_unrelated_review_changes_still_block_accept
     assert_eq!(reviewer.role, "reviewer");
     assert_eq!(reviewer.status, WorkerStatus::Running);
     assert_eq!(reviewer.base_commit.as_deref(), Some(commit.as_str()));
+    assert!(
+        after_implementation
+            .suspension
+            .contains("orchestrator chat is held")
+    );
 
     let reviewer_result = reviewer.worktree.join(".wayfinder-result.json");
     fs::write(
@@ -4128,6 +4782,109 @@ fn early_idle_snapshot_after_prompt_submission_is_retained_until_later_activity(
             .count(),
         1
     );
+}
+
+#[test]
+fn answered_blocked_result_is_preserved_when_worker_publishes_its_completion() {
+    let f = Fixture::new();
+    f.apply(RequestKind::Start);
+    let run = f.state().workers.runs[0].clone();
+    let blocked = json!({
+        "format_version": 1,
+        "run_id": run.id,
+        "ticket": run.ticket,
+        "role": run.role,
+        "status": "blocked",
+        "summary": "Waiting for the required whitespace policy decision.",
+        "question": "Should parse_milli accept and trim leading/trailing ASCII whitespace, or reject surrounding whitespace?"
+    });
+    fs::write(
+        run.worktree.join(".wayfinder-result.json"),
+        serde_json::to_vec(&blocked).unwrap(),
+    )
+    .unwrap();
+    f.herdr_state.lock().unwrap().agent_status = "idle".into();
+    success(f.once());
+    let pending = f.state().workers.runs[0].clone();
+    assert_eq!(pending.status, WorkerStatus::NeedsHuman);
+    let original_evidence = pending.result_evidence.clone().unwrap();
+    assert!(original_evidence.exists());
+
+    let answer = answer_cli(
+        &f,
+        &pending,
+        "worker_question",
+        "Accept and trim (Recommended)",
+    );
+    assert!(
+        answer.status.success(),
+        "{}",
+        String::from_utf8_lossy(&answer.stderr)
+    );
+    let answered = f.state().workers.runs[0].clone();
+    assert_eq!(
+        answered.human_response.as_deref(),
+        Some("Accept and trim (Recommended)")
+    );
+    assert_eq!(
+        answered.answer_history.last().unwrap().disposition,
+        AnswerDisposition::Submitted
+    );
+    let accepted_request_id = answered.answer_history.last().unwrap().request_id.clone();
+
+    let completed = json!({
+        "format_version": 1,
+        "run_id": run.id,
+        "ticket": run.ticket,
+        "role": run.role,
+        "status": "completed",
+        "summary": "Implemented exact milli-unit parsing after the human decision.",
+        "commit": git(&run.worktree, &["rev-parse", "HEAD"]).trim()
+    });
+    fs::write(
+        run.worktree.join(".wayfinder-result.json"),
+        serde_json::to_vec(&completed).unwrap(),
+    )
+    .unwrap();
+    let mut state = f.state();
+    state.workers.runs[0].status = WorkerStatus::Uncertain;
+    state.workers.runs[0].question = Some("previous result revision could not be retained".into());
+    store::atomic_json(&f.dir.join("state.json"), &state).unwrap();
+    f.herdr_state.lock().unwrap().agent_status = "idle".into();
+    success(f.once());
+
+    let accepted = f.state();
+    let implementation = &accepted.workers.runs[0];
+    assert_eq!(implementation.status, WorkerStatus::Completed);
+    let reviewer = accepted
+        .workers
+        .runs
+        .iter()
+        .find(|run| run.role == "reviewer")
+        .unwrap();
+    let review_context = reviewer.context.as_deref().unwrap();
+    assert!(review_context.contains(&accepted_request_id));
+    assert!(review_context.contains("Accept and trim (Recommended)"));
+    assert!(review_context.contains("do not ask these again"));
+    assert_eq!(
+        implementation.result_commit.as_deref(),
+        Some(git(&run.worktree, &["rev-parse", "HEAD"]).trim())
+    );
+    assert_eq!(
+        implementation.result_evidence_history,
+        vec![original_evidence.clone()]
+    );
+    assert!(
+        original_evidence.exists(),
+        "the blocked result remains immutable"
+    );
+    let revision = implementation.result_evidence.as_ref().unwrap();
+    assert_ne!(revision, &original_evidence);
+    assert!(revision.exists());
+    let original: Value = serde_json::from_slice(&fs::read(original_evidence).unwrap()).unwrap();
+    assert_eq!(original["status"], "blocked");
+    let current: Value = serde_json::from_slice(&fs::read(revision).unwrap()).unwrap();
+    assert_eq!(current["status"], "completed");
 }
 
 #[test]
@@ -4330,14 +5087,17 @@ fn insert_uncertain_run(f: &Fixture) -> WorkerRun {
         source_run: None,
         claim_login: Some("fixture-user".into()),
         context: None,
+        purpose: None,
         last_activity_ms: None,
         terminal_id: None,
         agent_provider: None,
         agent_session: None,
         foreground_process: None,
         result_evidence: None,
+        result_evidence_history: Vec::new(),
         initial_prompt_pending: false,
         initial_prompt_acknowledged: false,
+        initial_prompt_attempted: None,
         initial_prompt_reconnect_pending: false,
         known_prelaunch_failure: false,
     };
@@ -4386,6 +5146,58 @@ fn uncertain_retry_requires_actual_human_absence_confirmation_and_keeps_old_arti
         Some(old.id.as_str())
     );
     assert_eq!(state.workers.runs[0].worktree, old.worktree);
+}
+
+#[test]
+fn supported_final_review_retry_keeps_typed_purpose_and_review_ancestry() {
+    let f = Fixture::new_without_session();
+    let mut old = insert_uncertain_run(&f);
+    old.role = "reviewer".into();
+    old.purpose = Some(RunPurpose::FinalFeatureReview);
+    old.context = Some("wayfinder-final-feature-review\nReview exact feature commit".into());
+    old.source_run = Some("run-implementation-review".into());
+    old.workspace_id = None;
+    old.tab_id = None;
+    old.pane_id = None;
+    old.terminal_id = None;
+    old.agent_session = None;
+    old.foreground_process = None;
+    old.claim_login = None;
+    old.known_prelaunch_failure = true;
+    let mut state = f.state();
+    state.workers.runs[0] = old.clone();
+    store::atomic_json(&f.dir.join("state.json"), &state).unwrap();
+
+    let output = f
+        .cli()
+        .args([
+            "retry-worker",
+            "--map",
+            MAP,
+            "--run",
+            &old.id,
+            "--confirmed-absent-or-stopped",
+        ])
+        .output()
+        .unwrap();
+    success(output);
+
+    let state = f.state();
+    let retried = state.workers.runs.last().unwrap();
+    assert_eq!(retried.status, WorkerStatus::Queued);
+    assert_eq!(retried.purpose, Some(RunPurpose::FinalFeatureReview));
+    assert_eq!(retried.source_run.as_deref(), Some(old.id.as_str()));
+    assert_eq!(
+        retried.context.as_deref(),
+        Some(
+            "Human explicitly authorized this retry after the preceding worker was confirmed stopped or absent."
+        )
+    );
+    assert_eq!(state.workers.runs[0].status, WorkerStatus::Stopped);
+    assert_eq!(
+        state.workers.runs[0].purpose,
+        Some(RunPurpose::FinalFeatureReview)
+    );
 }
 
 #[test]

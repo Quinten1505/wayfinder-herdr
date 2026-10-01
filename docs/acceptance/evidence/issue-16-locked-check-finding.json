@@ -1,0 +1,22 @@
+{
+  "format_version": 1,
+  "source": "root supplemental validation in the pinned issue #2 reviewer checkout",
+  "candidate_commit": "b465193990a9a02907f8668fead3f66a36eb3d8a",
+  "candidate_reviewer_run": "run-00000000000000000005",
+  "candidate_reviewer_verdict": "approved",
+  "candidate_reviewer_limitations": [
+    "Automated tests were not run during this review."
+  ],
+  "check": "CARGO_HOME=/tmp/wayfinder-12-review-cargo-home cargo test --locked",
+  "exit_code": 101,
+  "observed_failure": "The clean pinned checkout had no Cargo.lock, and --locked prevented Cargo from creating it.",
+  "files_changed_by_check": false,
+  "required_delivery_check": "cargo test --locked --all-targets",
+  "required_check_source": "src/delivery.rs",
+  "disposition": "Resolved through the supported bounded rework lifecycle. Original approved b465 remains retained but was not integrated. Run6 added Cargo.lock at 4e0cefd83e6f853ed8748745cad34682644b56d4, separate reviewer run7 approved that exact commit, and the installed runtime passed all three configured checks before integrating it. See issue-16-required-check-rework.json.",
+  "map_state_at_recording": {
+    "authorization": "started",
+    "reconciled": false,
+    "suspension": "bound checkout must be on the map feature branch before ticket integration"
+  }
+}

@@ -4,13 +4,14 @@ use std::{
     os::unix::fs::PermissionsExt,
     path::PathBuf,
     process::{Child, Command, Output, Stdio},
+    sync::mpsc,
     thread,
     time::{Duration, Instant},
 };
 use tempfile::TempDir;
 use wayfinder_herdr::{
     host,
-    store::{self, Authorization, Binding, RequestKind},
+    store::{self, Authorization, Binding, Lock, RequestKind},
 };
 const MAP: &str = "Example/Project#42";
 
@@ -118,6 +119,56 @@ fn exclusive_runtime_lock_is_released_on_process_death_and_state_survives() {
     assert_eq!(f.state().authorization, Authorization::Paused);
     assert_eq!(f.state().history.len(), 2);
     assert!(!f.state().reconciled);
+}
+
+#[test]
+fn state_control_waits_for_the_supervised_transaction_instead_of_failing_busy() {
+    let f = Fixture::new();
+    let path = f.dir.join("state.lock");
+    let runtime_transaction = Lock::acquire(&path).unwrap();
+    let waiting_path = path.clone();
+    let (finished, wait_finished) = mpsc::channel();
+    let waiter = thread::spawn(move || {
+        let _control_transaction = Lock::acquire_wait(&waiting_path).unwrap();
+        finished.send(()).unwrap();
+    });
+
+    assert!(
+        wait_finished
+            .recv_timeout(Duration::from_millis(50))
+            .is_err(),
+        "foreground control must not enter while reconciliation owns state"
+    );
+    drop(runtime_transaction);
+    wait_finished
+        .recv_timeout(Duration::from_secs(2))
+        .expect("foreground control proceeds as soon as the state transaction finishes");
+    waiter.join().unwrap();
+}
+
+#[test]
+fn duplicate_hook_enqueues_serialize_without_dropping_a_request() {
+    let f = Fixture::new();
+    let queue = Lock::acquire(&f.dir.join("inbox.lock")).unwrap();
+    let dir = f.dir.clone();
+    let (finished, wait_finished) = mpsc::channel();
+    let hook = thread::spawn(move || {
+        let id = store::enqueue(&dir, RequestKind::Reconcile).unwrap();
+        finished.send(id).unwrap();
+    });
+
+    assert!(
+        wait_finished
+            .recv_timeout(Duration::from_millis(50))
+            .is_err(),
+        "a hook waits for the durable request sequence lock"
+    );
+    drop(queue);
+    let id = wait_finished
+        .recv_timeout(Duration::from_secs(2))
+        .expect("the queued hook is persisted after the prior writer exits");
+    hook.join().unwrap();
+    assert!(f.dir.join("inbox").join(format!("{id}.json")).exists());
 }
 
 #[test]

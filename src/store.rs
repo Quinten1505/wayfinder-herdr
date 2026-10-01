@@ -72,6 +72,15 @@ pub struct OrchestratorBinding {
     pub provider: String,
     #[serde(default)]
     pub session: Option<AgentSessionIdentity>,
+    /// Exact provider process identity persisted before the first prompt. Some
+    /// providers only expose a session ID after receiving that prompt.
+    #[serde(default)]
+    pub foreground_process: Option<LinuxProcessIdentity>,
+    /// `Some(false)` means the first prompt was definitely never attempted;
+    /// `Some(true)` means an effect may have been sent. Missing legacy state is
+    /// unknown and must not be replayed automatically.
+    #[serde(default)]
+    pub initial_prompt_attempted: Option<bool>,
     /// The exact Herdr pane that requested creation, used only to reconcile launch intent.
     pub source_pane_id: String,
 }
@@ -133,6 +142,7 @@ pub enum SchedulerDecisionKind {
     #[default]
     ReviewExhaustion,
     ConflictExhaustion,
+    RequiredChecksExhaustion,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -231,6 +241,13 @@ pub struct Provider {
     pub args: Vec<String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RunPurpose {
+    TicketWork,
+    FinalFeatureReview,
+}
+
 impl ProviderConfiguration {
     pub fn for_role(&self, role: &str) -> &Provider {
         self.roles.get(role).unwrap_or(&self.default)
@@ -290,6 +307,11 @@ pub struct WorkerRun {
     pub claim_login: Option<String>,
     #[serde(default)]
     pub context: Option<String>,
+    /// Stable workflow purpose. Legacy final-review records are recognized by
+    /// their original marker only until the next supported retry persists this
+    /// typed value; new dispatch and retry decisions use this field.
+    #[serde(default)]
+    pub purpose: Option<RunPurpose>,
     /// Last time Herdr confirmed activity for this submitted prompt. Brief idle
     /// snapshots after submission are not evidence that the launch is absent.
     #[serde(default)]
@@ -307,6 +329,10 @@ pub struct WorkerRun {
     /// Durable output copy outside the source checkout.
     #[serde(default)]
     pub result_evidence: Option<PathBuf>,
+    /// Earlier immutable result artifacts retained when a blocked worker later
+    /// updates its result after a correlated human answer.
+    #[serde(default)]
+    pub result_evidence_history: Vec<PathBuf>,
     /// The initial task prompt was rejected before input and is still pending
     /// human resolution of a Herdr startup UI.
     #[serde(default)]
@@ -316,6 +342,10 @@ pub struct WorkerRun {
     /// this confirmed launch without ever replaying its prompt.
     #[serde(default)]
     pub initial_prompt_acknowledged: bool,
+    /// None is legacy/unknown; Some(false) proves the initial prompt call was
+    /// never entered, and Some(true) preserves a potentially ambiguous attempt.
+    #[serde(default)]
+    pub initial_prompt_attempted: Option<bool>,
     /// One-time recovery window after durable acknowledgement but before the
     /// original worker identity has been re-established in this runtime.
     #[serde(default)]
@@ -326,6 +356,26 @@ pub struct WorkerRun {
     pub known_prelaunch_failure: bool,
 }
 
+/// Resolve a worker through retry ancestry to the implementation whose commit
+/// it ultimately concerns. Reviewer retries retain their immediate
+/// `source_run` for auditability, so approval consumers must not assume that
+/// their direct parent is an implementer.
+pub fn implementation_source<'a>(runs: &'a [WorkerRun], run: &WorkerRun) -> Option<&'a WorkerRun> {
+    let mut source_id = run.source_run.as_deref();
+    let mut visited = std::collections::BTreeSet::new();
+    while let Some(id) = source_id {
+        if !visited.insert(id) {
+            return None;
+        }
+        let source = runs.iter().find(|candidate| candidate.id == id)?;
+        if source.role == "implementer" {
+            return Some(source);
+        }
+        source_id = source.source_run.as_deref();
+    }
+    None
+}
+
 fn default_rework_round_limit() -> u8 {
     DEFAULT_REWORK_ROUNDS
 }
@@ -333,6 +383,23 @@ fn default_rework_round_limit() -> u8 {
 impl WorkerRun {
     pub fn reserves_capacity(&self) -> bool {
         self.status.reserves_capacity() && !self.known_prelaunch_failure
+    }
+
+    pub fn is_final_feature_review(&self) -> bool {
+        self.purpose == Some(RunPurpose::FinalFeatureReview)
+            || (self.purpose.is_none()
+                && self
+                    .context
+                    .as_deref()
+                    .is_some_and(|context| context.starts_with("wayfinder-final-feature-review")))
+    }
+
+    pub fn effective_purpose(&self) -> RunPurpose {
+        if self.is_final_feature_review() {
+            RunPurpose::FinalFeatureReview
+        } else {
+            RunPurpose::TicketWork
+        }
     }
 }
 
@@ -688,6 +755,23 @@ impl Lock {
         })?;
         Ok(Self { _file: file })
     }
+
+    /// Wait for the state transaction to finish instead of making a foreground
+    /// control fail merely because the supervised runtime is reconciling. The
+    /// runtime and user commands still serialize all reads and mutations on the
+    /// same kernel lock; only lifetime/integration locks remain nonblocking.
+    pub fn acquire_wait(path: &Path) -> Result<Self> {
+        let file = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .mode(0o600)
+            .open(path)?;
+        file.lock_exclusive()
+            .with_context(|| format!("wait for state lock {}", path.display()))?;
+        Ok(Self { _file: file })
+    }
 }
 
 /// Commit in the same directory: sync data, atomic rename, then sync directory.
@@ -749,7 +833,7 @@ pub fn attach(
     private_dir(&root.join("maps"))?;
     private_dir(&dir)?;
     private_dir(&dir.join("inbox"))?;
-    let _lock = Lock::acquire(&dir.join("state.lock"))?;
+    let _lock = Lock::acquire_wait(&dir.join("state.lock"))?;
     let path = dir.join("state.json");
     let state = if path.exists() {
         let mut state = read_state(&dir)?;
@@ -798,7 +882,7 @@ pub fn enqueue(dir: &Path, command: RequestKind) -> Result<String> {
     let inbox = dir.join("inbox");
     // Serialize submissions independently from the runtime state transaction. Persist
     // the sequence before publishing a request: crashes may leave gaps, never reuse IDs.
-    let _queue_lock = Lock::acquire(&dir.join("inbox.lock"))?;
+    let _queue_lock = Lock::acquire_wait(&dir.join("inbox.lock"))?;
     #[derive(Serialize, Deserialize)]
     #[serde(deny_unknown_fields)]
     struct Sequence {

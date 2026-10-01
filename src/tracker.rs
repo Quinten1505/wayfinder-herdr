@@ -341,7 +341,7 @@ impl GitHub {
             !input.label.trim().is_empty(),
             "ticket label cannot be empty"
         );
-        let _lock = Lock::acquire(&state_dir.join("state.lock"))?;
+        let _lock = Lock::acquire_wait(&state_dir.join("state.lock"))?;
         let marker = operation_marker("create-ticket", &json!([map.repo(), map.number, input]));
         let issue = self.with_intent(state_dir, &marker, "create-ticket", || {
             if let Some(found) = self.find_marker(&map.repo(), &marker)? {
@@ -375,7 +375,7 @@ impl GitHub {
         state_dir: &Path,
     ) -> Result<()> {
         ensure!(ticket != blocker, "a ticket cannot block itself");
-        let _lock = Lock::acquire(&state_dir.join("state.lock"))?;
+        let _lock = Lock::acquire_wait(&state_dir.join("state.lock"))?;
         ensure!(
             self.subissues(map)?.iter().any(|i| i["number"] == ticket),
             "ticket is not a child of this map"
@@ -415,7 +415,7 @@ impl GitHub {
         assignee: Option<&str>,
         state_dir: &Path,
     ) -> Result<String> {
-        let _lock = Lock::acquire(&state_dir.join("state.lock"))?;
+        let _lock = Lock::acquire_wait(&state_dir.join("state.lock"))?;
         self.claim_inner(map, ticket, assignee, state_dir)
     }
 
@@ -434,7 +434,7 @@ impl GitHub {
         assignee: Option<&str>,
         state_dir: &Path,
     ) -> Result<String> {
-        let _lock = Lock::acquire(&state_dir.join("state.lock"))?;
+        let _lock = Lock::acquire_wait(&state_dir.join("state.lock"))?;
         self.require_execution_override(map)?;
         let login = self.resolve_assignee(assignee)?;
         let marker = operation_marker("claim", &json!([map.repo(), ticket, login]));
@@ -648,7 +648,7 @@ impl GitHub {
             !resolution.trim().is_empty(),
             "resolution text cannot be empty"
         );
-        let _lock = Lock::acquire(&state_dir.join("state.lock"))?;
+        let _lock = Lock::acquire_wait(&state_dir.join("state.lock"))?;
         ensure!(
             self.subissues(map)?
                 .iter()

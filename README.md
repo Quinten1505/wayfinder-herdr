@@ -1,12 +1,12 @@
 # Wayfinder for herdr
 
-A Rust plugin foundation for one orchestrating chat to coordinate a map, delegated agents, independent reviewers, and Git worktrees.
+A Rust workflow plugin that coordinates a human-facing chat, map-scoped workers, independent reviews, Git integration, and a ready feature pull request.
 
 - [Decision map](https://github.com/Quinten1505/wayfinder-herdr/issues/1)
 - [Specification](https://github.com/Quinten1505/wayfinder-herdr/issues/10)
 - [Tracker conventions](docs/agents/issue-tracker.md)
 
-The runtime and GitHub map/ticket workflow dispatch ready research and task tickets to role-configured Herdr agents. Implementers and independent reviewers use separate detached-HEAD worktrees. Ticket results remain local evidence; review, ticket integration, and feature PR handoff are subsequent work. Installation is not dispatch authorization.
+The runtime dispatches eligible research and task tickets to role-configured Herdr agents. Implementers and independent reviewers use separate detached worktrees. It validates results and required checks against pinned commits, integrates accepted tickets, then requests an independent complete-feature review before marking the feature pull request ready. Humans retain control of decisions, body refreshes, and merges. Installation alone does not authorize dispatch.
 
 ## Build and install
 
@@ -68,9 +68,6 @@ wayfinder-herdr answer-worker --map OWNER/REPOSITORY#NUMBER --run RUN_ID \
 wayfinder-herdr stop-worker --map OWNER/REPOSITORY#NUMBER --run RUN_ID
 wayfinder-herdr retry-worker --map OWNER/REPOSITORY#NUMBER --run RUN_ID --confirmed-absent-or-stopped
 wayfinder-herdr abandon-worker --map OWNER/REPOSITORY#NUMBER --run RUN_ID
-wayfinder-herdr recover-chat --map OWNER/REPOSITORY#NUMBER --confirm-replacement
-wayfinder-herdr recover-chat --map OWNER/REPOSITORY#NUMBER \
-  --confirm-replacement --confirm-launch-absent-or-stopped
 wayfinder-herdr chat-outbox --map OWNER/REPOSITORY#NUMBER
 wayfinder-herdr resolve-chat-delivery --map OWNER/REPOSITORY#NUMBER \
   --message MESSAGE_ID --confirmed-not-delivered
@@ -81,7 +78,7 @@ wayfinder-herdr answer-decision --map OWNER/REPOSITORY#NUMBER \
 
 `answer-worker` requires the exact pending request ID and type shown by `status`. For a recorded worker question (`worker_question`), it submits the provided human response through Herdr's occupant-pinned `agent.prompt` API, after verifying worker identity. If Herdr reports that the worker has entered a recognized approval or question UI (`herdr_blocked_ui`), `answer-worker` retains the supplied answer and request evidence but does not send input. Open the named Herdr pane, inspect and answer that UI directly, then run `reconcile`; the worker keeps its capacity and retained evidence until its later state can be observed. A worker question that races into a blocked UI gets a fresh manual-interaction request, and the earlier answer is retained without replay. Ambiguous answer or stop outcomes are not resent automatically. Retrying an uncertain worker requires the caller to explicitly confirm that the prior worker is absent or stopped. Abandoning records the human decision but does not prove termination, release uncertain capacity, or delete retained work.
 
-If the orchestrator pane or agent identity is missing or changed, inspect the previous pane and choose the **Recover Wayfinder Chat** action from the original Herdr workspace (or run `recover-chat --map OWNER/REPOSITORY#NUMBER --confirm-replacement` there). Acknowledged launch stages reconnect without repeating an agent start or prompt. For an interrupted or uncertain stage, first inspect Herdr and confirm the old launch is absent or stop it manually; then include `--confirm-launch-absent-or-stopped`. Recovery archives the prior binding and starts in a fresh pane; it never focuses, prompts, closes, or reuses the old pane. Unknown panes are left untouched. Inspect ambiguous chat deliveries with `chat-outbox --map OWNER/REPOSITORY#NUMBER`. After checking the prior chat history, resolve each uncertain message explicitly with `resolve-chat-delivery --map OWNER/REPOSITORY#NUMBER --message MESSAGE_ID --confirmed-delivered` or `--confirmed-not-delivered`; only the latter permits a replay.
+If the orchestrator pane or agent identity is missing or changed, inspect the previous pane and invoke the installed Herdr **Recover Wayfinder chat** action (`recover-chat`) from the original repository workspace and same Herdr session. That action supplies Herdr's verified socket and invoking-pane context. Do not invoke the recovery binary as a bare CLI command from a Herdr pane: `--map` does not replace the required source workspace/pane context. Acknowledged launch stages reconnect without repeating an agent start or prompt. For an interrupted or uncertain stage, first inspect Herdr and confirm the old launch is absent or stop it manually, then invoke the action's confirmation; Recovery archives the prior binding and starts in a fresh pane. It never focuses, prompts, closes, or reuses the old pane, and leaves unknown panes untouched. Inspect ambiguous chat deliveries with `chat-outbox --map OWNER/REPOSITORY#NUMBER`. After checking the prior chat history, resolve each uncertain message explicitly with `resolve-chat-delivery --map OWNER/REPOSITORY#NUMBER --message MESSAGE_ID --confirmed-delivered` or `--confirmed-not-delivered`; only the latter permits a replay.
 
 Scheduler exhaustion requests are separate from worker questions and never target a worker pane. The orchestrating human must provide both their exact freeform response and `--disposition continue|defer|abandon`; the response text never implies an action. `continue` queues one bounded implementation rework or conflict-repair round tied to the original run and fixed commit. A later exhausted round creates a new scheduler request. `defer` keeps ticket readiness held while releasing capacity for a proven-completed worker; the same request can later receive a new exact response and disposition. `abandon` releases only the proven-finished blocked run's capacity, preserves all attempts/evidence, and does not satisfy integration/readiness. The CLI persists the choice; runtime reconciliation applies it idempotently after restart. Unknown requests and attempts to change an already-applied action are rejected. Chat integrations should route the actual human response and explicit disposition to `answer-decision` without calling `agent.prompt`.
 
@@ -134,6 +131,6 @@ python3 tests/install_smoke.py
 
 The installer smoke test builds and links in temporary XDG directories, substitutes a recording-only `systemctl`, and validates the generated unit with `systemd-analyze`; it does not start a live service.
 
-Tests cover exclusive runtimes, durable requests and authorization across restart, replay, corrupt/future state preservation, host compatibility and disabled plugins. The isolated herdr/Codex walkthrough and complete workflow acceptance belong to [Prove installation and the complete workflow in an isolated live session](https://github.com/Quinten1505/wayfinder-herdr/issues/16).
+Tests cover exclusive runtimes, durable requests and authorization across restart, replay, corrupt/future state preservation, host compatibility and disabled plugins. The isolated Herdr/Codex walkthrough and end-to-end acceptance record are in [docs/acceptance/issue-16-live.md](docs/acceptance/issue-16-live.md), for [Prove installation and the complete workflow in an isolated live session](https://github.com/Quinten1505/wayfinder-herdr/issues/16). The record separates real Herdr/runtime/Codex outcomes from automated fixtures and describes the installer overwrite incident and other limits.
 
 Detached worktree and socket dispatch acceptance tests are included in `tests/dispatch.rs`; run them in an environment where isolated Unix sockets are permitted. The tracker issue body and spec remain human-owned and are never refreshed by worker automation; map/spec updates use append-only comments with body refresh pending for a human.

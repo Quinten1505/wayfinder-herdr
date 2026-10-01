@@ -1,0 +1,275 @@
+{
+  "format_version": 1,
+  "session": "wayfinder-acceptance-20261001-issue16",
+  "map": "quinten1505/wayfinder-herdr-acceptance-20261001-issue16-7c4a#1",
+  "service_unit": "wayfinder-acceptance-20261001-issue16-runtime.service",
+  "service_main_pid_during_timer_pass": 1275204,
+  "service_invocation_during_timer_pass": "46126791ac45407094b0e16b37e787ff",
+  "experiment": {
+    "scope": "only the local Herdr plugin manifest under /tmp/wf16-acceptance/install and the named disposable session",
+    "original_manifest_copy": "/tmp/wf16-acceptance/evidence/issue-16-original-herdr-plugin.toml",
+    "original_manifest_sha256": "482e59c9bff5adeeeaea2dcde7cf73ced7d4391cd99557345d3df9149af6b1ca",
+    "hooks_suppressed_sha256": "0aecbff189aa5e7eaa7c35a1f08cf64d08c0f5ae20057817cfc8f4daaca39dbb",
+    "hooks_removed": [
+      "pane.agent_status_changed",
+      "pane.exited"
+    ],
+    "plugin_remained_enabled": true,
+    "enabled_with_no_events_verified_from_plugin_list": true,
+    "runtime_stopped_or_restarted": false,
+    "explicit_wayfinder_requests_during_timer_interval": false,
+    "bound_chat_before": {
+      "workspace_id": "w2",
+      "tab_id": "w2:t1",
+      "pane_id": "w2:p6",
+      "terminal_id": "term_65cce662e5cbb10",
+      "provider": "codex",
+      "status": "running",
+      "session": {
+        "source": "herdr:codex",
+        "agent": "codex",
+        "kind": "id",
+        "value": "01a0f972-3c6d-7421-ba37-de3bbebd14b9"
+      },
+      "foreground_process": {
+        "boot_id": "a093fcea-966d-46f2-8931-2d79488ce85b",
+        "pid": 1188931,
+        "start_time_ticks": 4883656
+      },
+      "initial_prompt_attempted": true
+    },
+    "human_stopped_chat_after_exact_identity_recheck": {
+      "supported_command": "herdr pane close w2:p6",
+      "workspace": "w2",
+      "tab": "w2:t1",
+      "pane": "w2:p6",
+      "terminal": "term_65cce662e5cbb10",
+      "provider": "codex",
+      "agent_session": "01a0f972-3c6d-7421-ba37-de3bbebd14b9",
+      "worktree": "/tmp/wf16-acceptance/repo",
+      "boot_id": "a093fcea-966d-46f2-8931-2d79488ce85b",
+      "pid": 1188931,
+      "start_time_ticks": 4883656,
+      "argv": "codex --approve-for-me -c service_tier=\"priority\" --model gpt-6-luna -c model_reasoning_effort=high",
+      "process_and_pane_verified_absent_after_close": true
+    },
+    "timer_only_observation_interval_local": "2026-10-02 00:53:43.998849393 through 00:54:22.003850824 CEST",
+    "timer_only_outcome": "Host and GitHub reconciled; 0/2 worker slots reserved; orchestrator chat is held for explicit reconciliation: herdr agent.get failed: agent target w2:p6 not found (agent_not_found)",
+    "durable_before": {
+      "history_count": 241,
+      "last_id": "request-00000000000000000241",
+      "sequence_next": 242,
+      "inbox_files": []
+    },
+    "durable_after": {
+      "history_count": 241,
+      "last_id": "request-00000000000000000241",
+      "sequence_next": 242,
+      "inbox_files": []
+    },
+    "history_and_inbox_unchanged_across_discovery": true,
+    "old_binding_preserved_for_explicit_recovery": true,
+    "run21_artifact_preserved_sha256": "0dd2ff7ab39b7bccf1d8490c6d93399eee03e0859373b07a32ce906e59a1e39e",
+    "worker_runs_after_timer_discovery": 21,
+    "outbox_after_timer_discovery": {
+      "messages": 77,
+      "delivered": 77,
+      "pending": 0
+    },
+    "service_remained_active": true,
+    "versioned_before_snapshot": "issue-16-missed-hook-before.json (all 241 history IDs retained)",
+    "versioned_after_snapshot": "issue-16-missed-hook-after.json",
+    "history_id_list_sha256": "3bce74d47a79fcdfc5cee9e1194f5197a7cd0065a9a191eb624b62143290b0ca"
+  },
+  "restoration_and_recovery": {
+    "restored_original_manifest_sha256": "482e59c9bff5adeeeaea2dcde7cf73ced7d4391cd99557345d3df9149af6b1ca",
+    "plugin_relinked_enabled_with_both_original_hooks": true,
+    "recovery_action": "herdr plugin action invoke recover-chat",
+    "workspace_context": "w2 source workspace; Herdr action log recorded focused pane cwd /tmp/wf16-acceptance/repo",
+    "actual_action_execution_log": {
+      "action_id": "recover-chat",
+      "command": [
+        "./bin/wayfinder-herdr",
+        "recover-chat",
+        "--confirm-replacement",
+        "--confirm-launch-absent-or-stopped"
+      ],
+      "exit_code": 1,
+      "finished_unix_ms": 1790895335889,
+      "log_id": "plugin-log-127",
+      "plugin_id": "wayfinder.herdr",
+      "started_unix_ms": 1790895335123,
+      "status": "failed",
+      "stderr": "Wayfinder: initial orchestrator prompt outcome is uncertain and will not be repeated: herdr agent.prompt failed: agent w2:p7 is not an active named agent (agent_not_ready)\n",
+      "stdout": ""
+    },
+    "startup_race": "The action created p7 but its first prompt request returned agent_not_ready. Herdr logged the exact failure. The saved launch retained initial_prompt_attempted=false with the exact p7 process fingerprint; after the real status-change callback, the runtime safely continued that same process and did not create a second pane or reuse p6.",
+    "subsequent_native_hook_logs": [
+      {
+        "command": [
+          "./bin/wayfinder-herdr",
+          "reconcile"
+        ],
+        "event": "pane.agent_status_changed",
+        "exit_code": 0,
+        "finished_unix_ms": 1790895339079,
+        "log_id": "plugin-log-128",
+        "plugin_id": "wayfinder.herdr",
+        "started_unix_ms": 1790895339077,
+        "status": "succeeded",
+        "stderr": "",
+        "stdout": ""
+      },
+      {
+        "command": [
+          "./bin/wayfinder-herdr",
+          "reconcile"
+        ],
+        "event": "pane.agent_status_changed",
+        "exit_code": 0,
+        "finished_unix_ms": 1790895349323,
+        "log_id": "plugin-log-129",
+        "plugin_id": "wayfinder.herdr",
+        "started_unix_ms": 1790895349321,
+        "status": "succeeded",
+        "stderr": "",
+        "stdout": ""
+      },
+      {
+        "command": [
+          "./bin/wayfinder-herdr",
+          "reconcile"
+        ],
+        "event": "pane.agent_status_changed",
+        "exit_code": 0,
+        "finished_unix_ms": 1790895397584,
+        "log_id": "plugin-log-130",
+        "plugin_id": "wayfinder.herdr",
+        "started_unix_ms": 1790895397576,
+        "status": "succeeded",
+        "stderr": "",
+        "stdout": ""
+      }
+    ],
+    "current_chat": {
+      "status": "running",
+      "workspace_id": "w2",
+      "tab_id": "w2:t1",
+      "pane_id": "w2:p7",
+      "terminal_id": "term_65ccf5049057216",
+      "provider": "codex",
+      "session": null,
+      "foreground_process": {
+        "boot_id": "a093fcea-966d-46f2-8931-2d79488ce85b",
+        "pid": 1327454,
+        "start_time_ticks": 5276413
+      },
+      "initial_prompt_attempted": true,
+      "observed_herdr_session_after_bootstrap": "01a0f9ae-2cbf-70e2-8622-ea8fd7c9fff0",
+      "saved_session_limitation": "Wayfinder retains the exact boot/PID/start foreground process and running status; this snapshot still has session=null even though Herdr later reports a session ID."
+    },
+    "old_chat_archive_count": 5,
+    "old_chat_archive_tail": {
+      "binding": {
+        "status": "running",
+        "workspace_id": "w2",
+        "tab_id": "w2:t1",
+        "pane_id": "w2:p6",
+        "terminal_id": "term_65cce662e5cbb10",
+        "provider": "codex",
+        "session": {
+          "source": "herdr:codex",
+          "agent": "codex",
+          "kind": "id",
+          "value": "01a0f972-3c6d-7421-ba37-de3bbebd14b9"
+        },
+        "foreground_process": {
+          "boot_id": "a093fcea-966d-46f2-8931-2d79488ce85b",
+          "pid": 1188931,
+          "start_time_ticks": 4883656
+        },
+        "initial_prompt_attempted": true,
+        "source_pane_id": "w2:p2"
+      },
+      "replaced_at_ms": 1790895335191,
+      "reason": "human explicitly confirmed replacement after the prior identity was missing or changed"
+    },
+    "runs_unchanged": true,
+    "outbox": {
+      "messages": 77,
+      "delivered": 77,
+      "pending": 0
+    }
+  },
+  "duplicate_native_callback_observation": {
+    "successful_reconcile_event_logs": [
+      {
+        "command": [
+          "./bin/wayfinder-herdr",
+          "reconcile"
+        ],
+        "event": "pane.agent_status_changed",
+        "exit_code": 0,
+        "finished_unix_ms": 1790895339079,
+        "log_id": "plugin-log-128",
+        "plugin_id": "wayfinder.herdr",
+        "started_unix_ms": 1790895339077,
+        "status": "succeeded",
+        "stderr": "",
+        "stdout": ""
+      },
+      {
+        "command": [
+          "./bin/wayfinder-herdr",
+          "reconcile"
+        ],
+        "event": "pane.agent_status_changed",
+        "exit_code": 0,
+        "finished_unix_ms": 1790895349323,
+        "log_id": "plugin-log-129",
+        "plugin_id": "wayfinder.herdr",
+        "started_unix_ms": 1790895349321,
+        "status": "succeeded",
+        "stderr": "",
+        "stdout": ""
+      },
+      {
+        "command": [
+          "./bin/wayfinder-herdr",
+          "reconcile"
+        ],
+        "event": "pane.agent_status_changed",
+        "exit_code": 0,
+        "finished_unix_ms": 1790895397584,
+        "log_id": "plugin-log-130",
+        "plugin_id": "wayfinder.herdr",
+        "started_unix_ms": 1790895397576,
+        "status": "succeeded",
+        "stderr": "",
+        "stdout": ""
+      }
+    ],
+    "post_recovery_reconcile_request_ids": [
+      "request-00000000000000000242",
+      "request-00000000000000000243",
+      "request-00000000000000000244"
+    ],
+    "worker_run_count_before_and_after": 21,
+    "meaning": "Multiple real native pane.agent_status_changed executions during one recovered-chat startup were processed without extra worker dispatch or outbox duplication. Herdr logs omit event payload/correlation IDs, so they prove repeated native executions, not redelivery of one identical event instance."
+  },
+  "accepted_feature_preserved": {
+    "commit": "f9c55676781e3163747e0fc466dc012132bf0f32",
+    "ready_disposable_pr": 4,
+    "merged": false,
+    "run21_result_sha256": "0dd2ff7ab39b7bccf1d8490c6d93399eee03e0859373b07a32ce906e59a1e39e"
+  },
+  "automated_fixture_coverage": [
+    "tests/runtime.rs::duplicate_hook_enqueues_serialize_without_dropping_a_request",
+    "tests/runtime.rs::queued_start_survives_restart_and_duplicate_request_is_not_reapplied"
+  ],
+  "limitations": [
+    "A Herdr API callback event ID is not correlated to a Wayfinder inbox request ID in Herdr 0.9.3 logs.",
+    "The real live experiment proves a deliberately missed pane.exited callback is recovered by the periodic runtime pass; native callbacks were restored before explicit chat recovery.",
+    "Repeated successful native callbacks were observed live, but exact duplicate delivery of the same event instance cannot be established from available Herdr log fields."
+  ]
+}

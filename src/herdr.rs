@@ -42,6 +42,14 @@ impl HerdrApiError {
     pub fn is_agent_not_found(&self) -> bool {
         self.method == "agent.get" && self.code == "agent_not_found"
     }
+
+    pub fn is_agent_not_ready(&self) -> bool {
+        self.method == "agent.prompt" && self.code == "agent_not_ready"
+    }
+
+    pub fn is_agent_pane_busy(&self) -> bool {
+        self.method == "agent.start" && self.code == "agent_pane_busy"
+    }
 }
 
 #[derive(Clone)]
@@ -122,10 +130,12 @@ pub fn verify_worker_identity(info: &Value, run: &WorkerRun) -> Result<()> {
         Some(terminal) == run.terminal_id,
         "Herdr worker terminal identity changed"
     );
-    ensure!(
-        provider == run.agent_provider,
-        "Herdr worker provider identity changed"
-    );
+    if let Some(expected) = run.agent_provider.as_deref() {
+        ensure!(
+            provider.as_deref() == Some(expected),
+            "Herdr worker provider identity changed"
+        );
+    }
     ensure!(
         session == run.agent_session,
         "Herdr agent session identity changed"
@@ -162,6 +172,101 @@ pub fn capture_foreground_process(info: &Value, pane_id: &str) -> Result<LinuxPr
         pid,
         start_time_ticks,
     })
+}
+
+/// Capture a newly launched provider only after Herdr reports the provider as
+/// foreground leader in the exact detached checkout. This avoids persisting a
+/// transient launcher shell as the worker's process identity.
+pub fn capture_provider_process(
+    info: &Value,
+    pane_id: &str,
+    provider: &str,
+    worktree: &str,
+) -> Result<LinuxProcessIdentity> {
+    let process_info = info
+        .get("process_info")
+        .context("Herdr pane.process_info omitted process_info")?;
+    ensure!(
+        field(process_info, "pane_id")? == pane_id,
+        "Herdr process information belongs to another pane"
+    );
+    let group = process_info["foreground_process_group_id"]
+        .as_u64()
+        .context("Herdr did not identify the foreground process group")?;
+    let process = process_info["foreground_processes"]
+        .as_array()
+        .context("Herdr omitted foreground process list")?
+        .iter()
+        .find(|process| process["pid"].as_u64() == Some(group))
+        .context("Herdr did not report the foreground process-group leader")?;
+    let name = process["name"]
+        .as_str()
+        .context("Herdr omitted foreground process name")?;
+    let argv0 = process["argv"]
+        .as_array()
+        .and_then(|args| args.first())
+        .and_then(Value::as_str)
+        .context("Herdr omitted foreground executable arguments")?;
+    ensure!(
+        std::path::Path::new(argv0)
+            .file_name()
+            .and_then(|name| name.to_str())
+            == Some(provider)
+            && name == provider,
+        "foreground process is not the configured {provider} provider"
+    );
+    ensure!(
+        process["cwd"].as_str() == Some(worktree),
+        "foreground provider is not running in its detached worktree"
+    );
+    capture_foreground_process(info, pane_id)
+}
+
+/// Capture the exact shell Herdr opened for a worker before calling
+/// `agent.start`. This makes a rejected or ambiguous start distinguishable
+/// from a replacement process without treating the pane name as identity.
+pub fn capture_shell_process(
+    info: &Value,
+    pane_id: &str,
+    worktree: &str,
+) -> Result<LinuxProcessIdentity> {
+    let process_info = info
+        .get("process_info")
+        .context("Herdr pane.process_info omitted process_info")?;
+    ensure!(
+        field(process_info, "pane_id")? == pane_id,
+        "Herdr process information belongs to another pane"
+    );
+    let group = process_info["foreground_process_group_id"]
+        .as_u64()
+        .context("Herdr did not identify the foreground process group")?;
+    let process = process_info["foreground_processes"]
+        .as_array()
+        .context("Herdr omitted foreground process list")?
+        .iter()
+        .find(|process| process["pid"].as_u64() == Some(group))
+        .context("Herdr did not report the foreground process-group leader")?;
+    let name = process["name"]
+        .as_str()
+        .context("Herdr omitted foreground process name")?;
+    let argv0 = process["argv"]
+        .as_array()
+        .and_then(|args| args.first())
+        .and_then(Value::as_str)
+        .context("Herdr omitted foreground executable arguments")?;
+    ensure!(
+        matches!(name, "bash" | "zsh" | "sh" | "fish" | "nu")
+            && std::path::Path::new(argv0)
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|base| matches!(base, "bash" | "zsh" | "sh" | "fish" | "nu")),
+        "foreground process is not an available shell"
+    );
+    ensure!(
+        process["cwd"].as_str() == Some(worktree),
+        "foreground shell is not running in its owned detached worktree"
+    );
+    capture_foreground_process(info, pane_id)
 }
 
 pub fn verify_foreground_process(info: &Value, run: &WorkerRun) -> Result<()> {
@@ -219,10 +324,12 @@ pub fn verify_pre_prompt_agent_identity(info: &Value, run: &WorkerRun) -> Result
         terminal == expected_terminal,
         "Herdr worker terminal identity changed"
     );
-    ensure!(
-        provider == run.agent_provider,
-        "Herdr worker provider identity changed"
-    );
+    if let Some(expected) = run.agent_provider.as_deref() {
+        ensure!(
+            provider.as_deref() == Some(expected),
+            "Herdr worker provider identity changed"
+        );
+    }
     if let Some(expected) = run.agent_session.as_ref() {
         ensure!(
             session.as_ref() == Some(expected),
@@ -354,6 +461,10 @@ impl Client {
 
     pub fn pane_list(&self, workspace_id: &str) -> Result<Value> {
         self.request("pane.list", json!({"workspace_id":workspace_id}))
+    }
+
+    pub fn pane(&self, pane_id: &str) -> Result<Value> {
+        self.request("pane.get", json!({"pane_id": pane_id}))
     }
 
     pub fn start_agent(

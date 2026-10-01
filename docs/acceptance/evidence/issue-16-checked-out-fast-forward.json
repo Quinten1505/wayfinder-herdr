@@ -1,0 +1,47 @@
+{
+  "format_version": 1,
+  "finding": "A prior delivery fast-forwarded refs/heads/feature/issue-16-acceptance with update-ref but left the bound checkout index and files at the previous commit.",
+  "candidate_commit": "4e0cefd83e6f853ed8748745cad34682644b56d4",
+  "old_commit": "4155227aa9beb20bfb72a3ec953c8c3c4fcd09fe",
+  "before_repair": {
+    "checked_out_branch": "feature/issue-16-acceptance",
+    "HEAD": "4e0cefd83e6f853ed8748745cad34682644b56d4",
+    "index_tree": "711093d3f41f37de57d16fa9364aca04c2cf61c0",
+    "old_commit_tree": "711093d3f41f37de57d16fa9364aca04c2cf61c0",
+    "candidate_tree": "54fb9441eb7a30072ce99424779a93cba5bcf3c9",
+    "git_diff_worktree_to_index": "clean",
+    "reported_paths": [
+      "Cargo.lock",
+      "src/lib.rs",
+      "tests/parse.rs"
+    ],
+    "classification": "index/worktree matched the old commit; no post-integration human edits were present"
+  },
+  "repair": {
+    "command": "git -C /tmp/wf16-acceptance/repo read-tree -m -u 4155227aa9beb20bfb72a3ec953c8c3c4fcd09fe 4e0cefd83e6f853ed8748745cad34682644b56d4",
+    "authorization": "root approved this precise stale-checkout repair",
+    "result": "success"
+  },
+  "after_repair": {
+    "HEAD": "4e0cefd83e6f853ed8748745cad34682644b56d4",
+    "index_tree": "54fb9441eb7a30072ce99424779a93cba5bcf3c9",
+    "candidate_tree": "54fb9441eb7a30072ce99424779a93cba5bcf3c9",
+    "git_status": "clean"
+  },
+  "implementation": "Checked-out feature branches use git merge --ff-only --no-edit --no-overwrite-ignore after expected HEAD/ref checks, updating HEAD/index/worktree together. Non-checked-out refs retain compare-and-swap update-ref.",
+  "regressions": [
+    "initial dispatch to implementation completion to exact-commit review to integration updates bound checkout cleanly",
+    "checked-out fast-forward preserves an unrelated untracked user file",
+    "checked-out fast-forward refuses a stale expected target",
+    "checked-out fast-forward refuses an ignored local file at a newly tracked candidate path without moving HEAD or the feature ref"
+  ],
+  "ignored_file_preservation_finding": {
+    "origin": "Root live-discovered issue16 acceptance finding; initial reproduction retained at /tmp/wf16-ignore-overwrite-probe.json.",
+    "risk": "A clean git status can hide ignored local data at a path newly tracked by the candidate; plain git merge --ff-only --no-edit overwrites it.",
+    "fix": "Checked-out integration now passes --no-overwrite-ignore so Git refuses before advancing branch or replacing the local file.",
+    "regression": "checked_out_fast_forward_preserves_ignored_user_file_at_new_candidate_path",
+    "fixture": "The actual Git fixture ignores Cargo.lock via .git/info/exclude, writes human-owned bytes there, then integrates a candidate that newly tracks Cargo.lock.",
+    "expected": "integration is held, ignored file bytes are unchanged, HEAD and refs/heads/feature/delivery-test remain at the old commit.",
+    "result": "passed in targeted cargo test run; full source test run is recorded in final handoff."
+  }
+}
