@@ -42,6 +42,7 @@ impl Fixture {
             socket,
             herdr_binary: binary,
             herdr_config: None,
+            source_workspace_id: Some("workspace-parent".into()),
         };
         let (key, _) = store::attach(&root, MAP, binding.clone(), 1).unwrap();
         let dir = store::map_dir(&root, &key).unwrap();
@@ -247,8 +248,19 @@ fn attach_is_idempotent_but_cannot_rebind_a_map_or_reset_pause() {
     let f = Fixture::new();
     f.apply(RequestKind::Start);
     f.apply(RequestKind::Pause);
-    let before = fs::read(f.dir.join("state.json")).unwrap();
+    let mut legacy = f.state();
+    legacy.binding.source_workspace_id = None;
+    store::atomic_json(&f.dir.join("state.json"), &legacy).unwrap();
     store::attach(&f.root, "example/project#042", f.binding.clone(), 30).unwrap();
+    let repaired = f.state();
+    assert_eq!(
+        repaired.binding.source_workspace_id.as_deref(),
+        Some("workspace-parent")
+    );
+    assert_eq!(repaired.authorization, Authorization::Paused);
+    assert_eq!(repaired.history.len(), legacy.history.len());
+    assert_eq!(repaired.history[0].id, legacy.history[0].id);
+    let before = fs::read(f.dir.join("state.json")).unwrap();
     let mut changed = f.binding.clone();
     changed.socket = "/different.sock".into();
     assert!(store::attach(&f.root, MAP, changed, 30).is_err());

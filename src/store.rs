@@ -20,6 +20,9 @@ pub struct Binding {
     pub herdr_binary: PathBuf,
     pub socket: PathBuf,
     pub herdr_config: Option<PathBuf>,
+    /// Owning repo workspace used as the explicit source for Herdr worktree.open.
+    #[serde(default)]
+    pub source_workspace_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -749,11 +752,21 @@ pub fn attach(
     let _lock = Lock::acquire(&dir.join("state.lock"))?;
     let path = dir.join("state.json");
     let state = if path.exists() {
-        let state = read_state(&dir)?;
-        ensure!(
-            state.binding == binding,
-            "map already bound to another repository or herdr endpoint; existing state preserved"
-        );
+        let mut state = read_state(&dir)?;
+        if state.binding != binding {
+            let only_adds_source_workspace = state.binding.repository == binding.repository
+                && state.binding.herdr_binary == binding.herdr_binary
+                && state.binding.socket == binding.socket
+                && state.binding.herdr_config == binding.herdr_config
+                && state.binding.source_workspace_id.is_none()
+                && binding.source_workspace_id.is_some();
+            ensure!(
+                only_adds_source_workspace,
+                "map already bound to another repository or herdr endpoint; existing state preserved"
+            );
+            state.binding.source_workspace_id = binding.source_workspace_id.clone();
+            atomic_json(&path, &state)?;
+        }
         state
     } else {
         let state = State {

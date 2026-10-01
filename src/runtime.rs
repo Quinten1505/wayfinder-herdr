@@ -135,6 +135,11 @@ fn reconcile(dir: &Path, state: &mut State) -> Result<String> {
         Authorization::Paused => return Ok("Host and GitHub reconciled; dispatch paused".into()),
         Authorization::Started => {}
     }
+    if state.binding.source_workspace_id.is_none() {
+        return Ok(
+            "Host and GitHub reconciled; dispatch held: attach this map with its owning Herdr workspace ID".into(),
+        );
+    }
     let ready = match github.dispatch_frontier(&map) {
         Ok(ready) => ready,
         Err(error) if format!("{error:#}").contains("execution override") => {
@@ -638,6 +643,7 @@ mod tests {
             herdr_binary: PathBuf::from("/bin/true"),
             socket: temp.path().join("owned-session.sock"),
             herdr_config: None,
+            source_workspace_id: Some("workspace-parent".into()),
         };
         let (key, _) = store::attach(temp.path(), "example/project#42", binding, 30).unwrap();
         let dir = store::map_dir(temp.path(), &key).unwrap();
@@ -793,6 +799,7 @@ mod tests {
             herdr_binary: PathBuf::from("/bin/true"),
             socket: temp.path().join("owned-session.sock"),
             herdr_config: None,
+            source_workspace_id: Some("workspace-parent".into()),
         };
         let (key, _) = store::attach(temp.path(), "example/project#42", binding, 30).unwrap();
         let dir = store::map_dir(temp.path(), &key).unwrap();
@@ -863,6 +870,7 @@ mod tests {
             herdr_binary: PathBuf::from("/bin/true"),
             socket: temp.path().join("owned-session.sock"),
             herdr_config: None,
+            source_workspace_id: Some("workspace-parent".into()),
         };
         let (key, _) = store::attach(temp.path(), "example/project#42", binding, 30).unwrap();
         let dir = store::map_dir(temp.path(), &key).unwrap();
@@ -1684,6 +1692,11 @@ fn launch_one(
     let opened = herdr.open_worktree(
         &run.worktree,
         &format!("Wayfinder ticket {} {}", run.ticket, run.role),
+        state
+            .binding
+            .source_workspace_id
+            .as_deref()
+            .context("attach this map with its owning Herdr workspace ID before dispatch")?,
     );
     let opened = match opened {
         Ok(value) => value,

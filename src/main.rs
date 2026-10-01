@@ -33,6 +33,9 @@ enum CommandName {
         repository: PathBuf,
         #[arg(long)]
         socket: Option<PathBuf>,
+        /// Owning repo workspace in the target Herdr session; defaults to HERDR_WORKSPACE_ID.
+        #[arg(long)]
+        workspace: Option<String>,
         #[arg(long)]
         herdr: Option<PathBuf>,
         #[arg(long, default_value_t = 30)]
@@ -319,6 +322,7 @@ fn run() -> Result<()> {
             map,
             repository,
             socket,
+            workspace,
             herdr,
             poll_seconds,
             no_service,
@@ -334,6 +338,7 @@ fn run() -> Result<()> {
                 socket,
                 herdr_binary: executable(herdr)?,
                 herdr_config: env::var_os("HERDR_CONFIG_PATH").map(PathBuf::from),
+                source_workspace_id: workspace.or_else(|| env::var("HERDR_WORKSPACE_ID").ok()),
             };
             let (key, state) = store::attach(&root, &map, binding, poll_seconds)?;
             println!(

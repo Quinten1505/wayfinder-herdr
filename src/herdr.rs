@@ -333,10 +333,15 @@ impl Client {
         Ok(())
     }
 
-    pub fn open_worktree(&self, path: &Path, label: &str) -> Result<Value> {
+    pub fn open_worktree(
+        &self,
+        path: &Path,
+        label: &str,
+        source_workspace_id: &str,
+    ) -> Result<Value> {
         self.request(
             "worktree.open",
-            json!({"cwd":path,"path":path,"label":label,"focus":false,"trust_repository":false}),
+            json!({"path":path,"label":label,"workspace_id":source_workspace_id,"focus":false,"trust_repository":false}),
         )
     }
 

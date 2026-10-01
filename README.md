@@ -28,12 +28,15 @@ Run from the intended herdr session, supplying the repository checkout and canon
 
 ```sh
 ~/.local/lib/wayfinder-herdr/bin/wayfinder-herdr attach \
-  --map 'OWNER/REPO#NUMBER' --repository /absolute/path/to/repository
+  --map 'OWNER/REPO#NUMBER' --repository /absolute/path/to/repository \
+  --workspace "$HERDR_WORKSPACE_ID"
 ~/.local/lib/wayfinder-herdr/bin/wayfinder-herdr status --map 'OWNER/REPO#NUMBER'
 ~/.local/lib/wayfinder-herdr/bin/wayfinder-herdr start --map 'OWNER/REPO#NUMBER'
 ```
 
 Attach binds the repository, herdr executable, and socket, initializes state as `awaiting_start`, and enables/starts that map's service. `--socket /absolute/socket` and `--herdr /absolute/herdr` make the endpoint explicit. `--no-service` initializes state without starting systemd. The printed map key identifies `wayfinder-herdr@KEY.service`; `journalctl --user -u wayfinder-herdr@KEY.service` shows failures.
+
+Attach from the repository's Herdr workspace so `HERDR_WORKSPACE_ID` is available, or provide it explicitly with `--workspace WORKSPACE_ID`. Wayfinder persists this owning workspace ID and supplies it to each `worktree.open` request. It does not depend on whichever workspace is focused when its background runtime later dispatches work. Existing state created without a source workspace may be repaired by an explicit reattach with `--workspace`; other repository, socket, or Herdr binding changes remain rejected.
 
 The Wayfinder Chat action opens or focuses the configured orchestrator agent in a Herdr pane for the attached map. It does not authorize execution: maps plan by default, and worker dispatch still requires an accepted map execution override plus an explicit Start. The Start, Pause, Resume, and Status plugin actions select the unique attached map matching the invoking workspace and herdr socket. If multiple maps match, use the CLI with `--map`. Start/Pause/Resume return when a request has been durably queued; inspect status for its applied outcome. A first Resume cannot substitute for explicit Start. Pause prevents future dispatch authorization; it does not cancel work. Startup and lifecycle hooks only queue reconciliation requests.
 
@@ -43,7 +46,8 @@ Configure shared defaults or a role override. Provider-specific argv is passed a
 
 ```sh
 wayfinder-herdr configure-worker --map OWNER/REPOSITORY#NUMBER \
-  --role implementer --kind codex --model MODEL --reasoning-effort high
+  --role implementer --kind codex --model MODEL --reasoning-effort high \
+  --arg=--approve-for-me --arg=-c --arg='service_tier="priority"'
 wayfinder-herdr configure-worker --map OWNER/REPOSITORY#NUMBER \
   --role reviewer --kind codex --arg=--full-auto --concurrency 2
 wayfinder-herdr configure-worker --map OWNER/REPOSITORY#NUMBER \

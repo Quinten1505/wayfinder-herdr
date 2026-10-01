@@ -218,6 +218,7 @@ impl Fixture {
             socket,
             herdr_binary: binary,
             herdr_config: None,
+            source_workspace_id: Some("workspace-parent".into()),
         };
         let root = temp.path().join("state");
         let (key, _) = store::attach(&root, MAP, binding.clone(), 1).unwrap();
@@ -684,6 +685,8 @@ fn cli_dispatch_creates_a_detached_ticket_worktree_and_uses_explicit_herdr_ids()
         .find(|r| r["method"] == "worktree.open")
         .unwrap();
     assert_eq!(open["params"]["path"], run.worktree.to_str().unwrap());
+    assert_eq!(open["params"]["workspace_id"], "workspace-parent");
+    assert!(open["params"].get("cwd").is_none());
     assert_eq!(open["params"]["focus"], false);
     assert_eq!(open["params"]["trust_repository"], false);
     let start = records
@@ -714,6 +717,22 @@ fn cli_dispatch_creates_a_detached_ticket_worktree_and_uses_explicit_herdr_ids()
     assert!(!prompt.contains("wayfinder-herdr/issues/18"));
     assert!(prompt.contains("$HOME/.agents/skills/implement/SKILL.md"));
     assert!(prompt.contains("Do not invent, infer, or answer a human response"));
+}
+
+#[test]
+fn missing_source_workspace_holds_dispatch_before_claim_or_worktree_creation() {
+    let f = Fixture::new();
+    let mut state = f.state();
+    state.binding.source_workspace_id = None;
+    store::atomic_json(&f.dir.join("state.json"), &state).unwrap();
+
+    f.apply(RequestKind::Start);
+
+    let state = f.state();
+    assert!(state.workers.runs.is_empty());
+    assert!(state.suspension.contains("owning Herdr workspace ID"));
+    assert!(f.herdr_state.lock().unwrap().requests.is_empty());
+    assert!(!f._temp.path().join(".wayfinder-42-13-1").exists());
 }
 
 #[test]

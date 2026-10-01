@@ -64,6 +64,7 @@ impl Fixture {
             socket: "/tmp/session.sock".into(),
             herdr_binary: herdr,
             herdr_config: None,
+            source_workspace_id: Some("workspace-parent".into()),
         };
         let (key, _) = store::attach(&root, MAP, binding.clone(), 1).unwrap();
         let dir = store::map_dir(&root, &key).unwrap();
