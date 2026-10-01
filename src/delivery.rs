@@ -42,6 +42,9 @@ pub struct DeliveryState {
     pub draft_pr: Option<PullRequest>,
     #[serde(default)]
     pub ready_commit: Option<String>,
+    /// A readiness mutation that has not yet been confirmed at GitHub.
+    #[serde(default)]
+    pub readiness_intent: Option<ReadinessIntent>,
     #[serde(default)]
     pub merged_commit: Option<String>,
     #[serde(default)]
@@ -96,6 +99,36 @@ pub struct CheckEvidence {
     pub commit: String,
     pub command: String,
     pub result: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ReadinessIntent {
+    pub pr_number: u64,
+    pub commit: String,
+    pub base: String,
+    pub action: ReadinessAction,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ReadinessAction {
+    Ready,
+    Draft,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReadinessResolution {
+    Ready,
+    Draft,
+}
+
+struct ObservedPullRequest {
+    pull_request: PullRequest,
+    head_oid: String,
+    base_oid: String,
+    merged: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -326,16 +359,29 @@ pub fn chat_milestones(dir: &Path) -> Result<Vec<String>> {
         }
     }
     if let Some(pr) = state.draft_pr {
-        milestones.push(format!(
-            "Feature PR #{} is {}: {}",
-            pr.number,
-            if pr.draft {
-                "draft"
-            } else {
-                "ready for human review"
-            },
-            pr.url
-        ));
+        if let Some(intent) = state.readiness_intent.as_ref() {
+            match intent.action {
+                ReadinessAction::Ready => milestones.push(format!(
+                    "Feature PR #{} readiness request for commit {} is pending remote verification and is not locally considered ready: {} ({})",
+                    intent.pr_number, intent.commit, intent.reason, pr.url
+                )),
+                ReadinessAction::Draft => milestones.push(format!(
+                    "Feature PR #{} may still be ready; draft invalidation for reviewed commit {} is pending remote verification: {} ({})",
+                    intent.pr_number, intent.commit, intent.reason, pr.url
+                )),
+            }
+        } else {
+            milestones.push(format!(
+                "Feature PR #{} is {}: {}",
+                pr.number,
+                if pr.draft {
+                    "draft"
+                } else {
+                    "ready for human review"
+                },
+                pr.url
+            ));
+        }
     }
     if let Some(commit) = state.ready_commit {
         milestones.push(format!(
@@ -350,7 +396,13 @@ pub fn chat_milestones(dir: &Path) -> Result<Vec<String>> {
         milestones.push(format!("Feature PR handoff is pending: {error}"));
     }
     if let Some(error) = state.ready_error {
-        milestones.push(format!("Feature PR remains draft: {error}"));
+        if state.readiness_intent.is_some() {
+            milestones.push(format!(
+                "Feature PR readiness is not locally verified; human action may be needed: {error}"
+            ));
+        } else {
+            milestones.push(format!("Feature PR remains draft: {error}"));
+        }
     }
     Ok(milestones)
 }
@@ -365,6 +417,341 @@ pub fn record_ready_error(dir: &Path, error: &str) -> Result<()> {
     let mut state = read(dir)?;
     state.ready_error = Some(error.to_owned());
     save(dir, &state)
+}
+
+fn observe_pr(gh: &Path, repository: &str, number: u64) -> Result<ObservedPullRequest> {
+    let expected_number = number;
+    let number = number.to_string();
+    let viewed = gh_json(
+        gh,
+        &[
+            "pr",
+            "view",
+            &number,
+            "--repo",
+            repository,
+            "--json",
+            "isDraft,headRefOid,baseRefOid,url,number,headRefName,baseRefName,mergedAt",
+        ],
+    )?;
+    let pull_request = parse_pr(&viewed)?;
+    ensure!(
+        pull_request.number == expected_number,
+        "GitHub PR view returned a different pull request"
+    );
+    Ok(ObservedPullRequest {
+        pull_request,
+        head_oid: viewed["headRefOid"]
+            .as_str()
+            .context("GitHub PR view omitted head commit")?
+            .to_owned(),
+        base_oid: viewed["baseRefOid"]
+            .as_str()
+            .context("GitHub PR view omitted base commit")?
+            .to_owned(),
+        merged: viewed["mergedAt"].as_str().is_some(),
+    })
+}
+
+fn save_pending_error(dir: &Path, delivery: &mut DeliveryState, detail: &str) -> Result<()> {
+    delivery.ready_commit = None;
+    delivery.ready_error = Some(format!(
+        "PR readiness is not locally verified; remote transition is pending reconciliation: {detail}"
+    ));
+    save(dir, delivery)
+}
+
+fn persist_draft_intent(
+    dir: &Path,
+    delivery: &mut DeliveryState,
+    pr_number: u64,
+    commit: &str,
+    base: &str,
+    reason: &str,
+) -> Result<()> {
+    delivery.readiness_intent = Some(ReadinessIntent {
+        pr_number,
+        commit: commit.to_owned(),
+        base: base.to_owned(),
+        action: ReadinessAction::Draft,
+        reason: reason.to_owned(),
+    });
+    delivery.ready_commit = None;
+    delivery.final_review_commit = None;
+    delivery.ready_error = Some(format!(
+        "PR may still be ready; draft invalidation is pending remote verification: {reason}"
+    ));
+    save(dir, delivery)
+}
+
+fn confirm_draft(
+    dir: &Path,
+    delivery: &mut DeliveryState,
+    intent: &ReadinessIntent,
+    observed: ObservedPullRequest,
+) -> Result<ReadinessResolution> {
+    ensure!(
+        observed.pull_request.draft && !observed.merged,
+        "cannot confirm PR draft state from this GitHub response"
+    );
+    delivery.draft_pr = Some(observed.pull_request);
+    delivery.ready_commit = None;
+    delivery.final_review_commit = None;
+    delivery.readiness_intent = None;
+    delivery.ready_error = Some(format!(
+        "PR is confirmed draft; renewed final review is required: {}",
+        intent.reason
+    ));
+    save(dir, delivery)?;
+    Ok(ReadinessResolution::Draft)
+}
+
+fn confirm_ready(
+    dir: &Path,
+    delivery: &mut DeliveryState,
+    intent: &ReadinessIntent,
+    observed: ObservedPullRequest,
+) -> Result<ReadinessResolution> {
+    ensure!(
+        !observed.pull_request.draft
+            && !observed.merged
+            && observed.head_oid == intent.commit
+            && observed.base_oid == intent.base,
+        "GitHub PR state does not match the persisted readiness intent"
+    );
+    delivery.draft_pr = Some(observed.pull_request);
+    delivery.ready_commit = Some(intent.commit.clone());
+    delivery.final_review_commit = Some(intent.commit.clone());
+    delivery.pr_base_commit = Some(intent.base.clone());
+    delivery.readiness_intent = None;
+    delivery.ready_error = None;
+    delivery.handoff_error = None;
+    save(dir, delivery)?;
+    Ok(ReadinessResolution::Ready)
+}
+
+/// Reconcile an already-persisted readiness effect. A local ready marker is
+/// written only after GitHub confirms the exact commit, base, and draft state.
+fn reconcile_readiness_intent(
+    dir: &Path,
+    delivery: &mut DeliveryState,
+    gh: &Path,
+    repository: &str,
+) -> Result<Option<ReadinessResolution>> {
+    let Some(mut intent) = delivery.readiness_intent.clone() else {
+        return Ok(None);
+    };
+    loop {
+        let observed = match observe_pr(gh, repository, intent.pr_number) {
+            Ok(observed) => observed,
+            Err(error) => {
+                if intent.action == ReadinessAction::Ready {
+                    let reason = format!(
+                        "PR state could not be read while a readiness effect may have taken place: {error:#}"
+                    );
+                    persist_draft_intent(
+                        dir,
+                        delivery,
+                        intent.pr_number,
+                        &intent.commit,
+                        &intent.base,
+                        &reason,
+                    )?;
+                    intent = delivery.readiness_intent.clone().unwrap();
+                    continue;
+                }
+                save_pending_error(dir, delivery, &format!("could not inspect PR: {error:#}"))?;
+                bail!("PR readiness transition remains pending: {error:#}");
+            }
+        };
+        match intent.action {
+            ReadinessAction::Draft => {
+                if observed.merged {
+                    let detail = format!(
+                        "PR {} was merged before draft invalidation could be confirmed; human reconciliation is required",
+                        intent.pr_number
+                    );
+                    save_pending_error(dir, delivery, &detail)?;
+                    bail!("{detail}");
+                }
+                if observed.pull_request.draft {
+                    return confirm_draft(dir, delivery, &intent, observed).map(Some);
+                }
+                let number = intent.pr_number.to_string();
+                let mutation = gh_text(
+                    gh,
+                    &[
+                        "api",
+                        "--method",
+                        "PATCH",
+                        &format!("repos/{repository}/pulls/{number}"),
+                        "-F",
+                        "draft=true",
+                    ],
+                );
+                let after = match observe_pr(gh, repository, intent.pr_number) {
+                    Ok(observed) => observed,
+                    Err(error) => {
+                        save_pending_error(
+                            dir,
+                            delivery,
+                            &format!(
+                                "draft mutation outcome is unverified ({}); follow-up PR read failed: {error:#}",
+                                mutation
+                                    .as_ref()
+                                    .map(|_| "request succeeded")
+                                    .unwrap_or("request failed")
+                            ),
+                        )?;
+                        bail!("PR draft invalidation remains pending: {error:#}");
+                    }
+                };
+                if after.pull_request.draft && !after.merged {
+                    return confirm_draft(dir, delivery, &intent, after).map(Some);
+                }
+                let mutation_error = mutation
+                    .err()
+                    .map(|error| format!("draft mutation reported failure: {error:#}; "))
+                    .unwrap_or_default();
+                let detail = format!(
+                    "{mutation_error}GitHub still reports PR {} as ready; draft invalidation remains pending",
+                    intent.pr_number
+                );
+                save_pending_error(dir, delivery, &detail)?;
+                bail!("{detail}");
+            }
+            ReadinessAction::Ready => {
+                if observed.merged {
+                    let reason = "PR was merged while readiness was being reconciled; human reconciliation is required";
+                    persist_draft_intent(
+                        dir,
+                        delivery,
+                        intent.pr_number,
+                        &intent.commit,
+                        &intent.base,
+                        reason,
+                    )?;
+                    intent = delivery.readiness_intent.clone().unwrap();
+                    continue;
+                }
+                let exact = observed.head_oid == intent.commit && observed.base_oid == intent.base;
+                if !observed.pull_request.draft && exact {
+                    return confirm_ready(dir, delivery, &intent, observed).map(Some);
+                }
+                if !observed.pull_request.draft && !exact {
+                    let reason = format!(
+                        "GitHub reports ready at head {} and base {}, not reviewed head {} and base {}",
+                        observed.head_oid, observed.base_oid, intent.commit, intent.base
+                    );
+                    persist_draft_intent(
+                        dir,
+                        delivery,
+                        intent.pr_number,
+                        &intent.commit,
+                        &intent.base,
+                        &reason,
+                    )?;
+                    intent = delivery.readiness_intent.clone().unwrap();
+                    continue;
+                }
+                if !exact {
+                    let reason = format!(
+                        "PR remained draft but its head/base moved from reviewed {}/{} to {}/{}",
+                        intent.commit, intent.base, observed.head_oid, observed.base_oid
+                    );
+                    return confirm_draft(
+                        dir,
+                        delivery,
+                        &ReadinessIntent { reason, ..intent },
+                        observed,
+                    )
+                    .map(Some);
+                }
+
+                let number = intent.pr_number.to_string();
+                let mutation = gh_text(gh, &["pr", "ready", &number, "--repo", repository]);
+                let after = match observe_pr(gh, repository, intent.pr_number) {
+                    Ok(observed) => observed,
+                    Err(error) => {
+                        let reason = format!(
+                            "post-ready GitHub state could not be read: {error:#}; original mutation result: {}",
+                            mutation.as_ref().map(|_| "success").unwrap_or("failure")
+                        );
+                        persist_draft_intent(
+                            dir,
+                            delivery,
+                            intent.pr_number,
+                            &intent.commit,
+                            &intent.base,
+                            &reason,
+                        )?;
+                        intent = delivery.readiness_intent.clone().unwrap();
+                        continue;
+                    }
+                };
+                if !after.merged
+                    && !after.pull_request.draft
+                    && after.head_oid == intent.commit
+                    && after.base_oid == intent.base
+                {
+                    return confirm_ready(dir, delivery, &intent, after).map(Some);
+                }
+                if after.merged || !after.pull_request.draft {
+                    let reason = if after.merged {
+                        "PR was merged during readiness verification; human reconciliation is required".to_owned()
+                    } else {
+                        format!(
+                            "post-ready verification observed head/base {}/{} instead of reviewed {}/{}",
+                            after.head_oid, after.base_oid, intent.commit, intent.base
+                        )
+                    };
+                    persist_draft_intent(
+                        dir,
+                        delivery,
+                        intent.pr_number,
+                        &intent.commit,
+                        &intent.base,
+                        &reason,
+                    )?;
+                    intent = delivery.readiness_intent.clone().unwrap();
+                    continue;
+                }
+                let reason = mutation
+                    .err()
+                    .map(|error| format!("GitHub did not ready the PR: {error:#}"))
+                    .unwrap_or_else(|| {
+                        "GitHub left the PR in draft after the readiness request".into()
+                    });
+                return confirm_draft(dir, delivery, &ReadinessIntent { reason, ..intent }, after)
+                    .map(Some);
+            }
+        }
+    }
+}
+
+fn request_draft_invalidation(
+    dir: &Path,
+    delivery: &mut DeliveryState,
+    gh: &Path,
+    repository: &str,
+    mut intent: ReadinessIntent,
+) -> Result<()> {
+    intent.action = ReadinessAction::Draft;
+    persist_draft_intent(
+        dir,
+        delivery,
+        intent.pr_number,
+        &intent.commit,
+        &intent.base,
+        &intent.reason,
+    )?;
+    match reconcile_readiness_intent(dir, delivery, gh, repository)? {
+        Some(ReadinessResolution::Draft) => Ok(()),
+        Some(ReadinessResolution::Ready) => {
+            bail!("draft invalidation unexpectedly resolved as ready")
+        }
+        None => bail!("draft invalidation intent disappeared before verification"),
+    }
 }
 
 pub fn mark_ready(
@@ -402,6 +789,19 @@ fn mark_ready_with(
     gh: &Path,
 ) -> Result<()> {
     let mut delivery = read(dir)?;
+    if delivery.readiness_intent.is_some() {
+        let map_ref = MapRef::parse(map)?;
+        let repository_name = format!("{}/{}", map_ref.owner, map_ref.repository);
+        match reconcile_readiness_intent(dir, &mut delivery, gh, &repository_name)? {
+            Some(ReadinessResolution::Ready) => return Ok(()),
+            Some(ReadinessResolution::Draft) => {
+                bail!(
+                    "a prior PR readiness transition was reconciled to draft; obtain renewed final review before retrying readiness"
+                )
+            }
+            None => bail!("persisted PR readiness intent disappeared during reconciliation"),
+        }
+    }
     let children = delivery
         .map_children
         .as_deref()
@@ -495,36 +895,33 @@ fn mark_ready_with(
         .context("draft feature PR has not been created")?;
     let map_ref = MapRef::parse(map)?;
     let repo = format!("{}/{}", map_ref.owner, map_ref.repository);
-    let number = pr.number.to_string();
-    gh_text(gh, &["pr", "ready", &number, "--repo", &repo])?;
-    let viewed = gh_json(
-        gh,
-        &[
-            "pr",
-            "view",
-            &number,
-            "--repo",
-            &repo,
-            "--json",
-            "isDraft,headRefOid,baseRefOid,url,number,headRefName,baseRefName",
-        ],
-    )?;
-    ensure!(
-        viewed["isDraft"] == false
-            && viewed["headRefOid"].as_str() == Some(commit)
-            && viewed["baseRefOid"].as_str() == Some(base.as_str()),
-        "GitHub did not confirm ready state for the reviewed head and current develop target"
-    );
-    delivery.draft_pr = Some(parse_pr(&viewed)?);
-    delivery.ready_commit = Some(commit.to_owned());
+    let intent = ReadinessIntent {
+        pr_number: pr.number,
+        commit: commit.to_owned(),
+        base: base.clone(),
+        action: ReadinessAction::Ready,
+        reason: "final feature review and checks passed for this exact head and base".into(),
+    };
+    delivery.readiness_intent = Some(intent);
+    delivery.ready_commit = None;
     delivery.final_review_commit = Some(commit.to_owned());
     delivery.final_review = Some(review_summary);
     delivery.final_checks = final_checks.clone();
     delivery.feature_checks = final_checks;
     delivery.pr_base_commit = Some(base);
-    delivery.handoff_error = None;
-    delivery.ready_error = None;
-    save(dir, &delivery)
+    delivery.ready_error = Some(
+        "PR readiness mutation is pending remote verification; it is not yet locally considered ready".into(),
+    );
+    save(dir, &delivery)?;
+    match reconcile_readiness_intent(dir, &mut delivery, gh, &repo)? {
+        Some(ReadinessResolution::Ready) => Ok(()),
+        Some(ReadinessResolution::Draft) => {
+            bail!(
+                "GitHub did not confirm readiness for the reviewed commit; the PR is confirmed draft"
+            )
+        }
+        None => bail!("readiness intent disappeared before GitHub verification"),
+    }
 }
 
 pub fn reconcile(dir: &Path, state: &State, children: &[ChildTicket]) -> Result<Outcome> {
@@ -1031,6 +1428,11 @@ fn ensure_draft_pr_with_gh(
     gh: &Path,
 ) -> Result<Option<PullRequest>> {
     let mut delivery = read(dir)?;
+    if delivery.readiness_intent.is_some() {
+        let map_ref = MapRef::parse(map)?;
+        let repository_name = format!("{}/{}", map_ref.owner, map_ref.repository);
+        reconcile_readiness_intent(dir, &mut delivery, gh, &repository_name)?;
+    }
     if !delivery
         .tickets
         .values()
@@ -1110,46 +1512,77 @@ fn ensure_draft_pr_with_gh(
         let observed_head = git(repository, &["rev-parse", &format!("refs/heads/{branch}")])?
             .trim()
             .to_owned();
-        let ready_invalid = delivery.ready_commit.as_deref().is_some_and(|ready| {
-            ready != observed_head
-                || delivery.pr_base_commit.as_deref() != Some(observed_base.as_str())
-        });
-        if ready_invalid && !existing_pr.draft {
-            let number = existing_pr.number.to_string();
-            gh_text(
+        if existing_pr.draft
+            && let Some(ready_commit) = delivery.ready_commit.clone()
+        {
+            let ready_base = delivery
+                .pr_base_commit
+                .clone()
+                .unwrap_or_else(|| observed_base.clone());
+            request_draft_invalidation(
+                dir,
+                &mut delivery,
                 gh,
-                &[
-                    "api",
-                    "--method",
-                    "PATCH",
-                    &format!("repos/{repo}/pulls/{number}"),
-                    "-F",
-                    "draft=true",
-                ],
+                &repo,
+                ReadinessIntent {
+                    pr_number: existing_pr.number,
+                    commit: ready_commit,
+                    base: ready_base,
+                    action: ReadinessAction::Draft,
+                    reason: "GitHub reports the PR is already draft; the previous readiness is no longer active".into(),
+                },
+            )?;
+        }
+        let ready_invalid = !existing_pr.draft
+            && (delivery.ready_commit.as_deref() != Some(observed_head.as_str())
+                || delivery.pr_base_commit.as_deref() != Some(observed_base.as_str())
+                || !is_ancestor(repository, &observed_base, &observed_head)?);
+        let ready_without_verified_evidence = !existing_pr.draft && delivery.ready_commit.is_none();
+        let readiness_commit = delivery
+            .ready_commit
+            .clone()
+            .unwrap_or_else(|| observed_head.clone());
+        let readiness_base = delivery
+            .pr_base_commit
+            .clone()
+            .unwrap_or_else(|| observed_base.clone());
+        if ready_invalid || ready_without_verified_evidence {
+            let reason = if ready_without_verified_evidence {
+                "GitHub reports a ready PR without a locally verified readiness record".to_owned()
+            } else {
+                "feature head or develop target changed after final review".to_owned()
+            };
+            request_draft_invalidation(
+                dir,
+                &mut delivery,
+                gh,
+                &repo,
+                ReadinessIntent {
+                    pr_number: existing_pr.number,
+                    commit: readiness_commit.clone(),
+                    base: readiness_base.clone(),
+                    action: ReadinessAction::Draft,
+                    reason,
+                },
             )?;
             forced_draft = true;
-            delivery.ready_commit = None;
-            delivery.final_review_commit = None;
-            delivery.ready_error = Some("feature head or develop target changed after final review; the PR returned to draft and needs a renewed final review".into());
         }
         let (base, target_updated) = sync_develop_target(dir, repository, &branch, &mut delivery)?;
         if target_updated && !existing_pr.draft && !forced_draft {
-            let number = existing_pr.number.to_string();
-            gh_text(
+            request_draft_invalidation(
+                dir,
+                &mut delivery,
                 gh,
-                &[
-                    "api",
-                    "--method",
-                    "PATCH",
-                    &format!("repos/{repo}/pulls/{number}"),
-                    "-F",
-                    "draft=true",
-                ],
+                &repo,
+                ReadinessIntent {
+                    pr_number: existing_pr.number,
+                    commit: readiness_commit.clone(),
+                    base: readiness_base.clone(),
+                    action: ReadinessAction::Draft,
+                    reason: "develop advanced after final review".into(),
+                },
             )?;
             forced_draft = true;
-            delivery.ready_commit = None;
-            delivery.final_review_commit = None;
-            delivery.ready_error = Some("develop advanced; the feature branch was updated and requires a renewed final review before this PR can be ready".into());
         }
         delivery.pr_base_commit = Some(base);
         save(dir, &delivery)?;
@@ -1158,11 +1591,80 @@ fn ensure_draft_pr_with_gh(
         delivery.pr_base_commit = Some(base);
         save(dir, &delivery)?;
     }
-    run(
+    if !forced_draft
+        && let Some(existing) = prs
+            .first()
+            .filter(|pr| pr["isDraft"].as_bool() == Some(false))
+    {
+        let expected_commit = delivery
+            .ready_commit
+            .clone()
+            .context("GitHub reports a ready PR without a locally verified commit")?;
+        let expected_base = delivery
+            .pr_base_commit
+            .clone()
+            .context("GitHub reports a ready PR without a locally verified base")?;
+        let remote_head = remote_ref(repository, "refs/heads", &branch);
+        let remote_base = git(repository, &["rev-parse", "refs/remotes/origin/develop"]);
+        let target_changed = remote_base
+            .as_ref()
+            .is_ok_and(|base| base.trim() != expected_base)
+            || remote_head
+                .as_ref()
+                .is_ok_and(|head| head.as_deref() != Some(expected_commit.as_str()));
+        if target_changed || remote_head.is_err() || remote_base.is_err() {
+            request_draft_invalidation(
+                dir,
+                &mut delivery,
+                gh,
+                &repo,
+                ReadinessIntent {
+                    pr_number: existing["number"].as_u64().context("ready PR omitted number")?,
+                    commit: expected_commit,
+                    base: expected_base,
+                    action: ReadinessAction::Draft,
+                    reason: "remote feature head or develop target changed or could not be verified before publishing the branch".into(),
+                },
+            )?;
+            forced_draft = true;
+        }
+    }
+    if let Err(push_error) = run(
         repository,
         "git",
         &["push", "--set-upstream", "origin", &branch],
-    )?;
+    ) {
+        if let Some(existing) = prs
+            .first()
+            .filter(|pr| pr["isDraft"].as_bool() == Some(false))
+        {
+            let fallback_commit = git(repository, &["rev-parse", &format!("refs/heads/{branch}")])
+                .unwrap_or_default()
+                .trim()
+                .to_owned();
+            let fallback_base = git(repository, &["rev-parse", "refs/remotes/origin/develop"])
+                .unwrap_or_default()
+                .trim()
+                .to_owned();
+            let readiness_commit = delivery.ready_commit.clone().unwrap_or(fallback_commit);
+            let readiness_base = delivery.pr_base_commit.clone().unwrap_or(fallback_base);
+            request_draft_invalidation(
+                dir,
+                &mut delivery,
+                gh,
+                &repo,
+                ReadinessIntent {
+                    pr_number: existing["number"].as_u64().context("ready PR omitted number")?,
+                    commit: readiness_commit,
+                    base: readiness_base,
+                    action: ReadinessAction::Draft,
+                    reason: format!("feature branch push failed while the PR was ready; readiness requires reconciliation: {push_error:#}"),
+                },
+            )
+            .context("could not confirm the ready PR was returned to draft after branch push failure")?;
+        }
+        return Err(push_error);
+    }
     let mut pr = if let Some(pr) = prs.first() {
         let mut parsed = parse_pr(pr)?;
         if forced_draft {
@@ -1246,36 +1748,64 @@ fn ensure_draft_pr_with_gh(
             }
         }
     };
-    if !pr.draft && delivery.ready_commit.is_some() {
-        run(repository, "git", &["fetch", "origin", "develop"])?;
-        let current_base = git(repository, &["rev-parse", "refs/remotes/origin/develop"])?
-            .trim()
-            .to_owned();
-        let current_head = remote_ref(repository, "refs/heads", &branch)?;
-        let ready_head = delivery.ready_commit.as_deref().unwrap();
-        let target_changed = delivery.pr_base_commit.as_deref() != Some(current_base.as_str());
-        if target_changed || current_head.as_deref() != Some(ready_head) {
-            let number = pr.number.to_string();
-            gh_text(
+    if !pr.draft {
+        let base_result = run(repository, "git", &["fetch", "origin", "develop"])
+            .and_then(|()| git(repository, &["rev-parse", "refs/remotes/origin/develop"]))
+            .map(|base| base.trim().to_owned());
+        let head_result = remote_ref(repository, "refs/heads", &branch);
+        let target_changed = base_result
+            .as_ref()
+            .is_ok_and(|base| delivery.pr_base_commit.as_deref() != Some(base.as_str()));
+        let head_changed = head_result
+            .as_ref()
+            .is_ok_and(|head| delivery.ready_commit.as_deref() != head.as_deref());
+        if target_changed
+            || head_changed
+            || delivery.ready_commit.is_none()
+            || base_result.is_err()
+            || head_result.is_err()
+        {
+            let reason = match (base_result.as_ref(), head_result.as_ref()) {
+                (Err(error), _) => format!(
+                    "develop target could not be checked after readiness: {error:#}"
+                ),
+                (_, Err(error)) => format!(
+                    "remote feature head could not be checked after readiness: {error:#}"
+                ),
+                (Ok(_), Ok(_)) if target_changed => {
+                    "develop moved after final review; update the feature branch, rerun checks, and obtain a renewed final review".into()
+                }
+                _ => "feature branch changed or lacks verified readiness evidence; obtain a renewed final review".into(),
+            };
+            let readiness_commit = delivery.ready_commit.clone().unwrap_or_else(|| {
+                head_result
+                    .as_ref()
+                    .ok()
+                    .and_then(|head| head.clone())
+                    .unwrap_or_default()
+            });
+            let readiness_base = delivery
+                .pr_base_commit
+                .clone()
+                .or_else(|| base_result.as_ref().ok().cloned())
+                .unwrap_or_default();
+            request_draft_invalidation(
+                dir,
+                &mut delivery,
                 gh,
-                &[
-                    "api",
-                    "--method",
-                    "PATCH",
-                    &format!("repos/{repo}/pulls/{number}"),
-                    "-F",
-                    "draft=true",
-                ],
+                &repo,
+                ReadinessIntent {
+                    pr_number: pr.number,
+                    commit: readiness_commit,
+                    base: readiness_base,
+                    action: ReadinessAction::Draft,
+                    reason,
+                },
             )?;
             pr.draft = true;
-            delivery.ready_commit = None;
-            delivery.final_review_commit = None;
-            delivery.pr_base_commit = Some(current_base);
-            delivery.ready_error = Some(if target_changed {
-                "develop moved after final review; update the feature branch, rerun checks, and obtain a renewed final review".into()
-            } else {
-                "feature branch changed after final review; obtain a renewed final review for its current commit".into()
-            });
+            if let Ok(current_base) = base_result {
+                delivery.pr_base_commit = Some(current_base);
+            }
         }
     }
     let body = pr_body(&delivery);
@@ -2436,13 +2966,53 @@ elif args[:2] == ['pr','edit']:
     json.dump(state,open(path,'w'))
 elif args[:2] == ['pr','ready']:
     state['pr']['isDraft']=False
+    if state.get('ready_head_override'):
+        state['pr']['headRefOid']=state['ready_head_override']
+    if state.get('ready_ambiguous_after_effect',0) > 0:
+        state['ready_ambiguous_after_effect'] -= 1
+        json.dump(state,open(path,'w'))
+        sys.stderr.write('simulated lost readiness response\n')
+        sys.exit(1)
     json.dump(state,open(path,'w'))
 elif args[:2] == ['pr','view']:
+    if state['pr'] and state['pr']['isDraft'] and state.get('view_fail_after_redraft',0) > 0:
+        state['view_fail_after_redraft'] -= 1
+        json.dump(state,open(path,'w'))
+        sys.stderr.write('simulated post-redraft view failure\n')
+        sys.exit(1)
+    if state['pr'] and not state['pr']['isDraft'] and state.get('view_fail_after_ready',0) > 0:
+        state['view_fail_after_ready'] -= 1
+        json.dump(state,open(path,'w'))
+        sys.stderr.write('simulated post-ready view failure\n')
+        sys.exit(1)
     print(json.dumps(state['pr']))
+elif args[:3] == ['api','--method','PATCH'] and args[-2:] == ['-F','draft=true']:
+    if state.get('redraft_fail_before_effect',0) > 0:
+        state['redraft_fail_before_effect'] -= 1
+        json.dump(state,open(path,'w'))
+        sys.stderr.write('simulated pre-effect redraft failure\n')
+        sys.exit(1)
+    state['pr']['isDraft']=True
+    if state.get('redraft_ambiguous_after_effect',0) > 0:
+        state['redraft_ambiguous_after_effect'] -= 1
+        json.dump(state,open(path,'w'))
+        sys.stderr.write('simulated lost redraft response\n')
+        sys.exit(1)
+    json.dump(state,open(path,'w'))
+    print('{}')
 else:
     sys.exit(2)
 "##).unwrap();
         fs::set_permissions(&gh, fs::Permissions::from_mode(0o755)).unwrap();
+        fs::write(
+            gh.with_file_name("pr.json"),
+            serde_json::to_vec(&json!({
+                "creates":0,"edits":0,"pr":null,"body":"",
+                "ready_ambiguous_after_effect":1
+            }))
+            .unwrap(),
+        )
+        .unwrap();
         let mut state_json = json!({
             "format_version":1,"map":"example/project#42",
             "binding":{"repository":repo,"herdr_binary":"/bin/true","socket":"/tmp/test.sock","herdr_config":null},
@@ -2451,6 +3021,15 @@ else:
         });
         let workers: State = serde_json::from_value(state_json.take()).unwrap();
         fs::write(gh.with_file_name("meta.json"), serde_json::to_vec(&json!({"head":head,"base":command(&repo, &["rev-parse", "refs/remotes/origin/develop"])})).unwrap()).unwrap();
+        let gh_state_path = temp.path().join("pr.json");
+        let mut readiness_remote: serde_json::Value =
+            serde_json::from_slice(&fs::read(&gh_state_path).unwrap()).unwrap();
+        readiness_remote["ready_ambiguous_after_effect"] = json!(1);
+        fs::write(
+            &gh_state_path,
+            serde_json::to_vec(&readiness_remote).unwrap(),
+        )
+        .unwrap();
         let mut missing_evidence = delivery.clone();
         let ticket = missing_evidence.tickets.get_mut("run-1").unwrap();
         ticket.review = None;
@@ -2634,6 +3213,220 @@ else:
         );
         let ready = read(&state_dir).unwrap();
         assert_eq!(ready.final_checks.len(), 1);
+
+        let mut remote: serde_json::Value =
+            serde_json::from_slice(&fs::read(&gh_state_path).unwrap()).unwrap();
+        remote["pr"]["isDraft"] = json!(true);
+        remote["pr"]["headRefOid"] = json!(head);
+        remote["ready_head_override"] = json!("concurrent-head-change");
+        remote["redraft_fail_before_effect"] = json!(1);
+        fs::write(&gh_state_path, serde_json::to_vec(&remote).unwrap()).unwrap();
+
+        let failed_invalidation = mark_ready_with(
+            &state_dir,
+            &repo,
+            "example/project#42",
+            &ready_workers,
+            "run-final-review",
+            &head,
+            |_| {
+                Ok(vec![CheckEvidence {
+                    commit: head.clone(),
+                    command: "cargo test --locked --all-targets".into(),
+                    result: "passed (exit 0)".into(),
+                }])
+            },
+            &gh,
+        )
+        .unwrap_err();
+        assert!(
+            failed_invalidation
+                .to_string()
+                .contains("draft invalidation remains pending")
+        );
+        let pending = read(&state_dir).unwrap();
+        assert!(pending.ready_commit.is_none());
+        let intent = pending.readiness_intent.as_ref().unwrap();
+        assert_eq!(intent.action, ReadinessAction::Draft);
+        assert!(intent.reason.contains("post-ready verification observed"));
+        assert!(chat_milestones(&state_dir).unwrap().iter().any(|line| {
+            line.contains("may still be ready") && line.contains("pending remote verification")
+        }));
+        remote = serde_json::from_slice(&fs::read(&gh_state_path).unwrap()).unwrap();
+        assert_eq!(remote["pr"]["isDraft"], false);
+
+        // Simulate a restart, then a draft request that takes effect but loses
+        // its response. The persisted intent is reconciled from the remote view.
+        remote["ready_head_override"] = serde_json::Value::Null;
+        remote["redraft_ambiguous_after_effect"] = json!(1);
+        remote["view_fail_after_redraft"] = json!(1);
+        fs::write(&gh_state_path, serde_json::to_vec(&remote).unwrap()).unwrap();
+        assert!(
+            ensure_draft_pr_with_gh(&state_dir, &repo, "example/project#42", &ready_workers, &gh)
+                .is_err()
+        );
+        let still_pending = read(&state_dir).unwrap();
+        assert_eq!(
+            still_pending.readiness_intent.as_ref().unwrap().action,
+            ReadinessAction::Draft
+        );
+        assert!(still_pending.ready_commit.is_none());
+
+        // Another process observes the already-draft PR and safely resolves the
+        // retained intent without repeating a potentially unsafe transition.
+        ensure_draft_pr_with_gh(&state_dir, &repo, "example/project#42", &ready_workers, &gh)
+            .unwrap();
+        let recovered = read(&state_dir).unwrap();
+        assert!(recovered.readiness_intent.is_none());
+        assert!(recovered.ready_commit.is_none());
+        assert!(recovered.draft_pr.as_ref().unwrap().draft);
+        remote = serde_json::from_slice(&fs::read(&gh_state_path).unwrap()).unwrap();
+        assert_eq!(remote["pr"]["isDraft"], true);
+
+        // Once the remote head is again the independently reviewed commit, a
+        // later explicit readiness attempt can complete normally.
+        remote["pr"]["headRefOid"] = json!(head);
+        remote["ready_head_override"] = serde_json::Value::Null;
+        fs::write(&gh_state_path, serde_json::to_vec(&remote).unwrap()).unwrap();
+        mark_ready_with(
+            &state_dir,
+            &repo,
+            "example/project#42",
+            &ready_workers,
+            "run-final-review",
+            &head,
+            |_| {
+                Ok(vec![CheckEvidence {
+                    commit: head.clone(),
+                    command: "cargo test --locked --all-targets".into(),
+                    result: "passed (exit 0)".into(),
+                }])
+            },
+            &gh,
+        )
+        .unwrap();
+        assert_eq!(
+            read(&state_dir).unwrap().ready_commit.as_deref(),
+            Some(head.as_str())
+        );
+
+        // A failed post-ready PR read is treated as uncertain and forces a
+        // confirmed return to draft before readiness is cleared locally.
+        remote = serde_json::from_slice(&fs::read(&gh_state_path).unwrap()).unwrap();
+        remote["pr"]["isDraft"] = json!(true);
+        remote["pr"]["headRefOid"] = json!(head);
+        remote["view_fail_after_ready"] = json!(1);
+        fs::write(&gh_state_path, serde_json::to_vec(&remote).unwrap()).unwrap();
+        assert!(
+            mark_ready_with(
+                &state_dir,
+                &repo,
+                "example/project#42",
+                &ready_workers,
+                "run-final-review",
+                &head,
+                |_| {
+                    Ok(vec![CheckEvidence {
+                        commit: head.clone(),
+                        command: "cargo test --locked --all-targets".into(),
+                        result: "passed (exit 0)".into(),
+                    }])
+                },
+                &gh,
+            )
+            .is_err()
+        );
+        let unreadable = read(&state_dir).unwrap();
+        assert!(unreadable.ready_commit.is_none());
+        assert!(unreadable.readiness_intent.is_none());
+        assert!(unreadable.draft_pr.as_ref().unwrap().draft);
+        remote = serde_json::from_slice(&fs::read(&gh_state_path).unwrap()).unwrap();
+        assert_eq!(remote["pr"]["isDraft"], true);
+
+        mark_ready_with(
+            &state_dir,
+            &repo,
+            "example/project#42",
+            &ready_workers,
+            "run-final-review",
+            &head,
+            |_| {
+                Ok(vec![CheckEvidence {
+                    commit: head.clone(),
+                    command: "cargo test --locked --all-targets".into(),
+                    result: "passed (exit 0)".into(),
+                }])
+            },
+            &gh,
+        )
+        .unwrap();
+        let develop_path = temp.path().join("develop-advance");
+        command(
+            &repo,
+            &[
+                "worktree",
+                "add",
+                "--detach",
+                develop_path.to_str().unwrap(),
+                &head,
+            ],
+        );
+        fs::write(develop_path.join("target-only.txt"), "advanced develop\n").unwrap();
+        command(&develop_path, &["add", "target-only.txt"]);
+        command(
+            &develop_path,
+            &["commit", "--quiet", "-m", "advance develop target"],
+        );
+        command(
+            &develop_path,
+            &["push", "origin", "HEAD:refs/heads/develop"],
+        );
+        command(&repo, &["fetch", "origin", "develop"]);
+        command(
+            &repo,
+            &["merge", "--no-edit", "refs/remotes/origin/develop"],
+        );
+        fs::write(
+            repo.join("new-feature-change.txt"),
+            "changed after readiness\n",
+        )
+        .unwrap();
+        command(&repo, &["add", "new-feature-change.txt"]);
+        command(
+            &repo,
+            &["commit", "--quiet", "-m", "concurrent feature change"],
+        );
+        command(&repo, &["push", "origin", "feature/delivery-test"]);
+        remote = serde_json::from_slice(&fs::read(&gh_state_path).unwrap()).unwrap();
+        remote["redraft_fail_before_effect"] = json!(1);
+        fs::write(&gh_state_path, serde_json::to_vec(&remote).unwrap()).unwrap();
+        assert!(
+            ensure_draft_pr_with_gh(&state_dir, &repo, "example/project#42", &ready_workers, &gh)
+                .is_err()
+        );
+        let changed_head = read(&state_dir).unwrap();
+        assert!(changed_head.ready_commit.is_none());
+        assert_eq!(
+            changed_head.readiness_intent.as_ref().unwrap().action,
+            ReadinessAction::Draft
+        );
+        assert!(
+            changed_head
+                .readiness_intent
+                .as_ref()
+                .unwrap()
+                .reason
+                .contains("feature head or develop target changed")
+        );
+        remote = serde_json::from_slice(&fs::read(&gh_state_path).unwrap()).unwrap();
+        remote["redraft_ambiguous_after_effect"] = json!(1);
+        fs::write(&gh_state_path, serde_json::to_vec(&remote).unwrap()).unwrap();
+        ensure_draft_pr_with_gh(&state_dir, &repo, "example/project#42", &ready_workers, &gh)
+            .unwrap();
+        let recovered_head_change = read(&state_dir).unwrap();
+        assert!(recovered_head_change.readiness_intent.is_none());
+        assert!(recovered_head_change.ready_commit.is_none());
+        assert!(recovered_head_change.draft_pr.as_ref().unwrap().draft);
     }
 
     #[test]
