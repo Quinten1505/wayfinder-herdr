@@ -19,10 +19,11 @@ Deliver a working Rust herdr plugin implementing the wayfinder workflow, with on
 
 ## Decisions so far
 
+- [How can a Rust plugin integrate with herdr?](issues/01-plugin-contract.md): Rust executable plugins are supported; one-shot startup and non-durable hooks require plugin-owned workflow state.
+- [What orchestration capabilities and lifecycle guarantees does herdr provide?](issues/02-orchestration-capabilities.md): Execution primitives exist; task completion, claims, review evidence, and restart recovery remain plugin responsibilities.
+
 ## Not yet specified
 
-- Detailed scheduling, resource limits, cancellation, and recovery behavior depend on herdr's lifecycle guarantees and the selected execution model.
-- Packaging, installation, upgrade behavior, and end-to-end acceptance scenarios depend on the plugin contract.
 - How to expose capabilities beyond the core worktree/agent/review flow depends on the capability inventory and coverage decision.
 - Implementation sequence will emerge after the runtime, state ownership, and review decisions.
 
