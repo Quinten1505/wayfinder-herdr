@@ -161,6 +161,37 @@ impl GitHub {
         self.get_list(&format!("repos/{}/issues/{number}/comments", map.repo()))
     }
 
+    fn has_comment_marker(&self, map: &MapRef, number: u64, marker: &str) -> Result<bool> {
+        let marker = format!("<!-- {marker} -->");
+        Ok(self.comments(map, number)?.iter().any(|comment| {
+            comment["body"]
+                .as_str()
+                .is_some_and(|body| body.contains(&marker))
+        }))
+    }
+
+    fn post_comment_once(&self, map: &MapRef, number: u64, body: &str, marker: &str) -> Result<()> {
+        if self.has_comment_marker(map, number, marker)? {
+            return Ok(());
+        }
+        let write = self.write(
+            "POST",
+            &format!("repos/{}/issues/{number}/comments", map.repo()),
+            &json!({"body":body}),
+        );
+        if self.has_comment_marker(map, number, marker)? {
+            return Ok(());
+        }
+        match write {
+            Ok(_) => bail!(
+                "GitHub accepted a comment write but its operation marker is not visible; intent retained for reconciliation"
+            ),
+            Err(error) => Err(error).context(
+                "comment write outcome is ambiguous; intent retained for marker reconciliation",
+            ),
+        }
+    }
+
     pub fn frontier(&self, map: &MapRef) -> Result<Vec<FrontierTicket>> {
         let mut frontier = Vec::new();
         for issue in self.subissues(map)? {
@@ -438,14 +469,15 @@ impl GitHub {
             "resolve",
             &json!([map.repo(), map.number, ticket, spec, resolution]),
         );
-        let comment_marker = format!("<!-- {marker} -->");
+        let resolution_marker = format!("{marker}:resolution");
+        let comment_marker = format!("<!-- {resolution_marker} -->");
         let body = format!("{resolution}\n\n{comment_marker}");
         self.with_intent(state_dir, &marker, "resolve", || {
-            let mut has_comment = self.comments(map, ticket)?.iter().any(|c| c["body"].as_str().is_some_and(|b| b.contains(&comment_marker)));
+            let mut has_comment = self.has_comment_marker(map, ticket, &resolution_marker)?;
             let latest = self.issue(map, ticket)?;
             ensure!(latest["state"] == "open" || has_comment, "ticket was closed externally; external closure does not count as resolution");
             if !has_comment {
-                self.write("POST", &format!("repos/{}/issues/{ticket}/comments", map.repo()), &json!({"body":body}))?;
+                self.post_comment_once(map, ticket, &body, &resolution_marker)?;
                 has_comment = true;
             }
             ensure!(has_comment, "resolution comment was not confirmed");
@@ -454,15 +486,30 @@ impl GitHub {
             if latest["state"] != "closed" {
                 self.write("PATCH", &map.issue_path(ticket), &json!({"state":"closed"}))?;
             }
-            self.advance_intent(state_dir, &marker, "closed")?;
-            let link = format!("- [#{} {}](https://github.com/{}/issues/{}) — {}", ticket, issue["title"].as_str().unwrap_or("Resolved ticket"), map.repo(), ticket, resolution.lines().next().unwrap_or("Resolved"));
-            self.update_issue_section(map, map.number, "Decisions so far", &link, &marker)?;
-            self.advance_intent(state_dir, &marker, "map-updated")?;
-            let spec_ref = MapRef { number: spec, ..map.clone() };
-            let spec_entry = format!("- Evidence from [#{}](https://github.com/{}/issues/{}) is recorded in its resolution comment.", ticket, map.repo(), ticket);
-            self.update_issue_section(map, spec, "Evidence and open design", &spec_entry, &marker)?;
-            self.advance_intent(state_dir, &marker, "complete")?;
-            let _ = spec_ref;
+            self.advance_intent(state_dir, &marker, "ticket-closed")?;
+            let title = issue["title"].as_str().unwrap_or("Resolved ticket");
+            let ticket_url = format!("https://github.com/{}/issues/{ticket}", map.repo());
+            let map_marker = format!("{marker}:map-pointer");
+            let map_comment = format!(
+                "### Decision index pointer — body refresh pending for a human\n\n- [#{ticket} {title}]({ticket_url}): {}\n\nRefresh the map's `Decisions so far` body section manually.\n\n<!-- {map_marker} -->",
+                resolution.lines().next().unwrap_or("Resolution recorded")
+            );
+            self.advance_intent(state_dir, &marker, "map-pointer-pending")?;
+            self.post_comment_once(map, map.number, &map_comment, &map_marker)?;
+            self.advance_intent(state_dir, &marker, "map-pointer-posted")?;
+
+            let spec_marker = format!("{marker}:spec-delta");
+            let proposed_delta = resolution
+                .lines()
+                .map(|line| format!("> {line}"))
+                .collect::<Vec<_>>()
+                .join("\n");
+            let spec_comment = format!(
+                "### Proposed specification delta — body refresh pending for a human\n\nDecision: [#{ticket} {title}]({ticket_url})\n\nProposed delta:\n{proposed_delta}\n\nReview and apply this proposed delta to the specification body manually.\n\n<!-- {spec_marker} -->"
+            );
+            self.advance_intent(state_dir, &marker, "spec-delta-pending")?;
+            self.post_comment_once(map, spec, &spec_comment, &spec_marker)?;
+            self.advance_intent(state_dir, &marker, "spec-delta-posted")?;
             Ok(Value::Null)
         })?;
         Ok(())
@@ -560,34 +607,6 @@ impl GitHub {
         intent.stage = stage.to_owned();
         atomic_json(path, &intent)
     }
-
-    fn update_issue_section(
-        &self,
-        map: &MapRef,
-        number: u64,
-        heading: &str,
-        entry: &str,
-        marker: &str,
-    ) -> Result<()> {
-        let path = map.issue_path(number);
-        for _ in 0..4 {
-            let issue = self.get(&path)?;
-            let body = issue["body"].as_str().unwrap_or_default();
-            if body.contains(marker) || body.contains(entry) {
-                return Ok(());
-            }
-            let updated = append_section(body, heading, entry, marker)?;
-            let _ = self.write("PATCH", &path, &json!({"body":updated}));
-            // GitHub issue-body writes do not offer conditional updates. Verify and
-            // re-merge if a concurrent edit replaced this write before readback.
-            let latest = self.get(&path)?;
-            let latest_body = latest["body"].as_str().unwrap_or_default();
-            if latest_body.contains(marker) || latest_body.contains(entry) {
-                return Ok(());
-            }
-        }
-        bail!("GitHub issue kept changing while updating {heading}; retry after reconciliation")
-    }
 }
 
 fn validate_repo(owner: &str, repository: &str) -> Result<()> {
@@ -656,20 +675,6 @@ fn affirmative_execution_override(notes: &str) -> bool {
         false
     })
 }
-fn append_section(body: &str, heading: &str, entry: &str, marker: &str) -> Result<String> {
-    let target = format!("## {heading}");
-    let start = body
-        .find(&target)
-        .context(format!("issue body has no '{target}' section"))?
-        + target.len();
-    let rest = &body[start..];
-    let end = rest
-        .find("\n## ")
-        .map_or(body.len(), |offset| start + offset);
-    let mut updated = body.to_owned();
-    updated.insert_str(end, &format!("\n{entry}\n\n<!-- {marker} -->\n"));
-    Ok(updated)
-}
 fn atomic_json(path: &Path, value: &impl Serialize) -> Result<()> {
     let parent = path.parent().context("intent path has no parent")?;
     fs::create_dir_all(parent)?;
@@ -718,15 +723,5 @@ mod tests {
         }
         assert!(section("## Destination\n\nExecution override: selected", "Notes").is_err());
         assert!(!affirmative_execution_override("Execution override: TBD"));
-    }
-
-    #[test]
-    fn safe_section_edit_preserves_surrounding_concurrent_content() {
-        let original = "## Notes\n\nkeep one\n\n## Decisions so far\n\nexisting decision\n\n## Out of scope\n\nkeep two";
-        let updated =
-            append_section(original, "Decisions so far", "- [#4](url) — done", "marker").unwrap();
-        assert!(updated.starts_with("## Notes\n\nkeep one"));
-        assert!(updated.contains("existing decision\n\n- [#4](url) — done"));
-        assert!(updated.ends_with("## Out of scope\n\nkeep two"));
     }
 }

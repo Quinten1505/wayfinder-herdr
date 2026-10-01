@@ -166,7 +166,9 @@ elif len(segments)>=5 and segments[3]=='issues':
         result={'id':len(comments)+1,'body':body['body']}
         comments.append(result)
         changed=True
-        if db.get('fail_after_comment_once'):
+        fail_map = db.get('fail_after_comment_issue') == parent
+        if fail_map: del db['fail_after_comment_issue']
+        if db.get('fail_after_comment_once') or fail_map:
             db['fail_after_comment_once']=False
             with open(data_path,'w') as f: json.dump(db,f)
             sys.stderr.write('simulated lost response after comment write\n'); sys.exit(1)
@@ -204,7 +206,8 @@ elif len(segments)>=5 and segments[3]=='issues':
             sys.stderr.write('HTTP 412 precondition failed\n'); sys.exit(1)
         target=db['issues'][str(parent)]
         for key,value in body.items():
-            if key=='assignees': target[key]=[{'login':v} for v in value]
+            if key=='body': db['body_patch_count']=db.get('body_patch_count',0)+1; target[key]=value
+            elif key=='assignees': target[key]=[{'login':v} for v in value]
             else: target[key]=value
         result=target
         changed=True
@@ -266,6 +269,19 @@ fn planning_operations_work_without_override_and_resolution_replay_is_idempotent
             .contains(&json!(6))
     );
 
+    let mut db = f.github();
+    db["issues"]["1"]["body"] = json!(format!(
+        "{}\n\nConcurrent map edit.",
+        db["issues"]["1"]["body"].as_str().unwrap()
+    ));
+    db["issues"]["10"]["body"] = json!(format!(
+        "{}\n\nConcurrent spec edit.",
+        db["issues"]["10"]["body"].as_str().unwrap()
+    ));
+    f.set_github(db);
+    let map_body_before = f.github()["issues"]["1"]["body"].clone();
+    let spec_body_before = f.github()["issues"]["10"]["body"].clone();
+
     f.success(&[
         "tracker",
         "resolve",
@@ -293,28 +309,33 @@ fn planning_operations_work_without_override_and_resolution_replay_is_idempotent
     let db = f.github();
     assert_eq!(db["issues"]["3"]["state"], "closed");
     assert_eq!(db["comments"]["3"].as_array().unwrap().len(), 1);
-    assert!(
-        db["issues"]["1"]["body"]
-            .as_str()
-            .unwrap()
-            .contains("#3 Ready")
+    assert_eq!(
+        db.get("body_patch_count")
+            .and_then(Value::as_u64)
+            .unwrap_or(0),
+        0
     );
-    assert!(db["issues"]["10"]["body"].as_str().unwrap().contains("#3"));
-    assert!(
-        db["issues"]["1"]["body"]
-            .as_str()
-            .unwrap()
-            .contains("keep planning")
-    );
+    assert_eq!(db["issues"]["1"]["body"], map_body_before);
+    assert_eq!(db["issues"]["10"]["body"], spec_body_before);
+    assert_eq!(db["comments"]["1"].as_array().unwrap().len(), 1);
+    assert_eq!(db["comments"]["10"].as_array().unwrap().len(), 1);
+    let map_comment = db["comments"]["1"][0]["body"].as_str().unwrap();
+    assert!(map_comment.contains("Decision index pointer"));
+    assert!(map_comment.contains("body refresh pending for a human"));
+    assert!(map_comment.contains("#3 Ready"));
+    let spec_comment = db["comments"]["10"][0]["body"].as_str().unwrap();
+    assert!(spec_comment.contains("Proposed specification delta"));
+    assert!(spec_comment.contains("body refresh pending for a human"));
+    assert!(spec_comment.contains("The human selected option A."));
 }
 
 #[test]
 fn ambiguous_comment_write_is_found_before_retry_and_external_close_is_not_resolution() {
     let f = Fixture::new(false);
     let mut db = f.github();
-    db["fail_after_comment_once"] = json!(true);
+    db["fail_after_comment_issue"] = json!(1);
     f.set_github(db);
-    let first = f.api(&[
+    f.success(&[
         "tracker",
         "resolve",
         "--map",
@@ -326,8 +347,7 @@ fn ambiguous_comment_write_is_found_before_retry_and_external_close_is_not_resol
         "--spec",
         "10",
     ]);
-    assert!(!first.status.success());
-    let second = f.api(&[
+    f.success(&[
         "tracker",
         "resolve",
         "--map",
@@ -339,10 +359,14 @@ fn ambiguous_comment_write_is_found_before_retry_and_external_close_is_not_resol
         "--spec",
         "10",
     ]);
-    assert!(
-        second.status.success(),
-        "{}",
-        String::from_utf8_lossy(&second.stderr)
+    assert_eq!(f.github()["comments"]["1"].as_array().unwrap().len(), 1);
+    assert_eq!(f.github()["comments"]["10"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        f.github()
+            .get("body_patch_count")
+            .and_then(Value::as_u64)
+            .unwrap_or(0),
+        0
     );
     assert_eq!(f.github()["comments"]["3"].as_array().unwrap().len(), 1);
 
@@ -544,9 +568,11 @@ fn planning_map_creation_is_idempotent_and_runtime_persists_frontier() {
 }
 
 #[test]
-fn map_and_spec_updates_keep_unrelated_text_and_map_reference_parses() {
+fn map_and_spec_comments_preserve_existing_issue_bodies() {
     assert_eq!(MapRef::parse(MAP).unwrap().number, 1);
     let f = Fixture::new(false);
+    let map_body = f.github()["issues"]["1"]["body"].clone();
+    let spec_body = f.github()["issues"]["10"]["body"].clone();
     f.success(&[
         "tracker",
         "resolve",
@@ -560,9 +586,8 @@ fn map_and_spec_updates_keep_unrelated_text_and_map_reference_parses() {
         "10",
     ]);
     let db = f.github();
-    let map_body = db["issues"]["1"]["body"].as_str().unwrap();
-    assert!(map_body.contains("existing decision"));
-    assert!(map_body.contains("keep scope"));
-    let spec_body = db["issues"]["10"]["body"].as_str().unwrap();
-    assert!(spec_body.contains("existing spec evidence"));
+    assert_eq!(db["issues"]["1"]["body"], map_body);
+    assert_eq!(db["issues"]["10"]["body"], spec_body);
+    assert_eq!(db["comments"]["1"].as_array().unwrap().len(), 1);
+    assert_eq!(db["comments"]["10"].as_array().unwrap().len(), 1);
 }
