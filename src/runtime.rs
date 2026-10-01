@@ -66,7 +66,10 @@ fn reconcile(dir: &Path, state: &mut State) -> Result<String> {
     store::atomic_json(&tracker_dir.join("frontier.json"), &frontier)?;
     let herdr = Client::new(&state.binding.socket);
     reconcile_workers(dir, state, &map, &github, &herdr)?;
-    crate::orchestration::reconcile(dir, state, &herdr, &github, &[])?;
+    // Issue 15 owns delivery milestones and State.scheduler_decisions. After
+    // its rebase, root maps delivery::chat_milestones(dir) and those persisted
+    // records into these additive chat adapters; transport stays in this module.
+    crate::orchestration::reconcile(dir, state, &herdr, &github, &[], &[])?;
     state.reconciled = true;
     match state.authorization {
         Authorization::AwaitingStart => {

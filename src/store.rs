@@ -49,6 +49,9 @@ pub struct State {
     /// Identity of the single Herdr-hosted orchestrator chat, if launched.
     #[serde(default)]
     pub orchestrator: Option<OrchestratorBinding>,
+    /// Former chats are evidence only. Recovery never sends commands to these panes.
+    #[serde(default)]
+    pub orchestrator_history: Vec<OrchestratorArchive>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -64,6 +67,14 @@ pub struct OrchestratorBinding {
     pub session: Option<AgentSessionIdentity>,
     /// The exact Herdr pane that requested creation, used only to reconcile launch intent.
     pub source_pane_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OrchestratorArchive {
+    pub binding: OrchestratorBinding,
+    pub replaced_at_ms: u128,
+    pub reason: String,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -519,6 +530,7 @@ pub fn attach(
             history: vec![],
             workers: WorkerState::default(),
             orchestrator: None,
+            orchestrator_history: vec![],
         };
         atomic_json(&path, &state)?;
         state

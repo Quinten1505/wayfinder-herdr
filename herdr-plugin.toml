@@ -37,6 +37,12 @@ title = "Open or focus the Wayfinder orchestrator chat"
 contexts = ["workspace"]
 command = ["./bin/wayfinder-herdr", "chat"]
 
+[[actions]]
+id = "recover-chat"
+title = "Replace a missing or changed Wayfinder chat (leave old pane untouched)"
+contexts = ["workspace"]
+command = ["./bin/wayfinder-herdr", "recover-chat", "--confirm-replacement"]
+
 [[events]]
 on = "pane.agent_status_changed"
 command = ["./bin/wayfinder-herdr", "reconcile"]

@@ -15,7 +15,13 @@ use std::{
 };
 use tempfile::TempDir;
 use wayfinder_herdr::store::{
-    self, Authorization, Binding, HumanRequestKind, Provider, RequestKind, WorkerRun, WorkerStatus,
+    self, AnswerDisposition, Authorization, Binding, HumanAnswerEvidence, HumanRequestKind,
+    Provider, RequestKind, WorkerRun, WorkerStatus,
+};
+use wayfinder_herdr::{
+    herdr::Client,
+    orchestration::{self, SchedulerDecisionNotice},
+    tracker::GitHub,
 };
 
 const MAP: &str = "example/project#42";
@@ -86,13 +92,14 @@ struct HerdrState {
     ambiguous_start_response: bool,
     ambiguous_close_response: bool,
     ambiguous_prompt_response: bool,
+    ambiguous_prompt_before_effect: bool,
     reject_next_prompt_as_blocked: bool,
     fail_first_open_without_resource: bool,
     fail_next_read: bool,
     empty_next_read: bool,
     changed_read: bool,
     opened_worktrees: Vec<OpenedWorktree>,
-    chat_pane: Option<OpenedWorktree>,
+    chat_panes: HashMap<String, OpenedWorktree>,
     agents: HashMap<String, Value>,
     sessions: HashMap<String, Value>,
     closed_panes: Vec<String>,
@@ -249,6 +256,38 @@ impl Fixture {
             .output()
             .unwrap()
     }
+    fn recover_chat(&self, confirmed: bool) -> Output {
+        let state = self.state();
+        let mut command = self.cli();
+        command.arg("recover-chat").args(["--map", MAP]);
+        if confirmed {
+            command.arg("--confirm-replacement");
+        }
+        command
+            .env("HERDR_SOCKET_PATH", state.binding.socket)
+            .env(
+                "HERDR_PLUGIN_CONTEXT_JSON",
+                json!({
+                    "workspace_cwd":state.binding.repository,
+                    "workspace_id":"origin-workspace",
+                    "tab_id":"origin-tab",
+                    "focused_pane_id":"origin-pane"
+                })
+                .to_string(),
+            )
+            .output()
+            .unwrap()
+    }
+    fn resolve_chat_message(&self, id: &str, delivered: bool) -> Output {
+        let mut command = self.cli();
+        command.args(["resolve-chat-delivery", "--map", MAP, "--message", id]);
+        command.arg(if delivered {
+            "--confirmed-delivered"
+        } else {
+            "--confirmed-not-delivered"
+        });
+        command.output().unwrap()
+    }
     fn apply(&self, kind: RequestKind) {
         store::enqueue(&self.dir, kind).unwrap();
         success(self.once());
@@ -256,6 +295,34 @@ impl Fixture {
     fn state(&self) -> store::State {
         store::read_state(&self.dir).unwrap()
     }
+}
+
+fn record_pending_worker_question(f: &Fixture) -> store::State {
+    f.herdr_state.lock().unwrap().agent_status = "idle".into();
+    f.apply(RequestKind::Start);
+    let mut state = f.state();
+    let run = state
+        .workers
+        .runs
+        .iter_mut()
+        .find(|run| run.ticket == 13)
+        .unwrap();
+    run.status = WorkerStatus::NeedsHuman;
+    run.question = Some("Which API shape should I use?".into());
+    run.human_request_seq = 1;
+    run.human_request_id = Some(format!("human-{}-0001", run.id));
+    run.human_request_kind = Some(HumanRequestKind::WorkerQuestion);
+    run.human_request_fingerprint = Some(store::human_request_fingerprint(
+        run.question.as_deref().unwrap(),
+    ));
+    run.answer_history.push(HumanAnswerEvidence {
+        request_id: format!("human-{}-0000", run.id),
+        request_kind: HumanRequestKind::WorkerQuestion,
+        response: "previous recorded answer".into(),
+        disposition: AnswerDisposition::Submitted,
+    });
+    store::atomic_json(&f.dir.join("state.json"), &state).unwrap();
+    state
 }
 
 fn handle_request(mut stream: std::os::unix::net::UnixStream, state: &Arc<Mutex<HerdrState>>) {
@@ -274,13 +341,19 @@ fn handle_request(mut stream: std::os::unix::net::UnixStream, state: &Arc<Mutex<
             let pane = request["params"]["pane_id"].as_str().unwrap();
             if pane == "origin-pane" {
                 result = json!({"type":"pane_info","pane":{"pane_id":"origin-pane","workspace_id":"origin-workspace","tab_id":"origin-tab","terminal_id":"origin-terminal","agent_status":"working"}});
-            } else if let Some(chat) = state.chat_pane.as_ref().filter(|chat| chat.pane == pane) {
+            } else if let Some(chat) = state.chat_panes.get(pane) {
                 result = json!({"type":"pane_info","pane":{"pane_id":chat.pane,"workspace_id":chat.workspace,"tab_id":chat.tab,"terminal_id":chat.terminal,"agent_status":"idle"}});
             } else {
                 error = Some(json!({"code":"pane_not_found","message":"unknown pane"}));
             }
         }
         "pane.split" => {
+            let pane_number = state.chat_panes.len() + 1;
+            let pane_id = if pane_number == 1 {
+                "orchestrator-pane".to_owned()
+            } else {
+                format!("orchestrator-pane-{pane_number}")
+            };
             let pane = OpenedWorktree {
                 path: request["params"]["cwd"].as_str().unwrap().to_owned(),
                 workspace: request["params"]["workspace_id"]
@@ -288,10 +361,10 @@ fn handle_request(mut stream: std::os::unix::net::UnixStream, state: &Arc<Mutex<
                     .unwrap()
                     .to_owned(),
                 tab: "origin-tab".into(),
-                pane: "orchestrator-pane".into(),
-                terminal: "orchestrator-terminal".into(),
+                pane: pane_id.clone(),
+                terminal: format!("orchestrator-terminal-{pane_number}"),
             };
-            state.chat_pane = Some(pane.clone());
+            state.chat_panes.insert(pane_id, pane.clone());
             result = json!({"type":"pane_info","pane":{"pane_id":pane.pane,"workspace_id":pane.workspace,"tab_id":pane.tab,"terminal_id":pane.terminal,"cwd":pane.path}});
         }
         "worktree.open" => {
@@ -364,13 +437,7 @@ fn handle_request(mut stream: std::os::unix::net::UnixStream, state: &Arc<Mutex<
                 .iter()
                 .find(|tree| tree.pane == pane)
                 .cloned()
-                .or_else(|| {
-                    state
-                        .chat_pane
-                        .as_ref()
-                        .filter(|tree| tree.pane == pane)
-                        .cloned()
-                })
+                .or_else(|| state.chat_panes.get(&pane).cloned())
             {
                 state.agent_status = "idle".into();
                 let info = json!({"agent":provider,"agent_session":null,"agent_status":"idle","name":name,"terminal_id":tree.terminal,"workspace_id":tree.workspace,"tab_id":tree.tab,"pane_id":tree.pane});
@@ -387,7 +454,12 @@ fn handle_request(mut stream: std::os::unix::net::UnixStream, state: &Arc<Mutex<
         }
         "agent.prompt" => {
             let pane = request["params"]["target"].as_str().unwrap().to_owned();
-            if state.agent_status == "blocked" || state.reject_next_prompt_as_blocked {
+            if state.ambiguous_prompt_before_effect {
+                state.ambiguous_prompt_before_effect = false;
+                error = Some(
+                    json!({"code":"response_lost","message":"simulated lost request before effect"}),
+                );
+            } else if state.agent_status == "blocked" || state.reject_next_prompt_as_blocked {
                 state.reject_next_prompt_as_blocked = false;
                 state.agent_status = "blocked".into();
                 error = Some(
@@ -403,6 +475,7 @@ fn handle_request(mut stream: std::os::unix::net::UnixStream, state: &Arc<Mutex<
                 state.agents.insert(pane.into(), updated);
                 result = json!({"type":"agent_prompted"});
                 if state.ambiguous_prompt_response {
+                    state.ambiguous_prompt_response = false;
                     error = Some(
                         json!({"code":"response_lost","message":"simulated lost agent.prompt response"}),
                     );
@@ -510,6 +583,10 @@ fn success(output: Output) {
         "{}",
         String::from_utf8_lossy(&output.stderr)
     );
+}
+
+fn success_status(output: Output) -> bool {
+    output.status.success()
 }
 
 fn write_worker_result(run: &WorkerRun, result: Value) {
@@ -667,6 +744,21 @@ fn one_orchestrator_chat_uses_configured_provider_and_delivers_grouped_linked_qu
     assert!(initial_prompt.contains("Wayfinding is planning by default"));
     assert!(initial_prompt.contains("Opening this chat does not grant execution authorization"));
     assert!(!initial_prompt.contains("This map has explicit execution authorization"));
+    assert!(initial_prompt.contains("retry-worker --map example/project#42 --run RUN"));
+    assert!(initial_prompt.contains("--confirmed-absent-or-stopped"));
+    assert!(initial_prompt.contains("abandon-worker --map example/project#42 --run RUN"));
+    assert!(initial_prompt.contains(
+        "without proving termination, releasing uncertain capacity, or deleting artifacts"
+    ));
+    assert!(initial_prompt.contains("recover-chat --map example/project#42 --confirm-replacement"));
+    assert!(
+        initial_prompt
+            .contains("resolve-chat-delivery --map example/project#42 --message MESSAGE_ID")
+    );
+    assert!(
+        initial_prompt.contains("answer-decision --map example/project#42 --request-id REQUEST_ID")
+    );
+    assert!(initial_prompt.contains("never sends input to a completed or stale worker"));
     assert_eq!(f.state().authorization, Authorization::AwaitingStart);
     assert!(f.state().workers.runs.is_empty());
     assert_eq!(
@@ -798,6 +890,7 @@ fn ambiguous_chat_delivery_is_retained_and_never_blindly_repeated() {
             .any(|message| message["status"] == "uncertain")
     );
 
+    f.herdr_state.lock().unwrap().agent_status = "idle".into();
     success(f.once());
     let prompts = f
         .herdr_state
@@ -811,6 +904,367 @@ fn ambiguous_chat_delivery_is_retained_and_never_blindly_repeated() {
         prompts, 2,
         "the uncertain outbox message was not submitted twice"
     );
+    let outbox: Value =
+        serde_json::from_slice(&fs::read(f.dir.join("chat-outbox.json")).unwrap()).unwrap();
+    let uncertain = outbox["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|message| message["status"] == "uncertain")
+        .unwrap();
+    let id = uncertain["id"].as_str().unwrap();
+    success(f.resolve_chat_message(id, true));
+    f.herdr_state.lock().unwrap().agent_status = "idle".into();
+    success(f.once());
+    let marker = format!("[WAYFINDER OUTBOX MESSAGE {id}]");
+    let attempts = f
+        .herdr_state
+        .lock()
+        .unwrap()
+        .requests
+        .iter()
+        .filter(|request| {
+            request["method"] == "agent.prompt"
+                && request["params"]["text"]
+                    .as_str()
+                    .is_some_and(|text| text.contains(&marker))
+        })
+        .count();
+    assert_eq!(
+        attempts, 1,
+        "a human-confirmed delivered notice stays delivered"
+    );
+}
+
+#[test]
+fn explicit_chat_recovery_archives_changed_identity_and_preserves_pending_human_state() {
+    let f = Fixture::new();
+    success(f.chat());
+    let original = record_pending_worker_question(&f);
+    let old = original.orchestrator.clone().unwrap();
+    {
+        let mut herdr = f.herdr_state.lock().unwrap();
+        herdr.agent_status = "idle".into();
+        herdr.agents.insert(
+            old.pane_id.clone(),
+            json!({
+                "agent":"claude",
+                "agent_session":{"source":"fixture","agent":"claude","kind":"id","value":"replacement-occupant"},
+                "agent_status":"idle",
+                "terminal_id":"replacement-terminal",
+                "workspace_id":old.workspace_id,
+                "tab_id":old.tab_id,
+                "pane_id":old.pane_id,
+            }),
+        );
+        herdr.sessions.insert(
+            old.pane_id.clone(),
+            json!({"source":"fixture","agent":"claude","kind":"id","value":"replacement-occupant"}),
+        );
+    }
+
+    let before = f.herdr_state.lock().unwrap().requests.len();
+    assert!(!success_status(f.recover_chat(false)));
+    assert_eq!(
+        f.herdr_state.lock().unwrap().requests.len(),
+        before,
+        "replacement requires an explicit human confirmation before Herdr effects"
+    );
+    let stale = f.chat();
+    assert!(!success_status(stale));
+
+    success(f.recover_chat(true));
+    let recovered = f.state();
+    let current = recovered.orchestrator.as_ref().unwrap();
+    assert_eq!(current.status, store::OrchestratorStatus::Running);
+    assert_eq!(current.pane_id, "orchestrator-pane-2");
+    assert_eq!(recovered.orchestrator_history.len(), 1);
+    assert_eq!(
+        recovered.orchestrator_history[0].binding.pane_id,
+        old.pane_id
+    );
+    assert!(
+        recovered.orchestrator_history[0]
+            .reason
+            .contains("human explicitly confirmed")
+    );
+    assert_eq!(
+        recovered.workers.runs[0].answer_history,
+        original.workers.runs[0].answer_history
+    );
+    assert_eq!(
+        recovered.workers.runs[0].human_request_id,
+        original.workers.runs[0].human_request_id
+    );
+
+    {
+        let mut herdr = f.herdr_state.lock().unwrap();
+        let occupant = herdr.agents[&old.pane_id].clone();
+        assert_eq!(occupant["agent"], "claude");
+        assert_eq!(occupant["terminal_id"], "replacement-terminal");
+        herdr.agent_status = "idle".into();
+    }
+    success(f.once());
+    success(f.once());
+    let herdr = f.herdr_state.lock().unwrap();
+    assert_eq!(herdr.agents[&old.pane_id]["agent"], "claude");
+    let after_initial_chat = &herdr.requests[before..];
+    assert_eq!(
+        after_initial_chat
+            .iter()
+            .filter(|request| request["method"] == "agent.start"
+                && request["params"]["pane_id"] == old.pane_id)
+            .count(),
+        0,
+        "replacement never starts over the changed pane occupant"
+    );
+    assert_eq!(
+        after_initial_chat
+            .iter()
+            .filter(|request| request["method"] == "agent.prompt"
+                && request["params"]["target"] == old.pane_id)
+            .count(),
+        0,
+        "replacement never sends input to the old pane occupant"
+    );
+    assert_eq!(
+        after_initial_chat
+            .iter()
+            .filter(|request| request["method"] == "agent.focus"
+                && request["params"]["target"] == old.pane_id)
+            .count(),
+        0
+    );
+    assert_eq!(
+        after_initial_chat
+            .iter()
+            .filter(|request| request["method"] == "agent.prompt"
+                && request["params"]["target"] == current.pane_id
+                && request["params"]["text"]
+                    .as_str()
+                    .is_some_and(|text| text.contains("Independent human decisions are pending")))
+            .count(),
+        1,
+        "retained question reaches the verified replacement once and is not replayed on restart"
+    );
+}
+
+#[test]
+fn explicit_chat_recovery_can_replace_a_missing_agent_only_after_confirmation() {
+    let f = Fixture::new();
+    success(f.chat());
+    let old = f.state().orchestrator.unwrap();
+    {
+        let mut herdr = f.herdr_state.lock().unwrap();
+        herdr.agents.remove(&old.pane_id);
+        herdr.sessions.remove(&old.pane_id);
+    }
+    let missing = f.chat();
+    assert!(!success_status(missing));
+    let before_recovery = f.herdr_state.lock().unwrap().requests.len();
+    success(f.recover_chat(true));
+
+    let state = f.state();
+    assert_eq!(state.orchestrator_history.len(), 1);
+    assert_eq!(state.orchestrator_history[0].binding.pane_id, old.pane_id);
+    assert_eq!(
+        state.orchestrator.as_ref().unwrap().pane_id,
+        "orchestrator-pane-2"
+    );
+    let herdr = f.herdr_state.lock().unwrap();
+    assert_eq!(
+        herdr
+            .requests
+            .iter()
+            .filter(|request| request["method"] == "pane.split")
+            .count(),
+        2,
+        "explicit recovery creates exactly one replacement chat"
+    );
+    let recovery_calls = &herdr.requests[before_recovery..];
+    assert!(
+        !recovery_calls
+            .iter()
+            .any(|request| request["method"] == "pane.close")
+    );
+    assert!(!recovery_calls.iter().any(|request| {
+        request["method"] == "agent.prompt" && request["params"]["target"] == old.pane_id
+    }));
+    assert!(!recovery_calls.iter().any(|request| {
+        request["method"] == "agent.focus" && request["params"]["target"] == old.pane_id
+    }));
+}
+
+#[test]
+fn uncertain_chat_delivery_stays_held_across_recovery_until_human_resolution() {
+    let f = Fixture::new();
+    success(f.chat());
+    {
+        let mut herdr = f.herdr_state.lock().unwrap();
+        herdr.agent_status = "idle".into();
+        herdr.ambiguous_prompt_before_effect = true;
+    }
+    success(f.once());
+    let before: Value =
+        serde_json::from_slice(&fs::read(f.dir.join("chat-outbox.json")).unwrap()).unwrap();
+    let uncertain = before["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|message| message["status"] == "uncertain")
+        .unwrap()
+        .clone();
+    let id = uncertain["id"].as_str().unwrap().to_owned();
+    let delivery_marker = format!("[WAYFINDER OUTBOX MESSAGE {id}]");
+    let old = f.state().orchestrator.unwrap();
+    {
+        let mut herdr = f.herdr_state.lock().unwrap();
+        herdr.agent_status = "idle".into();
+        herdr.agents.insert(
+            old.pane_id.clone(),
+            json!({"agent":"claude","agent_session":{"source":"fixture","agent":"claude","kind":"id","value":"replacement-occupant"},"agent_status":"idle","terminal_id":"replacement-terminal","workspace_id":old.workspace_id,"tab_id":old.tab_id,"pane_id":old.pane_id}),
+        );
+        herdr.sessions.insert(
+            old.pane_id.clone(),
+            json!({"source":"fixture","agent":"claude","kind":"id","value":"replacement-occupant"}),
+        );
+    }
+    success(f.recover_chat(true));
+    let marker_prompts = f
+        .herdr_state
+        .lock()
+        .unwrap()
+        .requests
+        .iter()
+        .filter(|request| {
+            request["method"] == "agent.prompt"
+                && request["params"]["text"]
+                    .as_str()
+                    .is_some_and(|text| text.contains(&delivery_marker))
+        })
+        .count();
+    f.herdr_state.lock().unwrap().agent_status = "idle".into();
+    success(f.once());
+    let prompts_after_held_reconcile = f
+        .herdr_state
+        .lock()
+        .unwrap()
+        .requests
+        .iter()
+        .filter(|request| {
+            request["method"] == "agent.prompt"
+                && request["params"]["text"]
+                    .as_str()
+                    .is_some_and(|text| text.contains(&delivery_marker))
+        })
+        .count();
+    assert_eq!(
+        prompts_after_held_reconcile, marker_prompts,
+        "uncertain delivery is never blindly replayed to the replacement chat"
+    );
+    let held: Value =
+        serde_json::from_slice(&fs::read(f.dir.join("chat-outbox.json")).unwrap()).unwrap();
+    assert_eq!(held["messages"][0]["status"], "uncertain");
+
+    success(f.resolve_chat_message(&id, false));
+    let resolved: Value =
+        serde_json::from_slice(&fs::read(f.dir.join("chat-outbox.json")).unwrap()).unwrap();
+    assert_eq!(resolved["messages"][0]["status"], "pending");
+    assert_eq!(
+        resolved["messages"][0]["resolution_history"][0]["choice"],
+        "confirmed_not_delivered"
+    );
+    f.herdr_state.lock().unwrap().agent_status = "idle".into();
+    success(f.once());
+    f.herdr_state.lock().unwrap().agent_status = "idle".into();
+    success(f.once());
+    let final_prompts = f
+        .herdr_state
+        .lock()
+        .unwrap()
+        .requests
+        .iter()
+        .filter(|request| {
+            request["method"] == "agent.prompt"
+                && request["params"]["text"]
+                    .as_str()
+                    .is_some_and(|text| text.contains(&delivery_marker))
+        })
+        .count();
+    assert_eq!(
+        final_prompts,
+        marker_prompts + 1,
+        "the human's explicit not-delivered decision permits exactly one replay"
+    );
+    assert_eq!(
+        f.herdr_state
+            .lock()
+            .unwrap()
+            .requests
+            .iter()
+            .filter(|request| request["method"] == "agent.prompt"
+                && request["params"]["target"] == "orchestrator-pane-2"
+                && request["params"]["text"]
+                    .as_str()
+                    .is_some_and(|text| text.contains(&delivery_marker)))
+            .count(),
+        1,
+        "confirmed replay is routed once to the verified replacement chat"
+    );
+}
+
+#[test]
+fn scheduler_decision_notice_reaches_chat_without_worker_input() {
+    let f = Fixture::new();
+    success(f.chat());
+    let mut state = f.state();
+    let target = state.orchestrator.as_ref().unwrap().pane_id.clone();
+    let pending = SchedulerDecisionNotice {
+        request_id: "scheduler-0007".into(),
+        ticket_link: "[Implement sample task](https://github.com/example/project/issues/13)".into(),
+        run_id: "run-completed-0007".into(),
+        question: "Review retries are exhausted. Continue, change scope, or abandon?".into(),
+        response: None,
+    };
+    let resolved = SchedulerDecisionNotice {
+        response: Some("continue after human review".into()),
+        ..pending.clone()
+    };
+    let herdr = Client::new(&state.binding.socket);
+    let github = GitHub::default();
+    f.herdr_state.lock().unwrap().agent_status = "idle".into();
+    for _ in 0..3 {
+        orchestration::reconcile(
+            &f.dir,
+            &state,
+            &herdr,
+            &github,
+            &[],
+            &[pending.clone(), resolved.clone()],
+        )
+        .unwrap();
+        f.herdr_state.lock().unwrap().agent_status = "idle".into();
+        state = f.state();
+    }
+    let calls = f.herdr_state.lock().unwrap().requests.clone();
+    let decision_prompts = calls
+        .iter()
+        .filter(|call| call["method"] == "agent.prompt")
+        .filter_map(|call| call["params"]["text"].as_str())
+        .filter(|text| text.contains("request ID scheduler-0007"))
+        .collect::<Vec<_>>();
+    assert_eq!(decision_prompts.len(), 1);
+    assert!(decision_prompts[0].contains(&pending.ticket_link));
+    assert!(decision_prompts[0].contains("choose continuation, scope change, or abandonment"));
+    assert!(decision_prompts[0].contains("answer-decision --map example/project#42"));
+    assert!(decision_prompts[0].contains("never use answer-worker or send input to its pane"));
+    assert!(calls.iter().any(|call| {
+        call["method"] == "agent.prompt"
+            && call["params"]["target"] == target
+            && call["params"]["text"]
+                .as_str()
+                .is_some_and(|text| text.contains("request ID scheduler-0007"))
+    }));
 }
 
 #[test]

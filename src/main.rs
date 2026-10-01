@@ -63,11 +63,34 @@ enum CommandName {
         #[arg(long)]
         map: Option<String>,
     },
+    /// Replace a missing or changed chat after an explicit human decision; leaves old panes untouched.
+    RecoverChat {
+        #[arg(long)]
+        map: Option<String>,
+        #[arg(long)]
+        confirm_replacement: bool,
+    },
+    /// Inspect durable chat delivery state before resolving an uncertain message.
+    ChatOutbox {
+        #[arg(long)]
+        map: String,
+    },
+    /// Resolve an uncertain message only after the human checks the previous chat history.
+    ResolveChatDelivery {
+        #[arg(long)]
+        map: String,
+        #[arg(long)]
+        message: String,
+        #[arg(long)]
+        confirmed_delivered: bool,
+        #[arg(long)]
+        confirmed_not_delivered: bool,
+    },
     /// Configure the provider used for delegated worker roles.
     ConfigureWorker {
         #[arg(long)]
         map: String,
-        /// One of researcher, implementer, reviewer; omit to set shared defaults.
+        /// One of orchestrator, researcher, implementer, reviewer; omit to set shared defaults.
         #[arg(long)]
         role: Option<String>,
         #[arg(long, default_value = "codex")]
@@ -332,6 +355,23 @@ fn run() -> Result<()> {
             );
         }
         CommandName::Chat { map } => orchestration::open_chat(&root, map.as_deref())?,
+        CommandName::RecoverChat {
+            map,
+            confirm_replacement,
+        } => orchestration::recover_chat(&root, map.as_deref(), confirm_replacement)?,
+        CommandName::ChatOutbox { map } => orchestration::list_deliveries(&root, &map)?,
+        CommandName::ResolveChatDelivery {
+            map,
+            message,
+            confirmed_delivered,
+            confirmed_not_delivered,
+        } => orchestration::resolve_uncertain_delivery(
+            &root,
+            &map,
+            &message,
+            confirmed_delivered,
+            confirmed_not_delivered,
+        )?,
         CommandName::ConfigureWorker {
             map,
             role,
