@@ -364,6 +364,29 @@ impl Client {
         )
     }
 
+    pub fn split_pane(
+        &self,
+        pane_id: &str,
+        workspace_id: &str,
+        cwd: &Path,
+        focus: bool,
+    ) -> Result<Value> {
+        self.request(
+            "pane.split",
+            json!({
+                "target_pane_id": pane_id,
+                "workspace_id": workspace_id,
+                "cwd": cwd,
+                "direction": "right",
+                "focus": focus,
+            }),
+        )
+    }
+
+    pub fn focus_agent(&self, pane_id: &str) -> Result<Value> {
+        self.request("agent.focus", json!({"target": pane_id}))
+    }
+
     pub fn prompt(&self, pane_id: &str, text: &str) -> Result<Value> {
         self.request(
             "agent.prompt",

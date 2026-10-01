@@ -35,7 +35,7 @@ Run from the intended herdr session, supplying the repository checkout and canon
 
 Attach binds the repository, herdr executable, and socket, initializes state as `awaiting_start`, and enables/starts that map's service. `--socket /absolute/socket` and `--herdr /absolute/herdr` make the endpoint explicit. `--no-service` initializes state without starting systemd. The printed map key identifies `wayfinder-herdr@KEY.service`; `journalctl --user -u wayfinder-herdr@KEY.service` shows failures.
 
-The Start, Pause, Resume, and Status plugin actions select the unique attached map matching the invoking workspace and herdr socket. If multiple maps match, use the CLI with `--map`. Start/Pause/Resume return when a request has been durably queued; inspect status for its applied outcome. A first Resume cannot substitute for explicit Start. Pause prevents future dispatch authorization; it does not cancel work. Startup and lifecycle hooks only queue reconciliation requests.
+The Wayfinder Chat action opens or focuses the configured orchestrator agent in a Herdr pane for the attached map. It does not authorize execution: maps plan by default, and worker dispatch still requires an accepted map execution override plus an explicit Start. The Start, Pause, Resume, and Status plugin actions select the unique attached map matching the invoking workspace and herdr socket. If multiple maps match, use the CLI with `--map`. Start/Pause/Resume return when a request has been durably queued; inspect status for its applied outcome. A first Resume cannot substitute for explicit Start. Pause prevents future dispatch authorization; it does not cancel work. Startup and lifecycle hooks only queue reconciliation requests.
 
 The runtime checks host compatibility and plugin enablement, reconciles the map's ordered frontier, and dispatches only after explicit Start and a map execution override. Researchers handle `wayfinder:research` and `wayfinder:prototype`; implementers handle `wayfinder:task`. Decision/grilling tickets remain for the orchestrator. Herdr worktree opening uses normal repository trust behavior and never changes trust automatically.
 
@@ -46,6 +46,8 @@ wayfinder-herdr configure-worker --map OWNER/REPOSITORY#NUMBER \
   --role implementer --kind codex --model MODEL --reasoning-effort high
 wayfinder-herdr configure-worker --map OWNER/REPOSITORY#NUMBER \
   --role reviewer --kind codex --arg=--full-auto --concurrency 2
+wayfinder-herdr configure-worker --map OWNER/REPOSITORY#NUMBER \
+  --role orchestrator --kind codex --model MODEL --reasoning-effort high
 ```
 
 Roles are `orchestrator`, `researcher`, `implementer`, and `reviewer`; concurrency is shared across delegated roles and defaults to three. Reviews are selected before other queued work when capacity opens. The runtime writes a durable run intent before claiming a ticket or creating resources. It uses `git worktree add --detach`, then opens that exact checkout through the bound Herdr socket, with explicit returned workspace/tab/pane IDs. It never creates a ticket branch.

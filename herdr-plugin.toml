@@ -31,6 +31,12 @@ title = "Wayfinder status"
 contexts = ["workspace"]
 command = ["./bin/wayfinder-herdr", "action", "status"]
 
+[[actions]]
+id = "chat"
+title = "Open or focus the Wayfinder orchestrator chat"
+contexts = ["workspace"]
+command = ["./bin/wayfinder-herdr", "chat"]
+
 [[events]]
 on = "pane.agent_status_changed"
 command = ["./bin/wayfinder-herdr", "reconcile"]

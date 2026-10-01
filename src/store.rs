@@ -46,6 +46,34 @@ pub struct State {
     /// Defaults keep state created by the initial runtime foundation readable.
     #[serde(default)]
     pub workers: WorkerState,
+    /// Identity of the single Herdr-hosted orchestrator chat, if launched.
+    #[serde(default)]
+    pub orchestrator: Option<OrchestratorBinding>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OrchestratorBinding {
+    pub status: OrchestratorStatus,
+    pub workspace_id: String,
+    pub tab_id: String,
+    pub pane_id: String,
+    pub terminal_id: Option<String>,
+    pub provider: String,
+    #[serde(default)]
+    pub session: Option<AgentSessionIdentity>,
+    /// The exact Herdr pane that requested creation, used only to reconcile launch intent.
+    pub source_pane_id: String,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum OrchestratorStatus {
+    PaneIntent,
+    AgentIntent,
+    PromptIntent,
+    Running,
+    Uncertain,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -490,6 +518,7 @@ pub fn attach(
                     .into(),
             history: vec![],
             workers: WorkerState::default(),
+            orchestrator: None,
         };
         atomic_json(&path, &state)?;
         state

@@ -66,6 +66,7 @@ fn reconcile(dir: &Path, state: &mut State) -> Result<String> {
     store::atomic_json(&tracker_dir.join("frontier.json"), &frontier)?;
     let herdr = Client::new(&state.binding.socket);
     reconcile_workers(dir, state, &map, &github, &herdr)?;
+    crate::orchestration::reconcile(dir, state, &herdr, &github, &[])?;
     state.reconciled = true;
     match state.authorization {
         Authorization::AwaitingStart => {

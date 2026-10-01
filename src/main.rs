@@ -3,7 +3,7 @@ use clap::{Parser, Subcommand};
 use std::{env, fs, path::PathBuf, process::Command};
 use wayfinder_herdr::{
     herdr::Client,
-    runtime,
+    orchestration, runtime,
     store::{
         self, AnswerDisposition, Binding, HumanAnswerEvidence, HumanRequestKind, Lock, Provider,
         RequestKind, WorkerRun, WorkerStatus,
@@ -57,6 +57,11 @@ enum CommandName {
     Status {
         #[arg(long)]
         map: String,
+    },
+    /// Open the orchestrating chat for a map. With no map, use this Herdr workspace/session.
+    Chat {
+        #[arg(long)]
+        map: Option<String>,
     },
     /// Configure the provider used for delegated worker roles.
     ConfigureWorker {
@@ -260,6 +265,7 @@ fn tracker_context(root: &std::path::Path, value: &str) -> Result<(MapRef, PathB
     );
     Ok((map, dir))
 }
+
 fn main() {
     if let Err(error) = run() {
         eprintln!("Wayfinder: {error:#}");
@@ -325,6 +331,7 @@ fn run() -> Result<()> {
                 serde_json::to_string_pretty(&store::read_state(&store::map_dir(&root, &key)?)?)?
             );
         }
+        CommandName::Chat { map } => orchestration::open_chat(&root, map.as_deref())?,
         CommandName::ConfigureWorker {
             map,
             role,

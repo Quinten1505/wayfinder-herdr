@@ -234,6 +234,50 @@ impl GitHub {
         Ok(frontier)
     }
 
+    /// Read the named child tickets that currently list `blocker` as a native dependency.
+    pub fn ticket_dependents(
+        &self,
+        map: &MapRef,
+        blocker: u64,
+    ) -> Result<Vec<(u64, String, String)>> {
+        let mut dependents = Vec::new();
+        for child in self.subissues(map)? {
+            let number = child["number"]
+                .as_u64()
+                .context("map child omitted ticket number")?;
+            if self
+                .blockers(map, number)?
+                .iter()
+                .any(|issue| issue["number"].as_u64() == Some(blocker))
+            {
+                dependents.push((
+                    number,
+                    child["title"].as_str().unwrap_or_default().to_owned(),
+                    child["html_url"]
+                        .as_str()
+                        .map(str::to_owned)
+                        .unwrap_or_else(|| {
+                            format!("https://github.com/{}/issues/{number}", map.repo())
+                        }),
+                ));
+            }
+        }
+        Ok(dependents)
+    }
+
+    /// Resolve a child ticket to a human-facing title/link pair for chat summaries.
+    pub fn ticket_link(&self, map: &MapRef, ticket: u64) -> Result<String> {
+        let issue = self.issue(map, ticket)?;
+        let title = issue["title"]
+            .as_str()
+            .context("GitHub ticket omitted its title")?;
+        let url = issue["html_url"]
+            .as_str()
+            .map(str::to_owned)
+            .unwrap_or_else(|| format!("https://github.com/{}/issues/{ticket}", map.repo()));
+        Ok(format!("[{title}]({url})"))
+    }
+
     pub fn create_map(
         &self,
         owner: &str,
