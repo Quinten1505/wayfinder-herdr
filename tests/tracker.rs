@@ -178,6 +178,10 @@ elif len(segments)>=5 and segments[3]=='issues':
             del db['claim_race_to']
         for login in body['assignees']:
             if not any(a['login']==login for a in target['assignees']): target['assignees'].append({'login':login})
+        db['claim_write_count']=db.get('claim_write_count',0)+1
+        if db.get('close_race_on_claim'):
+            target['state']='closed'
+            del db['close_race_on_claim']
         result=target
         changed=True
     elif method=='GET' and len(segments)==5:
@@ -391,6 +395,64 @@ fn claim_detects_external_reassignment_without_replacing_it() {
         .clone();
     assert!(assignees.iter().any(|a| a["login"] == "alice"));
     assert!(assignees.iter().any(|a| a["login"] == "quinten"));
+    let intent: Value = serde_json::from_slice(
+        &fs::read_dir(f.dir.join("tracker/intents"))
+            .unwrap()
+            .map(|entry| fs::read(entry.unwrap().path()).unwrap())
+            .next()
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(intent["stage"], "uncertain-claim");
+    let retry = f.api(&["tracker", "claim", "--map", MAP, "--ticket", "3"]);
+    assert!(!retry.status.success());
+    assert_eq!(f.github()["claim_write_count"], 1);
+}
+
+#[test]
+fn closed_child_is_rejected_before_claim_and_closure_race_retains_uncertain_intent() {
+    let closed = Fixture::new(true);
+    let mut db = closed.github();
+    db["issues"]["3"]["state"] = json!("closed");
+    closed.set_github(db);
+    let rejected = closed.api(&["tracker", "claim", "--map", MAP, "--ticket", "3"]);
+    assert!(!rejected.status.success());
+    assert!(
+        closed.github()["issues"]["3"]["assignees"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+    let intent: Value = serde_json::from_slice(
+        &fs::read_dir(closed.dir.join("tracker/intents"))
+            .unwrap()
+            .map(|entry| fs::read(entry.unwrap().path()).unwrap())
+            .next()
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(intent["stage"], "conflict-closed");
+
+    let raced = Fixture::new(true);
+    let mut db = raced.github();
+    db["close_race_on_claim"] = json!(true);
+    raced.set_github(db);
+    let result = raced.api(&["tracker", "claim", "--map", MAP, "--ticket", "3"]);
+    assert!(!result.status.success());
+    assert_eq!(raced.github()["issues"]["3"]["state"], "closed");
+    assert_eq!(
+        raced.github()["issues"]["3"]["assignees"][0]["login"],
+        "quinten"
+    );
+    let intent: Value = serde_json::from_slice(
+        &fs::read_dir(raced.dir.join("tracker/intents"))
+            .unwrap()
+            .map(|entry| fs::read(entry.unwrap().path()).unwrap())
+            .next()
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(intent["stage"], "uncertain-claim");
 }
 
 #[test]

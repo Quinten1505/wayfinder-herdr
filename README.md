@@ -59,7 +59,7 @@ wayfinder-herdr tracker block --map OWNER/REPOSITORY#NUMBER --ticket 24 --by 23
 wayfinder-herdr tracker frontier --map OWNER/REPOSITORY#NUMBER
 ```
 
-Planning operations, including ticket creation, dependencies, frontier reads, and decision resolution, do not require the execution override. Claims are GitHub assignments and require the map Notes to record `Execution override: ... selected`. Any existing assignment is a claim. Resolution comments use a stable operation marker, then close the ticket and update the map and spec indexes; retries inspect the marker before posting again. Body updates merge the latest fetched text and verify the result. GitHub does not support conditional issue-body writes, so a simultaneous external edit at the exact write boundary can still require a retry or manual reconciliation.
+Planning operations, including ticket creation, dependencies, frontier reads, and decision resolution, do not require the execution override. Claims are GitHub assignments and require an affirmative execution override in the map Notes. Any existing assignment is a claim. A reassignment or closure racing with a claim makes its durable local intent uncertain; the command fails and preserves all GitHub assignments for manual reconciliation before retry. Resolution comments use a stable operation marker, then close the ticket and update the map and spec indexes; retries inspect the marker before posting again. Body updates merge the latest fetched text and verify the result. GitHub does not support conditional issue-body writes, so a simultaneous external edit at the exact write boundary can still require a retry or manual reconciliation.
 
 ## State, restart, and upgrades
 

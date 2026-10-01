@@ -319,10 +319,6 @@ impl GitHub {
     ) -> Result<String> {
         let _lock = Lock::acquire(&state_dir.join("state.lock"))?;
         self.require_execution_override(map)?;
-        ensure!(
-            self.subissues(map)?.iter().any(|i| i["number"] == ticket),
-            "ticket is not a child of this map"
-        );
         let login = match assignee {
             Some("@me") | None => self.get("user")?["login"]
                 .as_str()
@@ -331,43 +327,87 @@ impl GitHub {
             Some(login) => login.to_owned(),
         };
         ensure!(!login.is_empty(), "assignee cannot be empty");
-        let issue = self.issue(map, ticket)?;
-        let assignees = issue["assignees"]
-            .as_array()
-            .context("issue omitted assignees")?;
-        if !assignees.is_empty() {
-            ensure!(
-                assignees.iter().all(|a| a["login"] == login),
-                "ticket already claimed by another assignee"
-            );
-            return Ok(login);
-        }
         let marker = operation_marker("claim", &json!([map.repo(), ticket, login]));
+        let intent_path = state_dir
+            .join("tracker/intents")
+            .join(format!("{marker}.json"));
+        if intent_path.exists() {
+            let prior: Intent = serde_json::from_slice(&fs::read(&intent_path)?)?;
+            ensure!(
+                prior.stage != "uncertain-claim",
+                "prior claim outcome is uncertain; reconcile GitHub assignments before retrying"
+            );
+        }
         self.with_intent(state_dir, &marker, "claim", || {
+            if !self
+                .subissues(map)?
+                .iter()
+                .any(|child| child["number"] == ticket)
+            {
+                self.advance_intent(state_dir, &marker, "conflict-not-child")?;
+                bail!("ticket is no longer a child of this map; claim was not attempted");
+            }
             let latest = self.issue(map, ticket)?;
+            if latest["state"] != "open" {
+                self.advance_intent(state_dir, &marker, "conflict-closed")?;
+                bail!("ticket was closed before claim; claim was not attempted");
+            }
             let assigned = latest["assignees"]
                 .as_array()
                 .context("issue omitted assignees")?;
             if !assigned.is_empty() {
+                if !assigned.iter().all(|a| a["login"] == login) {
+                    self.advance_intent(state_dir, &marker, "conflict-assigned")?;
+                    bail!("ticket is claimed by another assignee; claim was not attempted");
+                }
                 ensure!(
-                    assigned.iter().all(|a| a["login"] == login),
-                    "ticket was claimed by another assignee"
+                    self.blockers(map, ticket)?.iter().all(|blocker| blocker["state"] == "closed"),
+                    "ticket is already assigned but has an open blocker; reconcile its claim"
                 );
                 return Ok(latest);
             }
-            self.write(
+            if !self.frontier(map)?.iter().any(|ready| ready.number == ticket) {
+                self.advance_intent(state_dir, &marker, "conflict-not-frontier")?;
+                bail!("ticket is no longer in the open unclaimed frontier; claim was not attempted");
+            }
+            let mutation = self.write(
                 "POST",
                 &format!("repos/{}/issues/{ticket}/assignees", map.repo()),
                 &json!({"assignees":[login]}),
-            )?;
-            let after = self.issue(map, ticket)?;
-            let assigned = after["assignees"]
-                .as_array()
-                .context("issue omitted assignees after claim")?;
-            ensure!(
-                assigned.iter().all(|assignee| assignee["login"] == login),
-                "conflicting assignment appeared while claiming; preserve assignments and reconcile manually"
             );
+            let after = match self.issue(map, ticket) {
+                Ok(after) => after,
+                Err(error) => {
+                    self.advance_intent(state_dir, &marker, "uncertain-claim")?;
+                    bail!("claim outcome is uncertain after assignment request ({mutation:?}); retain intent and reconcile: {error:#}");
+                }
+            };
+            let assigned = after["assignees"]
+                .as_array();
+            let postcheck = (|| -> Result<bool> {
+                let assigned = assigned.context("issue omitted assignees after claim")?;
+                let still_child = self
+                    .subissues(map)?
+                    .iter()
+                    .any(|child| child["number"] == ticket);
+                let no_open_blockers = self
+                    .blockers(map, ticket)?
+                    .iter()
+                    .all(|blocker| blocker["state"] == "closed");
+                Ok(after["state"] == "open"
+                    && still_child
+                    && no_open_blockers
+                    && assigned
+                        .iter()
+                        .all(|assignee| assignee["login"] == login))
+            })();
+            if !matches!(postcheck, Ok(true)) {
+                self.advance_intent(state_dir, &marker, "uncertain-claim")?;
+                bail!("ticket state, ownership, blockers, or assignment changed or could not be confirmed after claim ({postcheck:?}); outcome is uncertain, assignments are retained, and manual reconciliation is required");
+            }
+            if let Err(error) = mutation {
+                eprintln!("gh did not confirm the claim, but a fresh GitHub read confirms @{login}: {error:#}");
+            }
             Ok(after)
         })?;
         Ok(login)
@@ -438,10 +478,7 @@ impl GitHub {
             .to_owned();
         let notes = section(&body, "Notes")?;
         ensure!(
-            notes.lines().any(
-                |line| line.to_ascii_lowercase().contains("execution override:")
-                    && line.to_ascii_lowercase().contains("selected")
-            ),
+            affirmative_execution_override(notes),
             "map Notes do not record an explicit execution override"
         );
         Ok(())
@@ -583,6 +620,41 @@ fn section<'a>(body: &'a str, heading: &str) -> Result<&'a str> {
         .split_once("\n## ")
         .map_or(rest, |(section, _)| section))
 }
+fn affirmative_execution_override(notes: &str) -> bool {
+    notes.lines().any(|line| {
+        let line = line.trim().trim_start_matches('-').trim().to_ascii_lowercase();
+        let Some(value) = line.strip_prefix("execution override:") else {
+            return false;
+        };
+        let value = value.trim().trim_end_matches('.').trim();
+        if matches!(
+            value,
+            "selected"
+                | "selected by user"
+                | "selected by the user"
+                | "selected for this effort"
+                | "selected by the user for this effort"
+        ) {
+            return true;
+        }
+
+        // Preserve the canonical execution override wording already recorded on
+        // the approved map while rejecting free-form or negated prose.
+        let prefix = "this effort includes implementation and review, as explicitly selected by the user on ";
+        if let Some(suffix) = value.strip_prefix(prefix) {
+            let date = suffix.get(..10).unwrap_or_default();
+            let valid_date = date.len() == 10
+                && date.as_bytes()[4] == b'-'
+                && date.as_bytes()[7] == b'-'
+                && date
+                    .bytes()
+                    .enumerate()
+                    .all(|(index, byte)| index == 4 || index == 7 || byte.is_ascii_digit());
+            return valid_date && suffix.as_bytes().get(10) == Some(&b'.');
+        }
+        false
+    })
+}
 fn append_section(body: &str, heading: &str, entry: &str, marker: &str) -> Result<String> {
     let target = format!("## {heading}");
     let start = body
@@ -624,17 +696,27 @@ mod tests {
 
     #[test]
     fn execution_override_is_limited_to_notes_and_requires_explicit_selection() {
-        assert!(
-            section("## Notes\n\nExecution override: selected by user", "Notes")
-                .unwrap()
-                .contains("selected")
-        );
+        let notes = section(
+            "## Notes\n\nExecution override: selected by the user.",
+            "Notes",
+        )
+        .unwrap();
+        assert!(affirmative_execution_override(notes));
+        let approved_map = "- Execution override: this effort includes implementation and review, as explicitly selected by the user on 2026-10-01. Charting remains one session.";
+        assert!(affirmative_execution_override(approved_map));
+        for rejected in [
+            "Execution override: not selected",
+            "Execution override: pending",
+            "Execution override: the team selected a plan",
+            "Execution override: selected, unless planning only",
+        ] {
+            assert!(
+                !affirmative_execution_override(rejected),
+                "accepted {rejected}"
+            );
+        }
         assert!(section("## Destination\n\nExecution override: selected", "Notes").is_err());
-        assert!(
-            section("## Notes\n\nExecution override: TBD", "Notes")
-                .unwrap()
-                .contains("TBD")
-        );
+        assert!(!affirmative_execution_override("Execution override: TBD"));
     }
 
     #[test]
