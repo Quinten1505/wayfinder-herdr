@@ -38,6 +38,10 @@ impl HerdrApiError {
     pub fn is_agent_blocked(&self) -> bool {
         self.method == "agent.prompt" && self.code == "agent_blocked"
     }
+
+    pub fn is_agent_not_found(&self) -> bool {
+        self.method == "agent.get" && self.code == "agent_not_found"
+    }
 }
 
 #[derive(Clone)]
@@ -187,6 +191,45 @@ pub fn inspect_worker(client: &Client, run: &WorkerRun) -> Result<Value> {
     let process = client.pane_process_info(pane)?;
     verify_foreground_process(&process, run)?;
     Ok(agent)
+}
+
+/// Verify the original process and terminal before the first task prompt. Herdr
+/// may not expose agent_session until a conversation begins, so this proof uses
+/// the observed Linux foreground process fingerprint and binds any session that
+/// has appeared only when it matches a previously persisted value.
+pub fn inspect_pre_prompt_worker(client: &Client, run: &WorkerRun) -> Result<Value> {
+    let pane = run
+        .pane_id
+        .as_deref()
+        .context("worker has no persisted pane identity")?;
+    let agent = client.agent(pane)?;
+    verify_pre_prompt_agent_identity(&agent, run)?;
+    let process = client.pane_process_info(pane)?;
+    verify_foreground_process(&process, run)?;
+    Ok(agent)
+}
+
+pub fn verify_pre_prompt_agent_identity(info: &Value, run: &WorkerRun) -> Result<()> {
+    let expected_terminal = run
+        .terminal_id
+        .as_deref()
+        .context("worker has no persisted terminal identity")?;
+    let (terminal, provider, session) = capture_agent_identity(info, run)?;
+    ensure!(
+        terminal == expected_terminal,
+        "Herdr worker terminal identity changed"
+    );
+    ensure!(
+        provider == run.agent_provider,
+        "Herdr worker provider identity changed"
+    );
+    if let Some(expected) = run.agent_session.as_ref() {
+        ensure!(
+            session.as_ref() == Some(expected),
+            "Herdr agent session identity changed"
+        );
+    }
+    Ok(())
 }
 
 fn linux_process_start_time(pid: u32) -> Result<u64> {

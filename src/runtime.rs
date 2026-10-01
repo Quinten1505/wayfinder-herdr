@@ -225,6 +225,7 @@ fn new_run(state: &mut State, request: NewRun<'_>) {
         agent_session: None,
         foreground_process: None,
         result_evidence: None,
+        initial_prompt_pending: false,
     });
 }
 
@@ -296,12 +297,23 @@ fn reconcile_workers(
             }
         };
         if let Err(error) = crate::herdr::verify_worker_identity(&info, &run) {
-            state.workers.runs[i].status = WorkerStatus::Uncertain;
-            state.workers.runs[i].question = Some(format!(
-                "The pane no longer proves this run's terminal and agent-session identity; no further effect was sent and capacity remains reserved: {error:#}"
-            ));
-            save(dir, state)?;
-            continue;
+            if !run.initial_prompt_pending {
+                state.workers.runs[i].status = WorkerStatus::Uncertain;
+                state.workers.runs[i].question = Some(format!(
+                    "The pane no longer proves this run's terminal and agent-session identity; no further effect was sent and capacity remains reserved: {error:#}"
+                ));
+                save(dir, state)?;
+                continue;
+            }
+            if let Err(process_error) = crate::herdr::verify_pre_prompt_agent_identity(&info, &run)
+            {
+                state.workers.runs[i].status = WorkerStatus::Uncertain;
+                state.workers.runs[i].question = Some(format!(
+                    "The initial task prompt is pending, but pane and terminal identity could not be verified: {process_error:#}"
+                ));
+                save(dir, state)?;
+                continue;
+            }
         }
         let process_info = match herdr.pane_process_info(pane) {
             Ok(info) => info,
@@ -326,7 +338,10 @@ fn reconcile_workers(
             "working" => {
                 let worker = &mut state.workers.runs[i];
                 worker.last_activity_ms = Some(now_ms());
-                if worker.status == WorkerStatus::NeedsHuman
+                if worker.initial_prompt_pending {
+                    worker.status = WorkerStatus::NeedsHuman;
+                    worker.question = Some("Herdr reports activity after the startup UI was handled, but the initial task prompt was not submitted. The task prompt will be sent after this startup activity settles to idle; reconcile continues to supervise this pane.".into());
+                } else if worker.status == WorkerStatus::NeedsHuman
                     && worker.human_request_kind
                         == Some(crate::store::HumanRequestKind::HerdrBlockedUi)
                 {
@@ -342,29 +357,23 @@ fn reconcile_workers(
                 save(dir, state)?;
             }
             "blocked" => {
-                match herdr
+                let question = herdr
                     .read_recent(pane)
                     .ok()
                     .and_then(|v| v["read"]["text"].as_str().map(str::to_owned))
                     .filter(|text| !text.trim().is_empty())
-                {
-                    Some(question) => {
-                        let worker = &mut state.workers.runs[i];
-                        worker.status = WorkerStatus::NeedsHuman;
-                        worker.set_human_request(
-                            crate::store::HumanRequestKind::HerdrBlockedUi,
-                            &question,
-                        );
-                        worker.question = Some(question);
-                    }
-                    None => {
-                        state.workers.runs[i].status = WorkerStatus::Uncertain;
-                        state.workers.runs[i].question = Some("Herdr reports a blocked worker but its exact prompt could not be read; capacity remains reserved and no answer can be correlated safely.".into());
-                    }
-                }
+                    .unwrap_or_else(|| format!("Herdr reports a blocked worker, but its current prompt could not be read. Inspect the named pane {pane} directly before responding."));
+                let worker = &mut state.workers.runs[i];
+                worker.status = WorkerStatus::NeedsHuman;
+                worker.set_human_request(crate::store::HumanRequestKind::HerdrBlockedUi, &question);
+                worker.question = Some(question);
                 save(dir, state)?;
             }
             "idle" | "done" => {
+                if run.initial_prompt_pending {
+                    submit_initial_task_prompt(dir, state, herdr, i)?;
+                    continue;
+                }
                 let result = match capture_result(dir, &run) {
                     Ok(Some((result, evidence))) => {
                         state.workers.runs[i].result_evidence = Some(evidence);
@@ -446,7 +455,7 @@ fn recover_open_intents(dir: &Path, state: &mut State, herdr: &Client) -> Result
                 state.workers.runs[i].workspace_id = Some(workspace);
                 state.workers.runs[i].tab_id = Some(tab);
                 state.workers.runs[i].pane_id = Some(pane);
-                state.workers.runs[i].status = WorkerStatus::AgentIntent;
+                state.workers.runs[i].status = WorkerStatus::AgentStartReady;
             }
             Ok(None) => {
                 state.workers.runs[i].status = WorkerStatus::Uncertain;
@@ -815,7 +824,14 @@ fn launch_queued(
         .workers
         .runs
         .iter()
-        .filter(|r| r.status == WorkerStatus::LaunchIntent)
+        .filter(|r| {
+            matches!(
+                r.status,
+                WorkerStatus::LaunchIntent
+                    | WorkerStatus::AgentStartReady
+                    | WorkerStatus::InitialPromptReady
+            )
+        })
         .map(|r| r.id.clone())
         .collect();
     intents.sort_by_key(|id| {
@@ -862,6 +878,12 @@ fn launch_one(
 ) -> Result<()> {
     let i = state.workers.runs.iter().position(|r| r.id == id).unwrap();
     let mut run = state.workers.runs[i].clone();
+    if run.status == WorkerStatus::AgentStartReady {
+        return start_agent_from_ready(dir, state, herdr, i);
+    }
+    if run.status == WorkerStatus::InitialPromptReady {
+        return submit_initial_task_prompt(dir, state, herdr, i);
+    }
     if run.pane_id.is_some() {
         state.workers.runs[i].status = WorkerStatus::Uncertain;
         state.workers.runs[i].question =
@@ -917,7 +939,7 @@ fn launch_one(
                 state.workers.runs[i].workspace_id = Some(workspace);
                 state.workers.runs[i].tab_id = Some(tab);
                 state.workers.runs[i].pane_id = Some(pane);
-                state.workers.runs[i].status = WorkerStatus::AgentIntent;
+                state.workers.runs[i].status = WorkerStatus::AgentStartReady;
                 save(dir, state)?;
                 Value::Null
             }
@@ -946,13 +968,44 @@ fn launch_one(
         state.workers.runs[i].workspace_id = Some(field(&opened, &["workspace", "workspace_id"])?);
         state.workers.runs[i].tab_id = Some(field(&opened, &["tab", "tab_id"])?);
         state.workers.runs[i].pane_id = Some(field(&opened, &["root_pane", "pane_id"])?);
-        state.workers.runs[i].status = WorkerStatus::AgentIntent;
+        state.workers.runs[i].status = WorkerStatus::AgentStartReady;
         save(dir, state)?;
     }
-    let pane = state.workers.runs[i]
+    start_agent_from_ready(dir, state, herdr, i)
+}
+
+fn start_agent_from_ready(dir: &Path, state: &mut State, herdr: &Client, i: usize) -> Result<()> {
+    let run = state.workers.runs[i].clone();
+    let pane = run
         .pane_id
         .clone()
         .context("Herdr worktree.open omitted root pane ID")?;
+    match herdr.agent(&pane) {
+        Err(error)
+            if error
+                .downcast_ref::<crate::herdr::HerdrApiError>()
+                .is_some_and(crate::herdr::HerdrApiError::is_agent_not_found) =>
+        {
+            // The exact recovered pane is known to have no occupant, so starting
+            // the first agent remains safe after restart.
+        }
+        Ok(_) => {
+            state.workers.runs[i].status = WorkerStatus::Uncertain;
+            state.workers.runs[i].question = Some(format!(
+                "The recovered pane {pane} already has an agent; no replacement was started. Inspect its identity before retrying."
+            ));
+            return save(dir, state);
+        }
+        Err(error) => {
+            state.workers.runs[i].status = WorkerStatus::Uncertain;
+            state.workers.runs[i].question = Some(format!(
+                "Could not confirm pane {pane} is empty; agent.start was not sent: {error:#}"
+            ));
+            return save(dir, state);
+        }
+    }
+    state.workers.runs[i].status = WorkerStatus::AgentIntent;
+    save(dir, state)?;
     let provider = state.workers.providers.for_role(&run.role).clone();
     let args = provider_args(&provider)?;
     let started = match herdr.start_agent(
@@ -970,7 +1023,7 @@ fn launch_one(
             return save(dir, state);
         }
     };
-    let (terminal_id, agent_provider, _) = match crate::herdr::capture_agent_identity(
+    let (terminal_id, agent_provider, agent_session) = match crate::herdr::capture_agent_identity(
         &started,
         &state.workers.runs[i],
     ) {
@@ -985,40 +1038,7 @@ fn launch_one(
     };
     state.workers.runs[i].terminal_id = Some(terminal_id);
     state.workers.runs[i].agent_provider = agent_provider;
-    save(dir, state)?;
-    state.workers.runs[i].status = WorkerStatus::PromptIntent;
-    save(dir, state)?;
-    let prompt = worker_prompt(&state.workers.runs[i], state);
-    if let Err(error) = herdr.prompt(&pane, &prompt) {
-        state.workers.runs[i].status = WorkerStatus::Uncertain;
-        state.workers.runs[i].question = Some(format!(
-            "Prompt may have been submitted; it was not repeated: {error:#}"
-        ));
-        return save(dir, state);
-    }
-    let observed = match herdr
-        .agent(&pane)
-        .and_then(|info| crate::herdr::capture_agent_identity(&info, &state.workers.runs[i]))
-    {
-        Ok((terminal, provider, Some(session))) => (terminal, provider, session),
-        Ok((_, _, None)) => {
-            state.workers.runs[i].status = WorkerStatus::Uncertain;
-            state.workers.runs[i].question = Some("Prompt entered activity but Herdr did not expose an agent-session identity; the run was not relaunched.".into());
-            return save(dir, state);
-        }
-        Err(error) => {
-            state.workers.runs[i].status = WorkerStatus::Uncertain;
-            state.workers.runs[i].question = Some(format!(
-                "Prompt entered activity but the original agent identity could not be verified; the run was not relaunched: {error:#}"
-            ));
-            return save(dir, state);
-        }
-    };
-    state.workers.runs[i].status = WorkerStatus::Running;
-    state.workers.runs[i].last_activity_ms = Some(now_ms());
-    state.workers.runs[i].terminal_id = Some(observed.0);
-    state.workers.runs[i].agent_provider = observed.1;
-    state.workers.runs[i].agent_session = Some(observed.2);
+    state.workers.runs[i].agent_session = agent_session;
     let process = match herdr
         .pane_process_info(&pane)
         .and_then(|info| crate::herdr::capture_foreground_process(&info, &pane))
@@ -1027,13 +1047,151 @@ fn launch_one(
         Err(error) => {
             state.workers.runs[i].status = WorkerStatus::Uncertain;
             state.workers.runs[i].question = Some(format!(
-                "Prompt entered activity but Linux process continuity could not be established; the run was not relaunched: {error:#}"
+                "Herdr started the agent, but Linux process continuity could not be established; no prompt was sent: {error:#}"
             ));
             return save(dir, state);
         }
     };
     state.workers.runs[i].foreground_process = Some(process);
-    state.workers.runs[i].question = None;
+    state.workers.runs[i].status = WorkerStatus::InitialPromptReady;
+    state.workers.runs[i].initial_prompt_pending = true;
+    save(dir, state)?;
+    submit_initial_task_prompt(dir, state, herdr, i)
+}
+
+fn submit_initial_task_prompt(
+    dir: &Path,
+    state: &mut State,
+    herdr: &Client,
+    i: usize,
+) -> Result<()> {
+    let run = state.workers.runs[i].clone();
+    let pane = run
+        .pane_id
+        .as_deref()
+        .context("initial prompt has no owned pane")?;
+    let agent = match crate::herdr::inspect_pre_prompt_worker(herdr, &run) {
+        Ok(agent) => agent,
+        Err(error) => {
+            state.workers.runs[i].status = WorkerStatus::Uncertain;
+            state.workers.runs[i].question = Some(format!(
+                "The initial task prompt was not sent because its terminal/process identity could not be verified: {error:#}"
+            ));
+            return save(dir, state);
+        }
+    };
+    match status(&agent).unwrap_or("unknown") {
+        "blocked" => return mark_initial_prompt_blocked(dir, state, herdr, i),
+        "idle" | "done" => {}
+        "working" => {
+            state.workers.runs[i].status = WorkerStatus::InitialPromptReady;
+            return save(dir, state);
+        }
+        other => {
+            state.workers.runs[i].status = WorkerStatus::Uncertain;
+            state.workers.runs[i].question = Some(format!(
+                "Initial task prompt remains unsent; Herdr reports unrecognized status {other}. Inspect pane {pane}."
+            ));
+            return save(dir, state);
+        }
+    }
+    state.workers.runs[i].status = WorkerStatus::PromptIntent;
+    state.workers.runs[i].initial_prompt_pending = true;
+    save(dir, state)?;
+    let prompt = worker_prompt(&state.workers.runs[i], state);
+    if let Err(error) = herdr.prompt(pane, &prompt) {
+        if error
+            .downcast_ref::<crate::herdr::HerdrApiError>()
+            .is_some_and(crate::herdr::HerdrApiError::is_agent_blocked)
+        {
+            return mark_initial_prompt_blocked(dir, state, herdr, i);
+        }
+        state.workers.runs[i].status = WorkerStatus::Uncertain;
+        state.workers.runs[i].question = Some(format!(
+            "Initial task prompt may have been submitted; it was not repeated: {error:#}"
+        ));
+        return save(dir, state);
+    }
+    // Herdr acknowledged this exact initial submission. From this point onward
+    // a restart must not treat the still-empty result file as task completion.
+    state.workers.runs[i].initial_prompt_pending = false;
+    save(dir, state)?;
+    let current = state.workers.runs[i].clone();
+    let observed = match herdr
+        .agent(pane)
+        .and_then(|info| crate::herdr::capture_agent_identity(&info, &current))
+    {
+        Ok((terminal, provider, Some(session))) => (terminal, provider, session),
+        Ok((_, _, None)) => {
+            state.workers.runs[i].status = WorkerStatus::Uncertain;
+            state.workers.runs[i].question = Some("Herdr acknowledged the initial prompt but did not expose an agent-session identity; it was not repeated.".into());
+            return save(dir, state);
+        }
+        Err(error) => {
+            state.workers.runs[i].status = WorkerStatus::Uncertain;
+            state.workers.runs[i].question = Some(format!(
+                "Herdr acknowledged the initial prompt but original agent identity could not be verified; it was not repeated: {error:#}"
+            ));
+            return save(dir, state);
+        }
+    };
+    let process = match herdr
+        .pane_process_info(pane)
+        .and_then(|info| crate::herdr::capture_foreground_process(&info, pane))
+    {
+        Ok(process) if current.foreground_process.as_ref() == Some(&process) => process,
+        Ok(_) => {
+            state.workers.runs[i].status = WorkerStatus::Uncertain;
+            state.workers.runs[i].question = Some("Herdr acknowledged the initial prompt but foreground process identity changed; it was not repeated.".into());
+            return save(dir, state);
+        }
+        Err(error) => {
+            state.workers.runs[i].status = WorkerStatus::Uncertain;
+            state.workers.runs[i].question = Some(format!(
+                "Herdr acknowledged the initial prompt but Linux process identity could not be verified; it was not repeated: {error:#}"
+            ));
+            return save(dir, state);
+        }
+    };
+    let worker = &mut state.workers.runs[i];
+    worker.status = WorkerStatus::Running;
+    worker.last_activity_ms = Some(now_ms());
+    worker.terminal_id = Some(observed.0);
+    worker.agent_provider = observed.1;
+    worker.agent_session = Some(observed.2);
+    worker.foreground_process = Some(process);
+    worker.question = None;
+    worker.human_request_id = None;
+    worker.human_request_kind = None;
+    worker.human_request_fingerprint = None;
+    save(dir, state)
+}
+
+fn mark_initial_prompt_blocked(
+    dir: &Path,
+    state: &mut State,
+    herdr: &Client,
+    i: usize,
+) -> Result<()> {
+    let pane = state.workers.runs[i]
+        .pane_id
+        .clone()
+        .context("blocked initial prompt has no owned pane")?;
+    let question = herdr
+        .read_recent(&pane)
+        .ok()
+        .and_then(|value| value["read"]["text"].as_str().map(str::to_owned))
+        .filter(|text| !text.trim().is_empty())
+        .unwrap_or_else(|| {
+            format!(
+                "Herdr blocked the startup prompt before task input. Inspect the named pane {pane} directly before responding."
+            )
+        });
+    let worker = &mut state.workers.runs[i];
+    worker.status = WorkerStatus::NeedsHuman;
+    worker.initial_prompt_pending = true;
+    worker.set_human_request(crate::store::HumanRequestKind::HerdrBlockedUi, &question);
+    worker.question = Some(question);
     save(dir, state)
 }
 

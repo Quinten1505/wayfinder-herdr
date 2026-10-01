@@ -397,24 +397,37 @@ fn run() -> Result<()> {
                 .iter()
                 .position(|worker| worker.id == run)
                 .context("worker run not found")?;
-            ensure!(
-                state.workers.runs[i].status == WorkerStatus::Running,
-                "only a confirmed running worker can be stopped; uncertain and blocked runs require reconciliation"
-            );
             let worker = state.workers.runs[i].clone();
-            let pane = worker
-                .pane_id
-                .clone()
-                .context("running worker has no owned pane")?;
+            let confirmed_blocked = worker.status == WorkerStatus::NeedsHuman
+                && worker.human_request_kind == Some(HumanRequestKind::HerdrBlockedUi);
+            ensure!(
+                worker.status == WorkerStatus::Running || confirmed_blocked,
+                "only a confirmed running worker or identity-verified Herdr-blocked worker can be stopped"
+            );
+            let pane = worker.pane_id.clone().context("worker has no owned pane")?;
             let herdr = Client::new(&state.binding.socket);
-            if let Err(error) = wayfinder_herdr::herdr::inspect_worker(&herdr, &worker) {
-                state.workers.runs[i].status = WorkerStatus::Uncertain;
-                state.workers.runs[i].question = Some(format!(
-                    "Worker identity/process continuity could not be verified; pane was not closed: {error:#}"
-                ));
-                store::atomic_json(&dir.join("state.json"), &state)?;
-                anyhow::bail!(
-                    "worker identity/process continuity could not be verified; pane was not closed: {error:#}"
+            let inspected = if worker.initial_prompt_pending {
+                wayfinder_herdr::herdr::inspect_pre_prompt_worker(&herdr, &worker)
+            } else {
+                wayfinder_herdr::herdr::inspect_worker(&herdr, &worker)
+            };
+            let agent = match inspected {
+                Ok(agent) => agent,
+                Err(error) => {
+                    state.workers.runs[i].status = WorkerStatus::Uncertain;
+                    state.workers.runs[i].question = Some(format!(
+                        "Worker identity/process continuity could not be verified; pane was not closed: {error:#}"
+                    ));
+                    store::atomic_json(&dir.join("state.json"), &state)?;
+                    anyhow::bail!(
+                        "worker identity/process continuity could not be verified; pane was not closed: {error:#}"
+                    );
+                }
+            };
+            if confirmed_blocked {
+                ensure!(
+                    agent["agent"]["agent_status"].as_str() == Some("blocked"),
+                    "the worker is no longer confirmed blocked; reconcile before stopping"
                 );
             }
             state.workers.runs[i].status = WorkerStatus::StopRequested;
@@ -483,7 +496,12 @@ fn run() -> Result<()> {
                 .clone()
                 .context("blocked worker has no owned pane")?;
             let herdr = Client::new(&state.binding.socket);
-            let agent = match wayfinder_herdr::herdr::inspect_worker(&herdr, &worker) {
+            let inspected = if worker.initial_prompt_pending {
+                wayfinder_herdr::herdr::inspect_pre_prompt_worker(&herdr, &worker)
+            } else {
+                wayfinder_herdr::herdr::inspect_worker(&herdr, &worker)
+            };
+            let agent = match inspected {
                 Ok(agent) => agent,
                 Err(error) => {
                     state.workers.runs[index].status = WorkerStatus::Uncertain;
@@ -702,7 +720,7 @@ fn run() -> Result<()> {
                 human_request_seq: 0, human_request_id: None, human_request_kind: None,
                 human_request_fingerprint: None, answer_request_id: None, answer_request_kind: None,
                 answer_history: Vec::new(),
-                source_run: Some(prior.id), claim_login: prior.claim_login, context: Some("Human explicitly authorized this retry after the preceding worker was confirmed stopped or absent.".into()), last_activity_ms: None, terminal_id: None, agent_provider: None, agent_session: None, foreground_process: None, result_evidence: None,
+                source_run: Some(prior.id), claim_login: prior.claim_login, context: Some("Human explicitly authorized this retry after the preceding worker was confirmed stopped or absent.".into()), last_activity_ms: None, terminal_id: None, agent_provider: None, agent_session: None, foreground_process: None, result_evidence: None, initial_prompt_pending: false,
             });
             store::atomic_json(&dir.join("state.json"), &state)?;
             println!(

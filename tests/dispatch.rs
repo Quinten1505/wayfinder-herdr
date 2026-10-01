@@ -59,6 +59,7 @@ struct HerdrState {
     ambiguous_close_response: bool,
     reject_next_prompt_as_blocked: bool,
     fail_next_read: bool,
+    empty_next_read: bool,
     changed_read: bool,
     opened_worktrees: Vec<OpenedWorktree>,
     agents: HashMap<String, Value>,
@@ -281,8 +282,14 @@ fn handle_request(mut stream: std::os::unix::net::UnixStream, state: &Arc<Mutex<
             let pane = request["params"]["pane_id"].as_str().unwrap().to_owned();
             let name = request["params"]["name"].as_str().unwrap().to_owned();
             let provider = request["params"]["kind"].as_str().unwrap().to_owned();
-            if let Some(tree) = state.opened_worktrees.iter().find(|tree| tree.pane == pane) {
-                let info = json!({"agent":provider,"agent_session":null,"agent_status":"working","name":name,"terminal_id":tree.terminal,"workspace_id":tree.workspace,"tab_id":tree.tab,"pane_id":tree.pane});
+            if let Some(tree) = state
+                .opened_worktrees
+                .iter()
+                .find(|tree| tree.pane == pane)
+                .cloned()
+            {
+                state.agent_status = "idle".into();
+                let info = json!({"agent":provider,"agent_session":null,"agent_status":"idle","name":name,"terminal_id":tree.terminal,"workspace_id":tree.workspace,"tab_id":tree.tab,"pane_id":tree.pane});
                 state.agents.insert(pane.clone(), info.clone());
                 result = json!({"type":"agent_started","agent":info,"argv":[]});
                 if state.ambiguous_start_response {
@@ -305,6 +312,7 @@ fn handle_request(mut stream: std::os::unix::net::UnixStream, state: &Arc<Mutex<
             } else if let Some(info) = state.agents.get(&pane) {
                 let mut updated = info.clone();
                 updated["agent_status"] = json!("working");
+                state.agent_status = "working".into();
                 let pane = request["params"]["target"].as_str().unwrap();
                 state.sessions.entry(pane.into()).or_insert_with(|| json!({"source":"fixture","agent":"codex","kind":"id","value":format!("conversation-{pane}")}));
                 updated["agent_session"] = state.sessions.get(pane).cloned().unwrap();
@@ -349,6 +357,9 @@ fn handle_request(mut stream: std::os::unix::net::UnixStream, state: &Arc<Mutex<
                 state.fail_next_read = false;
                 error =
                     Some(json!({"code":"read_failed","message":"simulated pane snapshot failure"}));
+            } else if state.empty_next_read {
+                state.empty_next_read = false;
+                result = json!({"type":"pane_read","read":{"text":""}})
             } else {
                 let text = if state.changed_read {
                     "Approval required: allow running a shell command?"
@@ -488,6 +499,103 @@ fn cli_dispatch_creates_a_detached_ticket_worktree_and_uses_explicit_herdr_ids()
     assert!(prompt.contains("Do not invent, infer, or answer a human response"));
 }
 
+#[test]
+fn recovered_open_intent_starts_the_agent_once_without_reopening_the_worktree() {
+    let f = Fixture::new();
+    let repository = f.state().binding.repository;
+    let checkout = f._temp.path().join("recovered-open-intent");
+    git(
+        &repository,
+        &[
+            "worktree",
+            "add",
+            "--detach",
+            checkout.to_str().unwrap(),
+            "HEAD",
+        ],
+    );
+    let tree = OpenedWorktree {
+        path: checkout.to_string_lossy().into_owned(),
+        workspace: "recovered-workspace".into(),
+        tab: "recovered-tab".into(),
+        pane: "recovered-pane".into(),
+        terminal: "recovered-terminal".into(),
+    };
+    f.herdr_state.lock().unwrap().opened_worktrees.push(tree);
+    let mut state = f.state();
+    state.authorization = Authorization::Started;
+    state.workers.next_run = 1;
+    let run = WorkerRun {
+        id: "run-00000000000000000001".into(),
+        ticket: 13,
+        role: "implementer".into(),
+        attempt: 1,
+        automatic_retries: 0,
+        rework_round: 0,
+        status: WorkerStatus::OpenIntent,
+        worktree: checkout,
+        workspace_id: None,
+        tab_id: None,
+        pane_id: None,
+        base_commit: None,
+        result_commit: None,
+        summary: None,
+        question: None,
+        human_response: None,
+        human_decision: None,
+        human_request_seq: 0,
+        human_request_id: None,
+        human_request_kind: None,
+        human_request_fingerprint: None,
+        answer_request_id: None,
+        answer_request_kind: None,
+        answer_history: Vec::new(),
+        source_run: None,
+        claim_login: Some("fixture-user".into()),
+        context: None,
+        last_activity_ms: None,
+        terminal_id: None,
+        agent_provider: None,
+        agent_session: None,
+        foreground_process: None,
+        result_evidence: None,
+        initial_prompt_pending: false,
+    };
+    state.workers.runs.push(run.clone());
+    store::atomic_json(&f.dir.join("state.json"), &state).unwrap();
+    store::enqueue(&f.dir, RequestKind::Reconcile).unwrap();
+
+    success(f.once());
+    let resumed = f.state().workers.runs[0].clone();
+    assert_eq!(resumed.status, WorkerStatus::Running);
+    assert_eq!(resumed.pane_id.as_deref(), Some("recovered-pane"));
+    let records = f.herdr_state.lock().unwrap();
+    assert_eq!(
+        records
+            .requests
+            .iter()
+            .filter(|r| r["method"] == "agent.start")
+            .count(),
+        1
+    );
+    assert_eq!(
+        records
+            .requests
+            .iter()
+            .filter(|r| r["method"] == "agent.prompt")
+            .count(),
+        1
+    );
+    assert_eq!(
+        records
+            .requests
+            .iter()
+            .filter(|r| r["method"] == "worktree.open")
+            .count(),
+        0
+    );
+}
+
 fn answer_cli(f: &Fixture, run: &WorkerRun, request_type: &str, response: &str) -> Output {
     f.cli()
         .args([
@@ -582,6 +690,131 @@ fn blocked_herdr_ui_requires_direct_human_interaction_and_never_sends_raw_input(
         resumed.answer_history[0].disposition,
         store::AnswerDisposition::ManualRequired
     );
+}
+
+#[test]
+fn initial_agent_prompt_block_is_manual_then_submitted_once_after_ui_clears() {
+    let f = Fixture::new();
+    f.herdr_state.lock().unwrap().reject_next_prompt_as_blocked = true;
+    f.apply(RequestKind::Start);
+    let pending = f.state().workers.runs[0].clone();
+    assert_eq!(pending.status, WorkerStatus::NeedsHuman);
+    assert_eq!(
+        pending.human_request_kind,
+        Some(store::HumanRequestKind::HerdrBlockedUi)
+    );
+    assert!(pending.initial_prompt_pending);
+    assert_eq!(pending.agent_session, None);
+    assert!(
+        pending
+            .question
+            .as_deref()
+            .unwrap()
+            .contains("Question: Which option")
+    );
+    assert!(pending.status.reserves_capacity());
+
+    let manual = answer_cli(&f, &pending, "herdr_blocked_ui", "allow this startup UI");
+    assert!(!manual.status.success());
+    assert!(
+        String::from_utf8_lossy(&manual.stderr).contains("interact with it directly"),
+        "{}",
+        String::from_utf8_lossy(&manual.stderr)
+    );
+    let retained = f.state().workers.runs[0].clone();
+    assert_eq!(retained.status, WorkerStatus::NeedsHuman);
+    assert!(retained.initial_prompt_pending);
+    assert_eq!(
+        retained.human_response.as_deref(),
+        Some("allow this startup UI")
+    );
+    assert_eq!(
+        retained.answer_history[0].disposition,
+        store::AnswerDisposition::ManualRequired
+    );
+    assert!(
+        !f.herdr_state
+            .lock()
+            .unwrap()
+            .requests
+            .iter()
+            .any(|request| request["method"] == "pane.send_input")
+    );
+
+    success(f.once());
+    assert_eq!(f.state().workers.runs[0].status, WorkerStatus::NeedsHuman);
+    assert!(f.state().workers.runs[0].initial_prompt_pending);
+    assert_eq!(
+        f.herdr_state
+            .lock()
+            .unwrap()
+            .requests
+            .iter()
+            .filter(|r| r["method"] == "agent.prompt")
+            .count(),
+        1,
+        "the rejected prompt is never retried while Herdr still reports blocked"
+    );
+
+    f.herdr_state.lock().unwrap().agent_status = "idle".into();
+    success(f.once());
+    let started = f.state().workers.runs[0].clone();
+    assert_eq!(started.status, WorkerStatus::Running);
+    assert!(!started.initial_prompt_pending);
+    assert!(started.agent_session.is_some());
+    assert_eq!(
+        f.herdr_state
+            .lock()
+            .unwrap()
+            .requests
+            .iter()
+            .filter(|r| r["method"] == "agent.prompt")
+            .count(),
+        2,
+        "the task prompt is submitted once after the human resolves startup UI"
+    );
+}
+
+#[test]
+fn blocked_worker_read_failure_or_empty_text_creates_refreshable_manual_request() {
+    for empty in [false, true] {
+        let f = Fixture::new();
+        f.apply(RequestKind::Start);
+        {
+            let mut herdr = f.herdr_state.lock().unwrap();
+            herdr.agent_status = "blocked".into();
+            if empty {
+                herdr.empty_next_read = true;
+            } else {
+                herdr.fail_next_read = true;
+            }
+        }
+        success(f.once());
+        let fallback = f.state().workers.runs[0].clone();
+        assert_eq!(fallback.status, WorkerStatus::NeedsHuman);
+        assert!(fallback.status.reserves_capacity());
+        assert_eq!(
+            fallback.human_request_kind,
+            Some(store::HumanRequestKind::HerdrBlockedUi)
+        );
+        assert!(
+            fallback
+                .question
+                .as_deref()
+                .unwrap()
+                .contains("named pane pane-owned")
+        );
+        assert!(fallback.human_request_id.is_some());
+
+        success(f.once());
+        let refreshed = f.state().workers.runs[0].clone();
+        assert_eq!(refreshed.status, WorkerStatus::NeedsHuman);
+        assert_ne!(refreshed.human_request_id, fallback.human_request_id);
+        assert_eq!(
+            refreshed.question.as_deref(),
+            Some("Question: Which option should I use, A or B?")
+        );
+    }
 }
 
 #[test]
@@ -1118,6 +1351,7 @@ fn cold_restored_or_replaced_agent_identity_becomes_uncertain_without_effects() 
             agent_session: None,
             foreground_process: None,
             result_evidence: None,
+            initial_prompt_pending: false,
         });
         store::atomic_json(&f.dir.join("state.json"), &queued).unwrap();
         {
@@ -1314,6 +1548,7 @@ fn review_rework_budget_advances_independently_of_failure_retry_budget() {
                 "verdict":"changes_requested"
             }),
         );
+        f.herdr_state.lock().unwrap().agent_status = "idle".into();
         success(f.once());
         let state = f.state();
         let rework = state
@@ -1403,6 +1638,7 @@ fn archived_result_allows_replay_but_unrelated_review_changes_still_block_accept
     )
     .unwrap();
     fs::write(reviewer.worktree.join("unrelated.txt"), "human edit\n").unwrap();
+    f.herdr_state.lock().unwrap().agent_status = "idle".into();
     success(f.once());
     let held = f.state();
     assert_eq!(held.workers.runs[1].status, WorkerStatus::Running);
@@ -1556,6 +1792,72 @@ fn human_stop_persists_before_closing_only_the_owned_pane_and_retains_checkout()
 }
 
 #[test]
+fn confirmed_blocked_worker_can_be_stopped_once_with_durable_intent() {
+    for ambiguous in [false, true] {
+        let f = Fixture::new();
+        f.apply(RequestKind::Start);
+        f.herdr_state.lock().unwrap().agent_status = "blocked".into();
+        success(f.once());
+        let blocked = f.state().workers.runs[0].clone();
+        assert_eq!(blocked.status, WorkerStatus::NeedsHuman);
+        assert_eq!(
+            blocked.human_request_kind,
+            Some(store::HumanRequestKind::HerdrBlockedUi)
+        );
+        f.herdr_state.lock().unwrap().ambiguous_close_response = ambiguous;
+
+        let stopped = f
+            .cli()
+            .args(["stop-worker", "--map", MAP, "--run", &blocked.id])
+            .output()
+            .unwrap();
+        if ambiguous {
+            assert!(!stopped.status.success());
+            assert_eq!(f.state().workers.runs[0].status, WorkerStatus::Uncertain);
+        } else {
+            success(stopped);
+            assert_eq!(f.state().workers.runs[0].status, WorkerStatus::Stopped);
+        }
+        success(f.once());
+        let records = f.herdr_state.lock().unwrap();
+        assert_eq!(records.closed_panes, ["pane-owned"]);
+        assert_eq!(
+            records
+                .requests
+                .iter()
+                .filter(|request| request["method"] == "pane.close")
+                .count(),
+            1,
+            "an ambiguous stop is never repeated"
+        );
+    }
+}
+
+#[test]
+fn blocked_worker_replacement_is_never_closed() {
+    let f = Fixture::new();
+    f.apply(RequestKind::Start);
+    f.herdr_state.lock().unwrap().agent_status = "blocked".into();
+    success(f.once());
+    let blocked = f.state().workers.runs[0].clone();
+    f.herdr_state
+        .lock()
+        .unwrap()
+        .agents
+        .get_mut("pane-owned")
+        .unwrap()["terminal_id"] = json!("replacement-terminal");
+
+    let stopped = f
+        .cli()
+        .args(["stop-worker", "--map", MAP, "--run", &blocked.id])
+        .output()
+        .unwrap();
+    assert!(!stopped.status.success());
+    assert_eq!(f.state().workers.runs[0].status, WorkerStatus::Uncertain);
+    assert!(f.herdr_state.lock().unwrap().closed_panes.is_empty());
+}
+
+#[test]
 fn role_configuration_persists_provider_model_effort_and_shared_capacity() {
     let f = Fixture::new_without_session();
     let output = f
@@ -1633,6 +1935,7 @@ fn insert_uncertain_run(f: &Fixture) -> WorkerRun {
         agent_session: None,
         foreground_process: None,
         result_evidence: None,
+        initial_prompt_pending: false,
     };
     state.workers.next_run = 1;
     state.workers.runs.push(run.clone());

@@ -170,6 +170,10 @@ pub struct WorkerRun {
     /// Durable output copy outside the source checkout.
     #[serde(default)]
     pub result_evidence: Option<PathBuf>,
+    /// The initial task prompt was rejected before input and is still pending
+    /// human resolution of a Herdr startup UI.
+    #[serde(default)]
+    pub initial_prompt_pending: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -253,7 +257,12 @@ pub enum WorkerStatus {
     Queued,
     LaunchIntent,
     OpenIntent,
+    /// Exact worktree pane found; agent.start is known not to have been sent.
+    AgentStartReady,
     AgentIntent,
+    /// Herdr confirmed agent.start and its terminal/process identity was saved;
+    /// the first task prompt has not been submitted.
+    InitialPromptReady,
     PromptIntent,
     AnswerIntent,
     Running,
@@ -272,7 +281,9 @@ impl WorkerStatus {
             self,
             Self::LaunchIntent
                 | Self::OpenIntent
+                | Self::AgentStartReady
                 | Self::AgentIntent
+                | Self::InitialPromptReady
                 | Self::PromptIntent
                 | Self::AnswerIntent
                 | Self::Running
