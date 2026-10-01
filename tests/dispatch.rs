@@ -1388,6 +1388,80 @@ fn ambiguous_claim_failure_releases_agent_slot_but_keeps_claim_and_intent_held()
             .count(),
         1
     );
+    drop(records);
+
+    // A human can reconcile the retained claim using fresh GitHub reads, then explicitly
+    // authorize a new worker after confirming the ambiguous prelaunch run is absent.
+    success(
+        f.cli()
+            .args(["tracker", "reconcile-claim", "--map", MAP, "--ticket", "13"])
+            .output()
+            .unwrap(),
+    );
+    success(
+        f.cli()
+            .args(["configure-worker", "--map", MAP, "--concurrency", "2"])
+            .output()
+            .unwrap(),
+    );
+    success(
+        f.cli()
+            .args([
+                "retry-worker",
+                "--map",
+                MAP,
+                "--run",
+                &uncertain.id,
+                "--confirmed-absent-or-stopped",
+            ])
+            .output()
+            .unwrap(),
+    );
+    success(f.once());
+    let retried = f.state();
+    assert_eq!(
+        retried
+            .workers
+            .runs
+            .iter()
+            .filter(|run| run.ticket == 13 && run.status == WorkerStatus::Running)
+            .count(),
+        1
+    );
+    let github = serde_json::from_slice::<Value>(&fs::read(&f.gh_state).unwrap()).unwrap();
+    assert_eq!(
+        github["claim_attempts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|ticket| *ticket == 13)
+            .count(),
+        1,
+        "recovered retry reuses the proven assignment without another assignment request"
+    );
+    let records = f.herdr_state.lock().unwrap();
+    assert_eq!(
+        records
+            .requests
+            .iter()
+            .filter(|request| request["method"] == "agent.start")
+            .count(),
+        2,
+        "the retry worker is dispatched once alongside the independent worker"
+    );
+    drop(records);
+    success(f.once());
+    assert_eq!(
+        f.herdr_state
+            .lock()
+            .unwrap()
+            .requests
+            .iter()
+            .filter(|request| request["method"] == "agent.start")
+            .count(),
+        2,
+        "later reconciliation does not dispatch a duplicate retry"
+    );
 }
 
 #[test]

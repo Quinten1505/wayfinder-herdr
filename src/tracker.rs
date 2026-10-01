@@ -369,14 +369,45 @@ impl GitHub {
         self.claim_inner(map, ticket, None, state_dir)
     }
 
-    fn claim_inner(
+    /// Resolve a retained uncertain claim only when fresh GitHub reads prove it is still owned.
+    /// This operation never writes an assignment; a separate explicit worker retry remains
+    /// necessary when the human has confirmed that no previous worker is active.
+    pub fn reconcile_claim(
         &self,
         map: &MapRef,
         ticket: u64,
         assignee: Option<&str>,
         state_dir: &Path,
     ) -> Result<String> {
+        let _lock = Lock::acquire(&state_dir.join("state.lock"))?;
         self.require_execution_override(map)?;
+        let login = self.resolve_assignee(assignee)?;
+        let marker = operation_marker("claim", &json!([map.repo(), ticket, login]));
+        let path = state_dir
+            .join("tracker/intents")
+            .join(format!("{marker}.json"));
+        ensure!(
+            path.exists(),
+            "no retained claim intent exists for this ticket and assignee"
+        );
+        let intent: Intent = serde_json::from_slice(&fs::read(&path)?)?;
+        ensure!(intent.kind == "claim", "retained intent is not a claim");
+        if intent.stage != "reconciled-claim" {
+            ensure!(
+                intent.stage == "uncertain-claim",
+                "claim intent is not uncertain (current stage: {})",
+                intent.stage
+            );
+            self.verify_owned_claim(map, ticket, &login)?;
+            self.advance_intent_path(&path, "reconciled-claim")?;
+        } else {
+            // Make the command safely repeatable while ensuring the old proof is not stale.
+            self.verify_owned_claim(map, ticket, &login)?;
+        }
+        Ok(login)
+    }
+
+    fn resolve_assignee(&self, assignee: Option<&str>) -> Result<String> {
         let login = match assignee {
             Some("@me") | None => self.get("user")?["login"]
                 .as_str()
@@ -385,6 +416,46 @@ impl GitHub {
             Some(login) => login.to_owned(),
         };
         ensure!(!login.is_empty(), "assignee cannot be empty");
+        Ok(login)
+    }
+
+    fn verify_owned_claim(&self, map: &MapRef, ticket: u64, login: &str) -> Result<()> {
+        ensure!(
+            self.subissues(map)?
+                .iter()
+                .any(|child| child["number"] == ticket),
+            "claim remains uncertain: ticket is no longer a child of this map"
+        );
+        let issue = self.issue(map, ticket)?;
+        ensure!(
+            issue["state"] == "open",
+            "claim remains uncertain: ticket is closed"
+        );
+        let assignees = issue["assignees"]
+            .as_array()
+            .context("claim remains uncertain: GitHub issue omitted assignees")?;
+        ensure!(
+            !assignees.is_empty() && assignees.iter().all(|a| a["login"] == login),
+            "claim remains uncertain: GitHub does not prove exclusive assignment to @{login}"
+        );
+        ensure!(
+            self.blockers(map, ticket)?
+                .iter()
+                .all(|blocker| blocker["state"] == "closed"),
+            "claim remains uncertain: ticket has an open blocker"
+        );
+        Ok(())
+    }
+
+    fn claim_inner(
+        &self,
+        map: &MapRef,
+        ticket: u64,
+        assignee: Option<&str>,
+        state_dir: &Path,
+    ) -> Result<String> {
+        self.require_execution_override(map)?;
+        let login = self.resolve_assignee(assignee)?;
         let marker = operation_marker("claim", &json!([map.repo(), ticket, login]));
         let intent_path = state_dir
             .join("tracker/intents")
@@ -395,6 +466,10 @@ impl GitHub {
                 prior.stage != "uncertain-claim",
                 "prior claim outcome is uncertain; reconcile GitHub assignments before retrying"
             );
+            if prior.stage == "reconciled-claim" {
+                self.verify_owned_claim(map, ticket, &login)?;
+                return Ok(login);
+            }
         }
         self.with_intent(state_dir, &marker, "claim", || {
             if !self

@@ -185,6 +185,15 @@ enum TrackerCommand {
         #[arg(long, default_value = "@me")]
         assignee: String,
     },
+    /// Reconcile an uncertain claim from current GitHub state without changing assignments.
+    ReconcileClaim {
+        #[arg(long)]
+        map: String,
+        #[arg(long)]
+        ticket: u64,
+        #[arg(long, default_value = "@me")]
+        assignee: String,
+    },
     /// Record an orchestrator resolution and update the map and spec index.
     Resolve {
         #[arg(long)]
@@ -878,6 +887,17 @@ fn run() -> Result<()> {
                     let (map, dir) = tracker_context(&root, &map)?;
                     let login = github.claim(&map, ticket, Some(&assignee), &dir)?;
                     println!("Claimed #{ticket} as @{login}");
+                }
+                TrackerCommand::ReconcileClaim {
+                    map,
+                    ticket,
+                    assignee,
+                } => {
+                    let (map, dir) = tracker_context(&root, &map)?;
+                    let login = github.reconcile_claim(&map, ticket, Some(&assignee), &dir)?;
+                    println!(
+                        "Confirmed existing GitHub claim for #{ticket} as @{login}; no assignment was changed."
+                    );
                 }
                 TrackerCommand::Resolve {
                     map,

@@ -197,7 +197,14 @@ elif len(segments)>=5 and segments[3]=='issues':
                 del db['close_race_on_claim']
             result=target
             changed=True
+            if db.get('fail_claim_postcheck_read'):
+                db['fail_claim_postcheck_read']=False
+                db['fail_issue_read_ticket']=parent
     elif method=='GET' and len(segments)==5:
+        if db.get('fail_issue_read_ticket') == parent:
+            db['fail_issue_read_ticket']=None
+            with open(data_path,'w') as f: json.dump(db,f)
+            sys.stderr.write('simulated unreadable issue read\n'); sys.exit(1)
         result=db['issues'][str(parent)]
     elif method=='PATCH' and len(segments)==5:
         current_etag='"%s"' % db['etag']
@@ -516,6 +523,99 @@ fn claim_without_persisted_assignment_fails_and_keeps_uncertain_intent() {
         )
         .unwrap();
         assert_eq!(intent["stage"], "uncertain-claim");
+    }
+}
+
+#[test]
+fn uncertain_claim_can_be_reconciled_from_fresh_owned_github_state_without_reassignment() {
+    let f = Fixture::new(true);
+    let mut db = f.github();
+    db["fail_claim_postcheck_read"] = json!(true);
+    f.set_github(db);
+
+    let first = f.api(&["tracker", "claim", "--map", MAP, "--ticket", "3"]);
+    assert!(!first.status.success());
+    assert_eq!(
+        f.github()["issues"]["3"]["assignees"][0]["login"],
+        "quinten"
+    );
+    assert_eq!(f.github()["claim_write_count"], 1);
+
+    let blocked = f.api(&["tracker", "claim", "--map", MAP, "--ticket", "3"]);
+    assert!(!blocked.status.success());
+    assert_eq!(f.github()["claim_write_count"], 1);
+
+    f.success(&["tracker", "reconcile-claim", "--map", MAP, "--ticket", "3"]);
+    let intent: Value = serde_json::from_slice(
+        &fs::read_dir(f.dir.join("tracker/intents"))
+            .unwrap()
+            .map(|entry| fs::read(entry.unwrap().path()).unwrap())
+            .next()
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(intent["stage"], "reconciled-claim");
+
+    // Runtime's claim path (also used by explicit retry-worker runs) accepts the reconciled
+    // ownership proof but never posts another assignment.
+    f.success(&["tracker", "claim", "--map", MAP, "--ticket", "3"]);
+    f.success(&["tracker", "reconcile-claim", "--map", MAP, "--ticket", "3"]);
+    assert_eq!(f.github()["claim_write_count"], 1);
+}
+
+#[test]
+fn uncertain_claim_reconciliation_keeps_foreign_empty_closed_and_unreadable_states_held() {
+    for state in ["foreign", "empty", "closed", "unreadable"] {
+        let f = Fixture::new(true);
+        let mut db = f.github();
+        match state {
+            "foreign" => db["claim_race_to"] = json!("alice"),
+            "empty" => db["claim_error_no_persist"] = json!(true),
+            "closed" => db["close_race_on_claim"] = json!(true),
+            "unreadable" => db["fail_claim_postcheck_read"] = json!(true),
+            _ => unreachable!(),
+        }
+        f.set_github(db);
+        let first = f.api(&["tracker", "claim", "--map", MAP, "--ticket", "3"]);
+        assert!(
+            !first.status.success(),
+            "{state} setup unexpectedly claimed"
+        );
+        if state == "foreign" {
+            // Model an external reassignment after the ambiguous operation resolved.
+            let mut db = f.github();
+            db["issues"]["3"]["assignees"] = json!([{"login":"alice"}]);
+            f.set_github(db);
+        }
+        if state == "unreadable" {
+            // The first failed read was consumed by the ambiguous postcheck; fail reconciliation.
+            let mut db = f.github();
+            db["fail_issue_read_ticket"] = json!(3);
+            f.set_github(db);
+        }
+        let before = f.github()["claim_write_count"].as_u64().unwrap();
+        let result = f.api(&["tracker", "reconcile-claim", "--map", MAP, "--ticket", "3"]);
+        assert!(
+            !result.status.success(),
+            "{state} was incorrectly reconciled"
+        );
+        let intent: Value = serde_json::from_slice(
+            &fs::read_dir(f.dir.join("tracker/intents"))
+                .unwrap()
+                .map(|entry| fs::read(entry.unwrap().path()).unwrap())
+                .next()
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            intent["stage"], "uncertain-claim",
+            "{state} cleared uncertainty"
+        );
+        assert_eq!(
+            f.github()["claim_write_count"],
+            before,
+            "{state} repeated assignment"
+        );
     }
 }
 
