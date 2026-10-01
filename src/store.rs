@@ -3,6 +3,7 @@ use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
+    collections::BTreeMap,
     fs::{self, File, OpenOptions},
     io::Write,
     os::unix::fs::{OpenOptionsExt, PermissionsExt},
@@ -37,11 +38,142 @@ pub struct State {
     pub authorization: Authorization,
     pub poll_seconds: u64,
     pub concurrency: u32,
-    /// Always false in this foundation: compatibility alone is not reconciliation.
+    /// Set only after the bound host and GitHub have both reconciled successfully.
     pub reconciled: bool,
     pub suspension: String,
     /// Request IDs are retained to make replay after commit-before-unlink safe.
     pub history: Vec<Applied>,
+    /// Defaults keep state created by the initial runtime foundation readable.
+    #[serde(default)]
+    pub workers: WorkerState,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+pub struct WorkerState {
+    #[serde(default)]
+    pub next_run: u64,
+    #[serde(default)]
+    pub runs: Vec<WorkerRun>,
+    #[serde(default)]
+    pub providers: ProviderConfiguration,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProviderConfiguration {
+    #[serde(default = "default_provider")]
+    pub default: Provider,
+    #[serde(default)]
+    pub roles: BTreeMap<String, Provider>,
+}
+
+impl Default for ProviderConfiguration {
+    fn default() -> Self {
+        Self {
+            default: default_provider(),
+            roles: BTreeMap::new(),
+        }
+    }
+}
+
+fn default_provider() -> Provider {
+    Provider {
+        kind: "codex".into(),
+        model: None,
+        reasoning_effort: None,
+        args: Vec::new(),
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Provider {
+    pub kind: String,
+    #[serde(default)]
+    pub model: Option<String>,
+    #[serde(default)]
+    pub reasoning_effort: Option<String>,
+    #[serde(default)]
+    pub args: Vec<String>,
+}
+
+impl ProviderConfiguration {
+    pub fn for_role(&self, role: &str) -> &Provider {
+        self.roles.get(role).unwrap_or(&self.default)
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkerRun {
+    pub id: String,
+    pub ticket: u64,
+    pub role: String,
+    pub attempt: u8,
+    #[serde(default)]
+    pub automatic_retries: u8,
+    #[serde(default)]
+    pub rework_round: u8,
+    pub status: WorkerStatus,
+    /// Persisted before a worktree or pane is requested from Herdr.
+    pub worktree: PathBuf,
+    pub workspace_id: Option<String>,
+    pub tab_id: Option<String>,
+    pub pane_id: Option<String>,
+    pub base_commit: Option<String>,
+    pub result_commit: Option<String>,
+    pub summary: Option<String>,
+    pub question: Option<String>,
+    #[serde(default)]
+    pub human_response: Option<String>,
+    #[serde(default)]
+    pub human_decision: Option<String>,
+    #[serde(default)]
+    pub source_run: Option<String>,
+    #[serde(default)]
+    pub claim_login: Option<String>,
+    #[serde(default)]
+    pub context: Option<String>,
+    /// Last time Herdr confirmed activity for this submitted prompt. Brief idle
+    /// snapshots after submission are not evidence that the launch is absent.
+    #[serde(default)]
+    pub last_activity_ms: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkerStatus {
+    Queued,
+    LaunchIntent,
+    OpenIntent,
+    AgentIntent,
+    PromptIntent,
+    AnswerIntent,
+    Running,
+    Uncertain,
+    StopRequested,
+    Stopped,
+    NeedsHuman,
+    Failed,
+    Completed,
+    Reviewed,
+}
+
+impl WorkerStatus {
+    pub fn reserves_capacity(&self) -> bool {
+        matches!(
+            self,
+            Self::LaunchIntent
+                | Self::OpenIntent
+                | Self::AgentIntent
+                | Self::PromptIntent
+                | Self::AnswerIntent
+                | Self::Running
+                | Self::Uncertain
+                | Self::StopRequested
+        )
+    }
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -220,6 +352,7 @@ pub fn attach(
                 "First attachment: explicit Start required; GitHub tracker reads begin with runtime reconciliation"
                     .into(),
             history: vec![],
+            workers: WorkerState::default(),
         };
         atomic_json(&path, &state)?;
         state

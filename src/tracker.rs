@@ -64,6 +64,8 @@ pub struct FrontierTicket {
     pub number: u64,
     pub title: String,
     pub assignees: Vec<String>,
+    pub labels: Vec<String>,
+    pub body: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -217,6 +219,16 @@ impl GitHub {
                 number,
                 title: issue["title"].as_str().unwrap_or_default().to_owned(),
                 assignees: vec![],
+                labels: issue["labels"]
+                    .as_array()
+                    .map(|labels| {
+                        labels
+                            .iter()
+                            .filter_map(|label| label["name"].as_str().map(str::to_owned))
+                            .collect()
+                    })
+                    .unwrap_or_default(),
+                body: issue["body"].as_str().unwrap_or_default().to_owned(),
             });
         }
         Ok(frontier)
@@ -349,6 +361,21 @@ impl GitHub {
         state_dir: &Path,
     ) -> Result<String> {
         let _lock = Lock::acquire(&state_dir.join("state.lock"))?;
+        self.claim_inner(map, ticket, assignee, state_dir)
+    }
+
+    /// Runtime variant; the single per-map runtime already owns state.lock.
+    pub fn claim_for_runtime(&self, map: &MapRef, ticket: u64, state_dir: &Path) -> Result<String> {
+        self.claim_inner(map, ticket, None, state_dir)
+    }
+
+    fn claim_inner(
+        &self,
+        map: &MapRef,
+        ticket: u64,
+        assignee: Option<&str>,
+        state_dir: &Path,
+    ) -> Result<String> {
         self.require_execution_override(map)?;
         let login = match assignee {
             Some("@me") | None => self.get("user")?["login"]
@@ -443,6 +470,40 @@ impl GitHub {
             Ok(after)
         })?;
         Ok(login)
+    }
+
+    /// Read the current map children only when the execution override is explicit.
+    pub fn dispatch_frontier(&self, map: &MapRef) -> Result<Vec<FrontierTicket>> {
+        self.require_execution_override(map)?;
+        self.frontier(map)
+    }
+
+    /// Recheck a locally claimed task before treating worker output as evidence.
+    pub fn confirm_claim(&self, map: &MapRef, ticket: u64, login: &str) -> Result<()> {
+        let children = self.subissues(map)?;
+        ensure!(
+            children.iter().any(|child| child["number"] == ticket),
+            "ticket was removed from the map; worker result requires reconciliation"
+        );
+        let issue = self.issue(map, ticket)?;
+        ensure!(
+            issue["state"] == "open",
+            "ticket was closed externally; closure does not establish worker success"
+        );
+        let assignees = issue["assignees"]
+            .as_array()
+            .context("issue omitted assignees")?;
+        ensure!(
+            assignees.len() == 1 && assignees[0]["login"] == login,
+            "ticket assignment changed; worker result requires reconciliation"
+        );
+        ensure!(
+            self.blockers(map, ticket)?
+                .iter()
+                .all(|blocker| blocker["state"] == "closed"),
+            "ticket now has an open blocker; worker result requires reconciliation"
+        );
+        Ok(())
     }
 
     pub fn resolve(

@@ -2,8 +2,9 @@ use anyhow::{Context, Result, ensure};
 use clap::{Parser, Subcommand};
 use std::{env, fs, path::PathBuf, process::Command};
 use wayfinder_herdr::{
+    herdr::Client,
     runtime,
-    store::{self, Binding, RequestKind},
+    store::{self, Binding, Lock, Provider, RequestKind, WorkerRun, WorkerStatus},
     tracker::{self, MapRef, TicketInput},
 };
 
@@ -53,6 +54,57 @@ enum CommandName {
     Status {
         #[arg(long)]
         map: String,
+    },
+    /// Configure the provider used for delegated worker roles.
+    ConfigureWorker {
+        #[arg(long)]
+        map: String,
+        /// One of researcher, implementer, reviewer; omit to set shared defaults.
+        #[arg(long)]
+        role: Option<String>,
+        #[arg(long, default_value = "codex")]
+        kind: String,
+        #[arg(long)]
+        model: Option<String>,
+        #[arg(long)]
+        reasoning_effort: Option<String>,
+        /// Provider-specific CLI argument. Repeat to pass multiple argv entries.
+        #[arg(long = "arg")]
+        args: Vec<String>,
+        #[arg(long)]
+        concurrency: Option<u32>,
+    },
+    /// Durably stop one worker pane. Its claim and artifacts remain retained.
+    StopWorker {
+        #[arg(long)]
+        map: String,
+        #[arg(long)]
+        run: String,
+    },
+    /// Submit an actual human answer to a worker blocked on a question.
+    AnswerWorker {
+        #[arg(long)]
+        map: String,
+        #[arg(long)]
+        run: String,
+        #[arg(long)]
+        response: String,
+    },
+    /// Resume a retained attempt. Uncertain workers require explicit absence confirmation.
+    RetryWorker {
+        #[arg(long)]
+        map: String,
+        #[arg(long)]
+        run: String,
+        #[arg(long)]
+        confirmed_absent_or_stopped: bool,
+    },
+    /// Record an abandonment decision without implying termination or deleting artifacts.
+    AbandonWorker {
+        #[arg(long)]
+        map: String,
+        #[arg(long)]
+        run: String,
     },
     /// Short startup/hook request. Never authorizes dispatch.
     Reconcile {
@@ -253,6 +305,279 @@ fn run() -> Result<()> {
             println!(
                 "{}",
                 serde_json::to_string_pretty(&store::read_state(&store::map_dir(&root, &key)?)?)?
+            );
+        }
+        CommandName::ConfigureWorker {
+            map,
+            role,
+            kind,
+            model,
+            reasoning_effort,
+            args,
+            concurrency,
+        } => {
+            let (_, dir) = tracker_context(&root, &map)?;
+            if let Some(role) = &role {
+                ensure!(
+                    ["orchestrator", "researcher", "implementer", "reviewer"]
+                        .contains(&role.as_str()),
+                    "role must be orchestrator, researcher, implementer, or reviewer"
+                );
+            }
+            let providers = [
+                "pi",
+                "claude",
+                "codex",
+                "gemini",
+                "cursor",
+                "devin",
+                "agy",
+                "cline",
+                "omp",
+                "mastracode",
+                "opencode",
+                "copilot",
+                "kimi",
+                "kiro",
+                "droid",
+                "amp",
+                "grok",
+                "hermes",
+                "kilo",
+                "qodercli",
+                "qwen",
+                "letta",
+                "maki",
+                "muse",
+            ];
+            ensure!(
+                providers.contains(&kind.as_str()),
+                "provider kind is not supported by herdr 0.9.3"
+            );
+            if let Some(concurrency) = concurrency {
+                ensure!((1..=32).contains(&concurrency), "concurrency must be 1..32");
+            }
+            let _lock = Lock::acquire(&dir.join("state.lock"))?;
+            let mut state = store::read_state(&dir)?;
+            let provider = Provider {
+                kind,
+                model,
+                reasoning_effort,
+                args,
+            };
+            if let Some(role) = role {
+                state.workers.providers.roles.insert(role, provider);
+            } else {
+                state.workers.providers.default = provider;
+            }
+            if let Some(concurrency) = concurrency {
+                state.concurrency = concurrency;
+            }
+            store::atomic_json(&dir.join("state.json"), &state)?;
+            println!(
+                "Worker provider configuration updated; existing runs retain their recorded provider-independent identity."
+            );
+        }
+        CommandName::StopWorker { map, run } => {
+            let (_, dir) = tracker_context(&root, &map)?;
+            let _lock = Lock::acquire(&dir.join("state.lock"))?;
+            let mut state = store::read_state(&dir)?;
+            let worker = state
+                .workers
+                .runs
+                .iter_mut()
+                .find(|worker| worker.id == run)
+                .context("worker run not found")?;
+            ensure!(
+                worker.status == WorkerStatus::Running,
+                "only a confirmed running worker can be stopped; uncertain and blocked runs require reconciliation"
+            );
+            let pane = worker
+                .pane_id
+                .clone()
+                .context("running worker has no owned pane")?;
+            worker.status = WorkerStatus::StopRequested;
+            worker.question =
+                Some("Stop requested by the human; claim and worktree will be retained.".into());
+            store::atomic_json(&dir.join("state.json"), &state)?;
+            let herdr = Client::new(&state.binding.socket);
+            match herdr.close_pane(&pane) {
+                Ok(_) => {
+                    let worker = state
+                        .workers
+                        .runs
+                        .iter_mut()
+                        .find(|worker| worker.id == run)
+                        .unwrap();
+                    worker.status = WorkerStatus::Stopped;
+                    worker.human_decision =
+                        Some("human requested stop; Herdr confirmed pane close".into());
+                    store::atomic_json(&dir.join("state.json"), &state)?;
+                    println!("Worker stop confirmed; claim and worktree remain retained.");
+                }
+                Err(error) => {
+                    let worker = state
+                        .workers
+                        .runs
+                        .iter_mut()
+                        .find(|worker| worker.id == run)
+                        .unwrap();
+                    worker.status = WorkerStatus::Uncertain;
+                    worker.question = Some(format!(
+                        "Stop outcome is uncertain; do not retry without confirming the worker is absent: {error:#}"
+                    ));
+                    store::atomic_json(&dir.join("state.json"), &state)?;
+                    anyhow::bail!(
+                        "stop outcome is uncertain; inspect pane {pane} and status before retrying: {error:#}"
+                    );
+                }
+            }
+        }
+        CommandName::AnswerWorker { map, run, response } => {
+            ensure!(
+                !response.trim().is_empty(),
+                "human response cannot be empty"
+            );
+            let (_, dir) = tracker_context(&root, &map)?;
+            let _lock = Lock::acquire(&dir.join("state.lock"))?;
+            let mut state = store::read_state(&dir)?;
+            let worker = state
+                .workers
+                .runs
+                .iter_mut()
+                .find(|worker| worker.id == run)
+                .context("worker run not found")?;
+            ensure!(
+                worker.status == WorkerStatus::NeedsHuman,
+                "worker has no pending human question"
+            );
+            let pane = worker
+                .pane_id
+                .clone()
+                .context("blocked worker has no owned pane")?;
+            worker.human_response = Some(response.clone());
+            worker.status = WorkerStatus::AnswerIntent;
+            store::atomic_json(&dir.join("state.json"), &state)?;
+            let herdr = Client::new(&state.binding.socket);
+            match herdr.prompt(&pane, &response) {
+                Ok(_) => {
+                    let worker = state
+                        .workers
+                        .runs
+                        .iter_mut()
+                        .find(|worker| worker.id == run)
+                        .unwrap();
+                    worker.status = WorkerStatus::Running;
+                    worker.question = None;
+                    worker.human_decision = Some("human response submitted".into());
+                    store::atomic_json(&dir.join("state.json"), &state)?;
+                    println!("Human response submitted to owned pane {pane}.");
+                }
+                Err(error) => {
+                    let worker = state
+                        .workers
+                        .runs
+                        .iter_mut()
+                        .find(|worker| worker.id == run)
+                        .unwrap();
+                    worker.status = WorkerStatus::Uncertain;
+                    worker.question = Some(format!(
+                        "Human response submission is ambiguous; it was not repeated: {error:#}"
+                    ));
+                    store::atomic_json(&dir.join("state.json"), &state)?;
+                    anyhow::bail!(
+                        "response submission uncertain; inspect pane {pane} and status before retrying: {error:#}"
+                    );
+                }
+            }
+        }
+        CommandName::RetryWorker {
+            map,
+            run,
+            confirmed_absent_or_stopped,
+        } => {
+            let (_, dir) = tracker_context(&root, &map)?;
+            let _lock = Lock::acquire(&dir.join("state.lock"))?;
+            let mut state = store::read_state(&dir)?;
+            let old = state
+                .workers
+                .runs
+                .iter()
+                .position(|worker| worker.id == run)
+                .context("worker run not found")?;
+            let prior = state.workers.runs[old].clone();
+            ensure!(
+                matches!(prior.status, WorkerStatus::Stopped | WorkerStatus::Failed)
+                    || (confirmed_absent_or_stopped
+                        && matches!(
+                            prior.status,
+                            WorkerStatus::Uncertain | WorkerStatus::NeedsHuman
+                        )),
+                "retry requires a stopped/failed worker, or --confirmed-absent-or-stopped for an uncertain worker"
+            );
+            ensure!(
+                prior.status != WorkerStatus::Running
+                    && prior.status != WorkerStatus::StopRequested,
+                "an active worker cannot be retried"
+            );
+            state.workers.runs[old].human_decision = Some(if confirmed_absent_or_stopped {
+                "human confirmed previous worker absent or stopped".into()
+            } else {
+                "human resumed confirmed stopped/failed worker".into()
+            });
+            if confirmed_absent_or_stopped {
+                state.workers.runs[old].status = WorkerStatus::Stopped;
+            }
+            state.workers.next_run = state.workers.next_run.saturating_add(1);
+            let number = state.workers.next_run;
+            let map_ref = MapRef::parse(&state.map)?;
+            let worktree = state
+                .binding
+                .repository
+                .parent()
+                .unwrap_or(&state.binding.repository)
+                .join(format!(
+                    ".wayfinder-{}-{}-{number}",
+                    map_ref.number, prior.ticket
+                ));
+            state.workers.runs.push(WorkerRun {
+                id: format!("run-{number:020}"), ticket: prior.ticket, role: prior.role.clone(), attempt: prior.attempt.saturating_add(1), automatic_retries: 0, rework_round: prior.rework_round,
+                status: WorkerStatus::Queued, worktree, workspace_id: None, tab_id: None, pane_id: None,
+                base_commit: prior.result_commit.clone().or(prior.base_commit.clone()), result_commit: None,
+                summary: None, question: None, human_response: None, human_decision: None,
+                source_run: Some(prior.id), claim_login: prior.claim_login, context: Some("Human explicitly authorized this retry after the preceding worker was confirmed stopped or absent.".into()), last_activity_ms: None,
+            });
+            store::atomic_json(&dir.join("state.json"), &state)?;
+            println!(
+                "Retry intent durably recorded as run-{:020}; runtime will honor map capacity and reconcile before dispatch.",
+                number
+            );
+        }
+        CommandName::AbandonWorker { map, run } => {
+            let (_, dir) = tracker_context(&root, &map)?;
+            let _lock = Lock::acquire(&dir.join("state.lock"))?;
+            let mut state = store::read_state(&dir)?;
+            let worker = state
+                .workers
+                .runs
+                .iter_mut()
+                .find(|worker| worker.id == run)
+                .context("worker run not found")?;
+            ensure!(
+                matches!(
+                    worker.status,
+                    WorkerStatus::Uncertain
+                        | WorkerStatus::NeedsHuman
+                        | WorkerStatus::Stopped
+                        | WorkerStatus::Failed
+                ),
+                "only retained or settled work can be abandoned"
+            );
+            worker.human_decision =
+                Some("human selected abandon; keep resources and artifacts retained".into());
+            store::atomic_json(&dir.join("state.json"), &state)?;
+            println!(
+                "Abandon decision recorded; this does not prove termination, release uncertain capacity, or remove artifacts."
             );
         }
         CommandName::Reconcile { map: Some(map) } => request(&root, &map, RequestKind::Reconcile)?,

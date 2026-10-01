@@ -6,7 +6,7 @@ A Rust plugin foundation for one orchestrating chat to coordinate a map, delegat
 - [Specification](https://github.com/Quinten1505/wayfinder-herdr/issues/10)
 - [Tracker conventions](docs/agents/issue-tracker.md)
 
-The runtime foundation and GitHub map/ticket workflow are implemented. Worker dispatch, human decision routing, reviews, and feature integration are subsequent tickets. **No workers are launched by this release, including after Start.** Installation is not dispatch authorization.
+The runtime and GitHub map/ticket workflow dispatch ready research and task tickets to role-configured Herdr agents. Implementers and independent reviewers use separate detached-HEAD worktrees. Ticket results remain local evidence; review, ticket integration, and feature PR handoff are subsequent work. Installation is not dispatch authorization.
 
 ## Build and install
 
@@ -37,7 +37,32 @@ Attach binds the repository, herdr executable, and socket, initializes state as 
 
 The Start, Pause, Resume, and Status plugin actions select the unique attached map matching the invoking workspace and herdr socket. If multiple maps match, use the CLI with `--map`. Start/Pause/Resume return when a request has been durably queued; inspect status for its applied outcome. A first Resume cannot substitute for explicit Start. Pause prevents future dispatch authorization; it does not cancel work. Startup and lifecycle hooks only queue reconciliation requests.
 
-The runtime checks host compatibility and plugin enablement, reads the map's ordered frontier, and stores a local frontier snapshot. It does not launch workers. A compatible host and a Start request alone cannot permit dispatch.
+The runtime checks host compatibility and plugin enablement, reconciles the map's ordered frontier, and dispatches only after explicit Start and a map execution override. Researchers handle `wayfinder:research` and `wayfinder:prototype`; implementers handle `wayfinder:task`. Decision/grilling tickets remain for the orchestrator. Herdr worktree opening uses normal repository trust behavior and never changes trust automatically.
+
+Configure shared defaults or a role override. Provider-specific argv is passed as separate arguments:
+
+```sh
+wayfinder-herdr configure-worker --map OWNER/REPOSITORY#NUMBER \
+  --role implementer --kind codex --model MODEL --reasoning-effort high
+wayfinder-herdr configure-worker --map OWNER/REPOSITORY#NUMBER \
+  --role reviewer --kind codex --arg=--full-auto --concurrency 2
+```
+
+Roles are `orchestrator`, `researcher`, `implementer`, and `reviewer`; concurrency is shared across delegated roles and defaults to three. Reviews are selected before other queued work when capacity opens. The runtime writes a durable run intent before claiming a ticket or creating resources. It uses `git worktree add --detach`, then opens that exact checkout through the bound Herdr socket, with explicit returned workspace/tab/pane IDs. It never creates a ticket branch.
+
+Workers are prompted to read the actual ticket, map, linked spec (when present), and accepted comments using repository-qualified GitHub identities. Their `.wayfinder-result.json` is correlated by run and ticket ID. A settled Herdr status alone is never accepted as success. Implementations must identify a clean committed HEAD; reviewers must identify the exact pinned commit. Uncertain launch/stop state retains its capacity, claim, checkout, and output rather than triggering a duplicate worker. The runtime caps automatic retries at two after confirmed worker failures and permits three separate review/rework rounds.
+
+Status displays run identities, worker questions and retained resources. The CLI exposes explicit controls for blocked/uncertain work:
+
+```sh
+wayfinder-herdr status --map OWNER/REPOSITORY#NUMBER
+wayfinder-herdr answer-worker --map OWNER/REPOSITORY#NUMBER --run RUN_ID --response "the human's actual answer"
+wayfinder-herdr stop-worker --map OWNER/REPOSITORY#NUMBER --run RUN_ID
+wayfinder-herdr retry-worker --map OWNER/REPOSITORY#NUMBER --run RUN_ID --confirmed-absent-or-stopped
+wayfinder-herdr abandon-worker --map OWNER/REPOSITORY#NUMBER --run RUN_ID
+```
+
+Answer submits exactly the provided human response. An ambiguous answer or stop is not resent automatically. Retrying an uncertain worker requires the caller to explicitly confirm that the prior worker is absent or stopped. Abandoning records the human decision but does not prove termination, release uncertain capacity, or delete retained work.
 
 ## GitHub map and ticket workflow
 
@@ -87,3 +112,5 @@ python3 tests/install_smoke.py
 The installer smoke test builds and links in temporary XDG directories, substitutes a recording-only `systemctl`, and validates the generated unit with `systemd-analyze`; it does not start a live service.
 
 Tests cover exclusive runtimes, durable requests and authorization across restart, replay, corrupt/future state preservation, host compatibility and disabled plugins. The isolated herdr/Codex walkthrough and complete workflow acceptance belong to [Prove installation and the complete workflow in an isolated live session](https://github.com/Quinten1505/wayfinder-herdr/issues/16).
+
+Detached worktree and socket dispatch acceptance tests are included in `tests/dispatch.rs`. They are ignored in managed environments that deny binding a disposable Unix socket; run them in an environment where isolated Unix sockets are permitted. The tracker issue body and spec remain human-owned and are never refreshed by worker automation; map/spec updates use append-only comments with body refresh pending for a human.
