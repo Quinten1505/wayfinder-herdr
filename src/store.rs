@@ -144,6 +144,9 @@ pub struct WorkerRun {
     pub answer_request_id: Option<String>,
     #[serde(default)]
     pub answer_request_kind: Option<HumanRequestKind>,
+    /// Append-only local evidence for each human answer attempt.
+    #[serde(default)]
+    pub answer_history: Vec<HumanAnswerEvidence>,
     #[serde(default)]
     pub source_run: Option<String>,
     #[serde(default)]
@@ -174,6 +177,25 @@ pub struct WorkerRun {
 pub enum HumanRequestKind {
     WorkerQuestion,
     HerdrBlockedUi,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct HumanAnswerEvidence {
+    pub request_id: String,
+    pub request_kind: HumanRequestKind,
+    pub response: String,
+    pub disposition: AnswerDisposition,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AnswerDisposition {
+    Intent,
+    ManualRequired,
+    Submitted,
+    RejectedBeforeEffect,
+    Uncertain,
 }
 
 impl HumanRequestKind {
@@ -256,6 +278,7 @@ impl WorkerStatus {
                 | Self::Running
                 | Self::Uncertain
                 | Self::StopRequested
+                | Self::NeedsHuman
         )
     }
 }

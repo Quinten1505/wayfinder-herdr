@@ -56,13 +56,15 @@ Status displays run identities, worker questions and retained resources. The CLI
 
 ```sh
 wayfinder-herdr status --map OWNER/REPOSITORY#NUMBER
-wayfinder-herdr answer-worker --map OWNER/REPOSITORY#NUMBER --run RUN_ID --response "the human's actual answer"
+wayfinder-herdr answer-worker --map OWNER/REPOSITORY#NUMBER --run RUN_ID \
+  --request-id HUMAN_REQUEST_ID --request-type worker_question \
+  --response "the human's actual answer"
 wayfinder-herdr stop-worker --map OWNER/REPOSITORY#NUMBER --run RUN_ID
 wayfinder-herdr retry-worker --map OWNER/REPOSITORY#NUMBER --run RUN_ID --confirmed-absent-or-stopped
 wayfinder-herdr abandon-worker --map OWNER/REPOSITORY#NUMBER --run RUN_ID
 ```
 
-Answer submits exactly the provided human response. An ambiguous answer or stop is not resent automatically. Retrying an uncertain worker requires the caller to explicitly confirm that the prior worker is absent or stopped. Abandoning records the human decision but does not prove termination, release uncertain capacity, or delete retained work.
+`answer-worker` requires the exact pending request ID and type shown by `status`. For a recorded worker question (`worker_question`), it submits the provided human response through Herdr's occupant-pinned `agent.prompt` API, after verifying worker identity. If Herdr reports that the worker has entered a recognized approval or question UI (`herdr_blocked_ui`), `answer-worker` retains the supplied answer and request evidence but does not send input. Open the named Herdr pane, inspect and answer that UI directly, then run `reconcile`; the worker keeps its capacity and retained evidence until its later state can be observed. A worker question that races into a blocked UI gets a fresh manual-interaction request, and the earlier answer is retained without replay. Ambiguous answer or stop outcomes are not resent automatically. Retrying an uncertain worker requires the caller to explicitly confirm that the prior worker is absent or stopped. Abandoning records the human decision but does not prove termination, release uncertain capacity, or delete retained work.
 
 ## GitHub map and ticket workflow
 

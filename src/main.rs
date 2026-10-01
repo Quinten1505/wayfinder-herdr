@@ -5,7 +5,8 @@ use wayfinder_herdr::{
     herdr::Client,
     runtime,
     store::{
-        self, Binding, HumanRequestKind, Lock, Provider, RequestKind, WorkerRun, WorkerStatus,
+        self, AnswerDisposition, Binding, HumanAnswerEvidence, HumanRequestKind, Lock, Provider,
+        RequestKind, WorkerRun, WorkerStatus,
     },
     tracker::{self, MapRef, TicketInput},
 };
@@ -83,7 +84,7 @@ enum CommandName {
         #[arg(long)]
         run: String,
     },
-    /// Submit an actual human answer to a worker blocked on a question.
+    /// Answer a recorded worker question or retain a manual-pane response.
     AnswerWorker {
         #[arg(long)]
         map: String,
@@ -519,6 +520,20 @@ fn run() -> Result<()> {
                         "the blocked Herdr prompt changed; review the updated prompt and use its new request ID/type"
                     );
                 }
+                let pending = &mut state.workers.runs[index];
+                pending.human_response = Some(response.clone());
+                pending.answer_request_id = Some(request_id.clone());
+                pending.answer_request_kind = Some(request_kind);
+                pending.answer_history.push(HumanAnswerEvidence {
+                    request_id: request_id.clone(),
+                    request_kind,
+                    response,
+                    disposition: AnswerDisposition::ManualRequired,
+                });
+                store::atomic_json(&dir.join("state.json"), &state)?;
+                anyhow::bail!(
+                    "Herdr blocked UI responses are not sent automatically. Open the named pane {pane}, inspect the current approval/question, and interact with it directly; then run `wayfinder-herdr reconcile --map {map}`. The worker remains needs_human and retains capacity and evidence"
+                );
             } else if agent_status == "blocked" {
                 let current = herdr.read_recent(&pane)?["read"]["text"]
                     .as_str()
@@ -540,17 +555,24 @@ fn run() -> Result<()> {
             state.workers.runs[index].human_response = Some(response.clone());
             state.workers.runs[index].answer_request_id = Some(request_id.clone());
             state.workers.runs[index].answer_request_kind = Some(request_kind);
+            state.workers.runs[index]
+                .answer_history
+                .push(HumanAnswerEvidence {
+                    request_id: request_id.clone(),
+                    request_kind,
+                    response: response.clone(),
+                    disposition: AnswerDisposition::Intent,
+                });
             state.workers.runs[index].status = WorkerStatus::AnswerIntent;
             store::atomic_json(&dir.join("state.json"), &state)?;
-            let delivery = match request_kind {
-                HumanRequestKind::WorkerQuestion => herdr.prompt(&pane, &response),
-                HumanRequestKind::HerdrBlockedUi => herdr.answer_blocked_ui(&pane, &response),
-            };
-            match delivery {
+            match herdr.prompt(&pane, &response) {
                 Ok(_) => {
                     let observed = wayfinder_herdr::herdr::inspect_worker(&herdr, &worker);
                     if let Err(error) = observed {
                         state.workers.runs[index].status = WorkerStatus::Uncertain;
+                        if let Some(answer) = state.workers.runs[index].answer_history.last_mut() {
+                            answer.disposition = AnswerDisposition::Uncertain;
+                        }
                         state.workers.runs[index].question = Some(format!(
                             "Human response may have been submitted but worker identity changed; it was not repeated: {error:#}"
                         ));
@@ -571,6 +593,9 @@ fn run() -> Result<()> {
                     worker.human_request_id = None;
                     worker.human_request_kind = None;
                     worker.human_request_fingerprint = None;
+                    if let Some(answer) = worker.answer_history.last_mut() {
+                        answer.disposition = AnswerDisposition::Submitted;
+                    }
                     store::atomic_json(&dir.join("state.json"), &state)?;
                     println!("Human response submitted to owned pane {pane}.");
                 }
@@ -586,6 +611,9 @@ fn run() -> Result<()> {
                         .as_str().context("Herdr rejected the worker prompt as blocked and omitted its current prompt")?.to_owned();
                     let worker = &mut state.workers.runs[index];
                     worker.status = WorkerStatus::NeedsHuman;
+                    if let Some(answer) = worker.answer_history.last_mut() {
+                        answer.disposition = AnswerDisposition::RejectedBeforeEffect;
+                    }
                     worker.set_human_request(HumanRequestKind::HerdrBlockedUi, &question);
                     worker.question = Some(question);
                     store::atomic_json(&dir.join("state.json"), &state)?;
@@ -596,6 +624,9 @@ fn run() -> Result<()> {
                 Err(error) => {
                     let worker = &mut state.workers.runs[index];
                     worker.status = WorkerStatus::Uncertain;
+                    if let Some(answer) = worker.answer_history.last_mut() {
+                        answer.disposition = AnswerDisposition::Uncertain;
+                    }
                     worker.question = Some(format!(
                         "Human response submission is ambiguous; it was not repeated: {error:#}"
                     ));
@@ -662,6 +693,7 @@ fn run() -> Result<()> {
                 summary: None, question: None, human_response: None, human_decision: None,
                 human_request_seq: 0, human_request_id: None, human_request_kind: None,
                 human_request_fingerprint: None, answer_request_id: None, answer_request_kind: None,
+                answer_history: Vec::new(),
                 source_run: Some(prior.id), claim_login: prior.claim_login, context: Some("Human explicitly authorized this retry after the preceding worker was confirmed stopped or absent.".into()), last_activity_ms: None, terminal_id: None, agent_provider: None, agent_session: None, foreground_process: None, result_evidence: None,
             });
             store::atomic_json(&dir.join("state.json"), &state)?;

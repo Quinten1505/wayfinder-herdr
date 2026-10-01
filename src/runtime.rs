@@ -215,6 +215,7 @@ fn new_run(state: &mut State, request: NewRun<'_>) {
         human_request_fingerprint: None,
         answer_request_id: None,
         answer_request_kind: None,
+        answer_history: Vec::new(),
         source_run,
         claim_login: None,
         context,
@@ -247,7 +248,8 @@ fn reconcile_workers(
                     | WorkerStatus::PromptIntent
                     | WorkerStatus::AnswerIntent
                     | WorkerStatus::StopRequested
-            )
+            ) || (r.status == WorkerStatus::NeedsHuman
+                && r.human_request_kind == Some(crate::store::HumanRequestKind::HerdrBlockedUi))
         })
         .map(|r| r.id.clone())
         .collect();
@@ -268,6 +270,11 @@ fn reconcile_workers(
                 let _ = herdr.agent(pane);
             }
             state.workers.runs[i].status = WorkerStatus::Uncertain;
+            if let Some(answer) = state.workers.runs[i].answer_history.last_mut()
+                && answer.disposition == crate::store::AnswerDisposition::Intent
+            {
+                answer.disposition = crate::store::AnswerDisposition::Uncertain;
+            }
             state.workers.runs[i].question = Some("A Herdr start or prompt may have taken effect before restart; it was not repeated. Inspect the owned pane and explicitly reconcile this run.".into());
             save(dir, state)?;
             continue;
@@ -317,7 +324,21 @@ fn reconcile_workers(
         }
         match status(&info).unwrap_or("unknown") {
             "working" => {
-                state.workers.runs[i].last_activity_ms = Some(now_ms());
+                let worker = &mut state.workers.runs[i];
+                worker.last_activity_ms = Some(now_ms());
+                if worker.status == WorkerStatus::NeedsHuman
+                    && worker.human_request_kind
+                        == Some(crate::store::HumanRequestKind::HerdrBlockedUi)
+                {
+                    // The human interacted with the named Herdr UI outside this
+                    // process. Observed activity resumes supervision; it does not
+                    // claim the task is complete or synthesize an answer.
+                    worker.status = WorkerStatus::Running;
+                    worker.question = None;
+                    worker.human_request_id = None;
+                    worker.human_request_kind = None;
+                    worker.human_request_fingerprint = None;
+                }
                 save(dir, state)?;
             }
             "blocked" => {

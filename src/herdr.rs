@@ -340,16 +340,6 @@ impl Client {
         self.request("pane.process_info", json!({"pane_id":pane_id}))
     }
 
-    /// Submit text to the explicitly-owned pane and press Enter as one Herdr
-    /// operation. This is used only after a correlated blocked UI snapshot has
-    /// been re-read and matched; agent.prompt rejects recognized blocked agents.
-    pub fn answer_blocked_ui(&self, pane_id: &str, text: &str) -> Result<Value> {
-        self.request(
-            "pane.send_input",
-            json!({"pane_id":pane_id,"text":text,"keys":["enter"]}),
-        )
-    }
-
     pub fn read_recent(&self, pane_id: &str) -> Result<Value> {
         self.request(
             "agent.read",
