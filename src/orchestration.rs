@@ -30,6 +30,10 @@ struct OutboundMessage {
     id: String,
     text: String,
     status: MessageStatus,
+    /// Stable human-question identities carried by a grouped transport message.
+    /// Missing in issue-14 outboxes; those are reconciled through legacy IDs.
+    #[serde(default)]
+    constituents: Vec<String>,
     #[serde(default)]
     resolution_history: Vec<DeliveryResolution>,
 }
@@ -71,6 +75,14 @@ pub struct SchedulerDecisionNotice {
     /// true for deferred and legacy response-only records as well as unanswered
     /// requests, and false only after continue/abandon was applied.
     pub action_required: bool,
+}
+
+#[derive(Debug, Clone)]
+struct HumanQuestionNotice {
+    identity: String,
+    legacy_ids: Vec<String>,
+    legacy_marker: Option<String>,
+    text: String,
 }
 
 pub fn open_chat(root: &Path, requested_map: Option<&str>) -> Result<()> {
@@ -574,8 +586,9 @@ pub fn reconcile(
         return Ok(());
     }
     let map = MapRef::parse(&state.map)?;
+    let mut questions = build_worker_question_notices(state, github, &map)?;
+    questions.extend(build_scheduler_decision_notices(&map, scheduler_decisions)?);
     let mut notices = build_notices(state, github, &map)?;
-    notices.extend(build_scheduler_decision_notices(&map, scheduler_decisions)?);
     if !ticket_milestones.is_empty() {
         let text = format!(
             "Ticket delivery milestones (durable integration/review state):\n{}",
@@ -584,12 +597,38 @@ pub fn reconcile(
         notices.push((message_id(&text), text));
     }
     let mut outbox = read_outbox(dir)?;
+    let new_questions = uncovered_questions(questions, &outbox);
+    if !new_questions.is_empty() {
+        let mut identities = new_questions
+            .iter()
+            .map(|question| question.identity.clone())
+            .collect::<Vec<_>>();
+        identities.sort();
+        identities.dedup();
+        let joined = identities.join("\n");
+        let text = format!(
+            "Independent human decisions are pending. Present these independent questions together as one grouped round. Preserve each request's title/link, exact request ID and type, and its own answer/action command. Give a recommendation grounded in the relevant ticket/spec evidence and identify the work each answer unblocks. Never answer for the human. Wait for real human responses and record each exact response only against its matching request.\n\n{}",
+            new_questions
+                .iter()
+                .map(|question| question.text.as_str())
+                .collect::<Vec<_>>()
+                .join("\n\n")
+        );
+        outbox.messages.push(OutboundMessage {
+            id: message_id(&format!("human-question-round:{joined}")),
+            text,
+            status: MessageStatus::Pending,
+            constituents: identities,
+            resolution_history: Vec::new(),
+        });
+    }
     for (id, text) in notices {
         if !outbox.messages.iter().any(|message| message.id == id) {
             outbox.messages.push(OutboundMessage {
                 id,
                 text,
                 status: MessageStatus::Pending,
+                constituents: Vec::new(),
                 resolution_history: Vec::new(),
             });
         }
@@ -648,7 +687,7 @@ pub fn reconcile(
 fn build_scheduler_decision_notices(
     map: &MapRef,
     decisions: &[SchedulerDecisionNotice],
-) -> Result<Vec<(String, String)>> {
+) -> Result<Vec<HumanQuestionNotice>> {
     decisions
         .iter()
         .filter(|decision| decision.action_required)
@@ -669,10 +708,10 @@ fn build_scheduler_decision_notices(
                 })
                 .unwrap_or_default();
             let text = format!(
-                "A scheduler decision is needed for {}. The review or conflict retry budget is exhausted (associated run {}; request ID {}). {}\n\n{}Ask the human to choose one explicit disposition: continue for one bounded rework, defer (keep the ticket held while releasing only proven-completed worker capacity), or abandon (retain artifacts and never count unimplemented work as integrated or ready). Recommend an action using retained review/conflict evidence; keep evidence details in worker/reviewer panes. Preserve the human's exact response verbatim and record the chosen disposition separately; never infer an action from response text. This decision may outlive the worker; never use answer-worker or send input to its pane. After a genuine human response in this chat, record it locally with `{}` `answer-decision --map {}/{}#{} --request-id {} --response RESPONSE --disposition continue|defer|abandon`; this does not contact Herdr.",
+                "Scheduler decision for {} (request ID {}; type scheduler_decision; related run {}). {}\n{}Ask the human to choose one explicit disposition: continue for one bounded implementation rework, defer to keep this ticket held while releasing only proven-completed worker capacity, or abandon to retain artifacts without claiming unimplemented work is integrated or ready. Work unblocked: the linked ticket's explicitly selected follow-up; abandonment does not satisfy integration/readiness. Recommend using retained review/conflict evidence; keep details in the worker/reviewer pane. Preserve any human response exactly and record it separately from the disposition; never infer an action from response text. This may outlive the worker. Never use answer-worker or send input to its pane. After a genuine human response, record it locally with `{}` `answer-decision --map {}/{}#{} --request-id {} --response RESPONSE --disposition continue|defer|abandon`; this does not contact Herdr.",
                 decision.ticket_link,
-                decision.run_id,
                 decision.request_id,
+                decision.run_id,
                 question,
                 previous_response,
                 env::current_exe()
@@ -683,14 +722,125 @@ fn build_scheduler_decision_notices(
                 map.number,
                 decision.request_id,
             );
-            Ok((
-                message_id(&format!(
-                    "scheduler-decision:{}:{}",
-                    decision.request_id,
-                    decision.response.as_deref().unwrap_or("unanswered")
-                )),
+            let (identity, legacy_ids) = scheduler_question_identity(decision);
+            Ok(HumanQuestionNotice {
+                identity,
+                legacy_ids,
+                legacy_marker: None,
                 text,
-            ))
+            })
+        })
+        .collect()
+}
+
+fn scheduler_question_identity(decision: &SchedulerDecisionNotice) -> (String, Vec<String>) {
+    let (identity, legacy_identity) = match decision.response.as_deref() {
+        None => (
+            format!("scheduler:{}:unanswered", decision.request_id),
+            vec![
+                format!("scheduler-decision:{}", decision.request_id),
+                format!("scheduler-decision:{}:unanswered", decision.request_id),
+            ],
+        ),
+        Some(response) => {
+            let digest = Sha256::digest(response.as_bytes());
+            let fingerprint = digest
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>();
+            (
+                format!("scheduler:{}:response:{fingerprint}", decision.request_id),
+                vec![format!(
+                    "scheduler-decision:{}:{response}",
+                    decision.request_id
+                )],
+            )
+        }
+    };
+    (
+        identity,
+        legacy_identity
+            .into_iter()
+            .map(|identity| message_id(&identity))
+            .collect(),
+    )
+}
+
+fn message_covers_question(message: &OutboundMessage, question: &HumanQuestionNotice) -> bool {
+    message.constituents.contains(&question.identity)
+        || question.legacy_ids.contains(&message.id)
+        || question
+            .legacy_marker
+            .as_ref()
+            .is_some_and(|marker| message.text.contains(marker))
+}
+
+fn uncovered_questions(
+    questions: Vec<HumanQuestionNotice>,
+    outbox: &Outbox,
+) -> Vec<HumanQuestionNotice> {
+    questions
+        .into_iter()
+        .filter(|question| {
+            !outbox
+                .messages
+                .iter()
+                .any(|message| message_covers_question(message, question))
+        })
+        .collect()
+}
+
+fn build_worker_question_notices(
+    state: &State,
+    github: &GitHub,
+    map: &MapRef,
+) -> Result<Vec<HumanQuestionNotice>> {
+    state
+        .workers
+        .runs
+        .iter()
+        .filter(|run| run.status == WorkerStatus::NeedsHuman && run.human_request_id.is_some())
+        .map(|run| -> Result<HumanQuestionNotice> {
+            let ticket = github.ticket_link(map, run.ticket)?;
+            let dependents = github.ticket_dependents(map, run.ticket)?;
+            let unblocks = if dependents.is_empty() {
+                format!("completion and human resolution of {ticket}")
+            } else {
+                dependents
+                    .iter()
+                    .map(|(number, title, url)| format!("[{title}]({url}) (#{number})"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            };
+            let request_id = run.human_request_id.as_deref().unwrap_or_default();
+            let request_type = run
+                .human_request_kind
+                .map(HumanRequestKind::as_str)
+                .unwrap_or("unknown");
+            let action = match run.human_request_kind {
+                Some(HumanRequestKind::WorkerQuestion) => format!(
+                    "After the genuine human responds, preserve the exact text and use `answer-worker --map {}/{}#{} --run {} --request-id {} --request-type worker_question --response RESPONSE`.",
+                    map.owner, map.repository, map.number, run.id, request_id
+                ),
+                Some(HumanRequestKind::HerdrBlockedUi) => format!(
+                    "Have the human inspect and interact directly with the linked worker pane; never send raw pane input. After the human reports the actual answer, preserve it exactly and use `answer-worker --map {}/{}#{} --run {} --request-id {} --request-type herdr_blocked_ui --response RESPONSE`.",
+                    map.owner, map.repository, map.number, run.id, request_id
+                ),
+                _ => "Request type is unknown; inspect retained state and do not route an answer until its request type is verified.".into(),
+            };
+            let text = format!(
+                "Worker question for {ticket} (request ID {request_id}; type {request_type}; run {}): {}\nRecommendation: inspect the ticket/spec and worker context, then give a grounded recommendation to the human.\nWork this answer unblocks: {unblocks}; dependent tickets remain blocked until the answer is recorded and the blocker is resolved. {action}",
+                run.id,
+                run.question
+                    .as_deref()
+                    .unwrap_or("Question text unavailable; inspect the named worker pane."),
+            );
+            Ok(HumanQuestionNotice {
+                identity: format!("worker:{}:{request_id}:{request_type}", run.id),
+                legacy_ids: Vec::new(),
+                legacy_marker: Some(format!("request ID {request_id} / {request_type}")),
+                text,
+            })
         })
         .collect()
 }
@@ -806,44 +956,6 @@ fn resolve_map(root: &Path, requested: Option<&str>) -> Result<(String, String)>
 
 fn build_notices(state: &State, github: &GitHub, map: &MapRef) -> Result<Vec<(String, String)>> {
     let mut notices = Vec::new();
-    let pending: Vec<_> = state
-        .workers
-        .runs
-        .iter()
-        .filter(|run| run.status == WorkerStatus::NeedsHuman && run.human_request_id.is_some())
-        .collect();
-    if !pending.is_empty() {
-        let mut questions: Vec<_> = pending
-            .iter()
-            .map(|run| -> Result<String> {
-                let ticket = github.ticket_link(map, run.ticket)?;
-                let dependents = github.ticket_dependents(map, run.ticket)?;
-                let unblocks = if dependents.is_empty() {
-                    format!("completion and human resolution of {ticket}")
-                } else {
-                    dependents
-                        .iter()
-                        .map(|(number, title, url)| format!("[{title}]({url}) (#{number})"))
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                };
-                Ok(format!(
-                    "- {ticket} (run {}, request ID {} / {}): {}\n  Recommendation: inspect the ticket and spec with the worker context, then offer a grounded recommendation to the human.\n  Work this answer unblocks: {unblocks}; dependent tickets remain blocked until the answer is recorded and the blocker is resolved.",
-                    run.id,
-                    run.human_request_id.as_deref().unwrap_or_default(),
-                    run.human_request_kind.map(HumanRequestKind::as_str).unwrap_or("unknown"),
-                    run.question.as_deref().unwrap_or("Question text unavailable; inspect the named worker pane."),
-                ))
-            })
-            .collect::<Result<Vec<_>>>()?;
-        questions.sort();
-        let text = format!(
-            "Independent human decisions are pending. Present this as one grouped round. For each request, show its exact ID and type, the worker's question, a recommendation grounded in the ticket/spec, and the named work it unblocks. Do not answer any question. Ask the human to respond naturally in this chat. For a worker_question, after an actual human response, record that response exactly with the attached Wayfinder answer-worker command and its run/request/type tuple. For herdr_blocked_ui, preserve the accepted manual path: ask the human to inspect and interact directly with the named worker pane; never send raw pane input.\n\n{}",
-            questions.join("\n")
-        );
-        notices.push((message_id(&text), text));
-    }
-
     for run in &state.workers.runs {
         if let Some(answer) = run.answer_history.last() {
             if answer.disposition == AnswerDisposition::Submitted {
@@ -1162,30 +1274,27 @@ mod tests {
             3,
             "deferred and legacy records remain actionable"
         );
-        assert_eq!(
-            notices[0].0,
-            message_id("scheduler-decision:scheduler-0007:unanswered")
-        );
-        assert!(notices[0].1.contains(&pending.ticket_link));
-        assert!(notices[0].1.contains("choose one explicit disposition"));
-        assert!(notices[0].1.contains("request ID scheduler-0007"));
+        assert_eq!(notices[0].identity, "scheduler:scheduler-0007:unanswered");
+        assert!(notices[0].text.contains(&pending.ticket_link));
+        assert!(notices[0].text.contains("choose one explicit disposition"));
+        assert!(notices[0].text.contains("request ID scheduler-0007"));
         assert!(
             notices[0]
-                .1
+                .text
                 .contains("answer-decision --map example/project#42")
         );
         assert!(
             notices[0]
-                .1
+                .text
                 .contains("--disposition continue|defer|abandon")
         );
         assert!(
             notices[0]
-                .1
+                .text
                 .contains("never infer an action from response text")
         );
-        assert!(notices[1].1.contains("we should return to this later"));
-        assert!(notices[1].1.contains("no disposition inferred"));
+        assert!(notices[1].text.contains("we should return to this later"));
+        assert!(notices[1].text.contains("no disposition inferred"));
         let deferred_update = build_scheduler_decision_notices(
             &map,
             &[SchedulerDecisionNotice {
@@ -1196,14 +1305,59 @@ mod tests {
         )
         .unwrap();
         assert_ne!(
-            notices[0].0, deferred_update[0].0,
+            notices[0].identity, deferred_update[0].identity,
             "recording a response must produce one new visible decision notice"
         );
         assert!(
             notices[0]
-                .1
-                .contains("never use answer-worker or send input")
+                .text
+                .contains("Never use answer-worker or send input")
         );
-        assert!(notices[0].1.contains("does not contact Herdr"));
+        assert!(notices[0].text.contains("does not contact Herdr"));
+    }
+
+    #[test]
+    fn accepted_issue_14_scheduler_outbox_ids_cover_the_same_request_after_upgrade() {
+        let map = MapRef::parse("example/project#42").unwrap();
+        let scheduler = build_scheduler_decision_notices(
+            &map,
+            &[SchedulerDecisionNotice {
+                request_id: "scheduler-upgrade".into(),
+                ticket_link: "[Upgrade task](https://github.com/example/project/issues/13)".into(),
+                run_id: "run-old".into(),
+                question: "Choose what happens next".into(),
+                response: None,
+                action_required: true,
+            }],
+        )
+        .unwrap()
+        .remove(0);
+        let legacy_id = message_id("scheduler-decision:scheduler-upgrade");
+        let interim_id = message_id("scheduler-decision:scheduler-upgrade:unanswered");
+        assert!(scheduler.legacy_ids.contains(&legacy_id));
+        assert!(scheduler.legacy_ids.contains(&interim_id));
+        let worker = HumanQuestionNotice {
+            identity: "worker:run-new:human-new-1:worker_question".into(),
+            legacy_ids: Vec::new(),
+            legacy_marker: Some("request ID human-new-1 / worker_question".into()),
+            text: "A new worker question".into(),
+        };
+
+        for status in [MessageStatus::Delivered, MessageStatus::Uncertain] {
+            let outbox = Outbox {
+                format_version: 1,
+                messages: vec![OutboundMessage {
+                    id: legacy_id.clone(),
+                    text: "legacy scheduler notice".into(),
+                    status,
+                    constituents: Vec::new(),
+                    resolution_history: Vec::new(),
+                }],
+            };
+            let fresh = uncovered_questions(vec![scheduler.clone(), worker.clone()], &outbox);
+            assert_eq!(fresh.len(), 1);
+            assert_eq!(fresh[0].identity, worker.identity);
+            assert_eq!(outbox.messages[0].status, status);
+        }
     }
 }

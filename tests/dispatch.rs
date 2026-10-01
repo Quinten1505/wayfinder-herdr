@@ -1,4 +1,5 @@
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use std::{
     collections::HashMap,
     fs,
@@ -14,18 +15,22 @@ use std::{
     time::Duration,
 };
 use tempfile::TempDir;
+use wayfinder_herdr::delivery::{DeliveryState, TicketDelivery};
 use wayfinder_herdr::store::{
     self, AnswerDisposition, Authorization, Binding, HumanAnswerEvidence, HumanRequestKind,
     Provider, RequestKind, WorkerRun, WorkerStatus,
 };
-use wayfinder_herdr::{
-    delivery::{DeliveryState, TicketDelivery},
-    herdr::Client,
-    orchestration::{self, SchedulerDecisionNotice},
-    tracker::GitHub,
-};
 
 const MAP: &str = "example/project#42";
+
+fn legacy_chat_message_id(identity: &str) -> String {
+    let digest = Sha256::digest(identity.as_bytes());
+    let hash = digest
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    format!("chat-{hash}")
+}
 const GH_MOCK: &str = r##"#!/usr/bin/env python3
 import json, os, sys
 args=sys.argv[1:]
@@ -1639,53 +1644,273 @@ fn uncertain_chat_delivery_stays_held_across_recovery_until_human_resolution() {
 fn scheduler_decision_notice_reaches_chat_without_worker_input() {
     let f = Fixture::new();
     success(f.chat());
-    let mut state = f.state();
+    let mut state = record_pending_worker_question(&f);
     let target = state.orchestrator.as_ref().unwrap().pane_id.clone();
-    let pending = SchedulerDecisionNotice {
-        request_id: "scheduler-0007".into(),
-        ticket_link: "[Implement sample task](https://github.com/example/project/issues/13)".into(),
-        run_id: "run-completed-0007".into(),
-        question: "Review retries are exhausted. Continue, change scope, or abandon?".into(),
-        response: None,
-        action_required: true,
-    };
-    let herdr = Client::new(&state.binding.socket);
-    let github = GitHub::default();
-    f.herdr_state.lock().unwrap().agent_status = "idle".into();
-    for _ in 0..3 {
-        orchestration::reconcile(
-            &f.dir,
+    let run_id = state.workers.runs[0].id.clone();
+    for (kind, question) in [
+        (
+            store::SchedulerDecisionKind::ReviewExhaustion,
+            "Review retries are exhausted. Continue, defer, or abandon?",
+        ),
+        (
+            store::SchedulerDecisionKind::ConflictExhaustion,
+            "Conflict repair retries are exhausted. Continue, defer, or abandon?",
+        ),
+    ] {
+        store::create_scheduler_decision(
             &mut state,
-            &herdr,
-            &github,
-            &[],
-            std::slice::from_ref(&pending),
+            store::NewSchedulerDecision {
+                ticket: 13,
+                run_id: &run_id,
+                source_run_id: &run_id,
+                kind,
+                blocked_status: WorkerStatus::Completed,
+                base_commit: None,
+                question,
+            },
         )
         .unwrap();
-        f.herdr_state.lock().unwrap().agent_status = "idle".into();
-        state = f.state();
     }
+    store::atomic_json(&f.dir.join("state.json"), &state).unwrap();
+    f.herdr_state.lock().unwrap().agent_status = "idle".into();
+    success(f.once());
+    f.herdr_state.lock().unwrap().agent_status = "idle".into();
+    success(f.once());
     let calls = f.herdr_state.lock().unwrap().requests.clone();
+    let scheduler_request_ids = state
+        .scheduler_decisions
+        .iter()
+        .map(|decision| decision.request_id.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(scheduler_request_ids.len(), 2);
     let decision_prompts = calls
         .iter()
         .filter(|call| call["method"] == "agent.prompt")
         .filter_map(|call| call["params"]["text"].as_str())
-        .filter(|text| text.contains("request ID scheduler-0007"))
+        .filter(|text| {
+            text.contains(scheduler_request_ids[0])
+                || text.contains(scheduler_request_ids[1])
+                || text.contains("human-run-00000000000000000001-0001")
+        })
+        .map(str::to_owned)
         .collect::<Vec<_>>();
-    assert_eq!(decision_prompts.len(), 1);
-    assert!(decision_prompts[0].contains(&pending.ticket_link));
-    assert!(decision_prompts[0].contains("choose one explicit disposition"));
-    assert!(decision_prompts[0].contains("--disposition continue|defer|abandon"));
-    assert!(decision_prompts[0].contains("never infer an action from response text"));
-    assert!(decision_prompts[0].contains("answer-decision --map example/project#42"));
-    assert!(decision_prompts[0].contains("never use answer-worker or send input to its pane"));
+    assert_eq!(decision_prompts.len(), 1, "human questions share one round");
+    let grouped = &decision_prompts[0];
+    assert!(
+        grouped
+            .contains("[Implement sample task 13](https://github.com/example/project/issues/13)")
+    );
+    assert!(grouped.contains(scheduler_request_ids[0]));
+    assert!(grouped.contains(scheduler_request_ids[1]));
+    assert!(grouped.contains("type scheduler_decision"));
+    assert!(grouped.contains("choose one explicit disposition"));
+    assert!(grouped.contains("--disposition continue|defer|abandon"));
+    assert!(grouped.contains("never infer an action from response text"));
+    assert!(grouped.contains("answer-decision --map example/project#42"));
+    assert!(grouped.contains("Never use answer-worker or send input to its pane"));
+    let worker_request = state.workers.runs[0].human_request_id.as_deref().unwrap();
+    assert!(grouped.contains(&format!("request ID {worker_request}")));
+    assert!(grouped.contains("type worker_question"));
+    assert!(grouped.contains("answer-worker --map example/project#42"));
     assert!(calls.iter().any(|call| {
         call["method"] == "agent.prompt"
             && call["params"]["target"] == target
-            && call["params"]["text"]
-                .as_str()
-                .is_some_and(|text| text.contains("request ID scheduler-0007"))
+            && call["params"]["text"].as_str().is_some_and(|text| {
+                scheduler_request_ids
+                    .iter()
+                    .all(|request_id| text.contains(request_id))
+                    && text.contains(&format!("request ID {worker_request}"))
+            })
     }));
+}
+
+#[test]
+fn delivered_issue_14_scheduler_notice_is_not_replayed_with_incremental_question() {
+    let f = Fixture::new();
+    success(f.chat());
+    let mut state = record_pending_worker_question(&f);
+    let run_id = state.workers.runs[0].id.clone();
+    let request_id = store::create_scheduler_decision(
+        &mut state,
+        store::NewSchedulerDecision {
+            ticket: 13,
+            run_id: &run_id,
+            source_run_id: &run_id,
+            kind: store::SchedulerDecisionKind::ReviewExhaustion,
+            blocked_status: WorkerStatus::Completed,
+            base_commit: None,
+            question: "Select how to handle exhausted review rework.",
+        },
+    )
+    .unwrap();
+    store::atomic_json(&f.dir.join("state.json"), &state).unwrap();
+    let old_id = legacy_chat_message_id(&format!("scheduler-decision:{request_id}"));
+    fs::write(
+        f.dir.join("chat-outbox.json"),
+        json!({
+            "format_version": 1,
+            "messages": [{
+                "id": old_id,
+                "text": format!("Legacy scheduler notice request ID {request_id}"),
+                "status": "delivered",
+                "resolution_history": []
+            }]
+        })
+        .to_string(),
+    )
+    .unwrap();
+    f.herdr_state.lock().unwrap().agent_status = "idle".into();
+    success(f.once());
+
+    let pane = state.orchestrator.unwrap().pane_id;
+    let prompts = f
+        .herdr_state
+        .lock()
+        .unwrap()
+        .requests
+        .iter()
+        .filter(|request| {
+            request["method"] == "agent.prompt" && request["params"]["target"] == pane
+        })
+        .filter_map(|request| request["params"]["text"].as_str())
+        .filter(|text| text.contains("human-run-00000000000000000001-0001"))
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    assert_eq!(prompts.len(), 1);
+    assert!(prompts[0].contains("worker_question"));
+    assert!(prompts[0].contains("human-run-00000000000000000001-0001"));
+    assert!(!prompts[0].contains(&request_id));
+
+    let outbox: Value =
+        serde_json::from_slice(&fs::read(f.dir.join("chat-outbox.json")).unwrap()).unwrap();
+    assert_eq!(outbox["messages"][0]["id"], old_id);
+    assert_eq!(outbox["messages"][0]["status"], "delivered");
+    let grouped = outbox["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|message| {
+            message["text"]
+                .as_str()
+                .unwrap()
+                .contains("worker_question")
+        })
+        .unwrap();
+    assert_eq!(grouped["constituents"].as_array().unwrap().len(), 1);
+
+    let mut outbox: Value =
+        serde_json::from_slice(&fs::read(f.dir.join("chat-outbox.json")).unwrap()).unwrap();
+    for message in outbox["messages"].as_array_mut().unwrap() {
+        message["status"] = json!("delivered");
+    }
+    store::atomic_json(&f.dir.join("chat-outbox.json"), &outbox).unwrap();
+    let answer = f
+        .cli()
+        .args([
+            "answer-decision",
+            "--map",
+            MAP,
+            "--request-id",
+            &request_id,
+            "--response",
+            "Please defer until I review the retained evidence.",
+            "--disposition",
+            "defer",
+        ])
+        .output()
+        .unwrap();
+    success(answer);
+    f.herdr_state.lock().unwrap().agent_status = "idle".into();
+    success(f.once());
+    let deferred_prompts = f
+        .herdr_state
+        .lock()
+        .unwrap()
+        .requests
+        .iter()
+        .filter(|request| {
+            request["method"] == "agent.prompt" && request["params"]["target"] == pane
+        })
+        .filter_map(|request| request["params"]["text"].as_str())
+        .filter(|text| text.contains("Previously recorded human response (verbatim"))
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    assert_eq!(deferred_prompts.len(), 1);
+    assert!(deferred_prompts[0].contains("Please defer until I review the retained evidence."));
+    assert!(deferred_prompts[0].contains("disposition inferred"));
+    assert!(deferred_prompts[0].contains("--disposition continue|defer|abandon"));
+}
+
+#[test]
+fn uncertain_issue_14_scheduler_notice_still_holds_incremental_chat_delivery() {
+    let f = Fixture::new();
+    success(f.chat());
+    let mut state = record_pending_worker_question(&f);
+    let run_id = state.workers.runs[0].id.clone();
+    let request_id = store::create_scheduler_decision(
+        &mut state,
+        store::NewSchedulerDecision {
+            ticket: 13,
+            run_id: &run_id,
+            source_run_id: &run_id,
+            kind: store::SchedulerDecisionKind::ConflictExhaustion,
+            blocked_status: WorkerStatus::Completed,
+            base_commit: None,
+            question: "Select how to handle exhausted conflict repair.",
+        },
+    )
+    .unwrap();
+    store::atomic_json(&f.dir.join("state.json"), &state).unwrap();
+    let old_id = legacy_chat_message_id(&format!("scheduler-decision:{request_id}"));
+    fs::write(
+        f.dir.join("chat-outbox.json"),
+        json!({
+            "format_version": 1,
+            "messages": [{
+                "id": old_id,
+                "text": format!("Legacy uncertain scheduler notice request ID {request_id}"),
+                "status": "uncertain",
+                "resolution_history": []
+            }]
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let requests_before = f.herdr_state.lock().unwrap().requests.len();
+    f.herdr_state.lock().unwrap().agent_status = "idle".into();
+    success(f.once());
+
+    let pane = state.orchestrator.unwrap().pane_id;
+    let outbox: Value =
+        serde_json::from_slice(&fs::read(f.dir.join("chat-outbox.json")).unwrap()).unwrap();
+    assert_eq!(outbox["messages"][0]["status"], "uncertain");
+    let grouped = outbox["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|message| {
+            message["text"]
+                .as_str()
+                .unwrap()
+                .contains("worker_question")
+        })
+        .unwrap();
+    assert!(!grouped["text"].as_str().unwrap().contains(&request_id));
+    assert!(
+        !f.herdr_state
+            .lock()
+            .unwrap()
+            .requests
+            .iter()
+            .skip(requests_before)
+            .any(|request| {
+                request["method"] == "agent.prompt"
+                    && request["params"]["target"] == pane
+                    && request["params"]["text"]
+                        .as_str()
+                        .is_some_and(|text| text.contains("[WAYFINDER OUTBOX MESSAGE"))
+            })
+    );
 }
 
 #[test]
