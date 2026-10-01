@@ -18,7 +18,7 @@ use std::{
 };
 
 const FAILURE_RETRIES: u8 = 2;
-const REWORK_ROUNDS: u8 = 3;
+const REWORK_ROUNDS: u8 = store::DEFAULT_REWORK_ROUNDS;
 const SUBMITTED_IDLE_GRACE: Duration = Duration::from_secs(5 * 60);
 
 /// systemd supervises this process; the kernel releases its lifetime lock on death.
@@ -66,6 +66,8 @@ fn reconcile(dir: &Path, state: &mut State) -> Result<String> {
     fs::create_dir_all(&tracker_dir)?;
     store::atomic_json(&tracker_dir.join("frontier.json"), &frontier)?;
     let herdr = Client::new(&state.binding.socket);
+    let repository = state.binding.repository.clone();
+    apply_scheduler_decisions(dir, state, &repository, &map)?;
     reconcile_workers(dir, state, &map, &github, &herdr)?;
     let children = github.child_tickets(&map)?;
     apply_delivery_outcome(
@@ -117,6 +119,163 @@ fn reconcile(dir: &Path, state: &mut State) -> Result<String> {
         "Host and GitHub reconciled; {active}/{} worker slots reserved",
         state.concurrency
     ))
+}
+
+/// Apply a typed scheduler choice as one durable state transition. Queue
+/// creation and the decision marker are saved together before Herdr sees any
+/// launch request, so restart/replay cannot create duplicate workers.
+fn apply_scheduler_decisions(
+    dir: &Path,
+    state: &mut State,
+    repository: &Path,
+    map: &MapRef,
+) -> Result<()> {
+    for index in 0..state.scheduler_decisions.len() {
+        let decision = state.scheduler_decisions[index].clone();
+        let Some(disposition) = decision.disposition else {
+            continue;
+        };
+        if disposition == store::SchedulerDecisionDisposition::Defer {
+            if decision.application != store::SchedulerDecisionApplication::Deferred {
+                state.scheduler_decisions[index].application =
+                    store::SchedulerDecisionApplication::Deferred;
+                save(dir, state)?;
+            }
+            continue;
+        }
+        if matches!(
+            decision.application,
+            store::SchedulerDecisionApplication::Continued
+                | store::SchedulerDecisionApplication::Abandoned
+        ) {
+            continue;
+        }
+        let blocked_index = state
+            .workers
+            .runs
+            .iter()
+            .position(|run| run.id == decision.run_id)
+            .context(
+                "scheduler decision's blocked run is missing; human reconciliation required",
+            )?;
+        let source_index = state
+            .workers
+            .runs
+            .iter()
+            .position(|run| run.id == decision.source_run_id)
+            .context(
+                "scheduler decision's implementation run is missing; human reconciliation required",
+            )?;
+        let source = state.workers.runs[source_index].clone();
+        let blocked = state.workers.runs[blocked_index].clone();
+        let finished_before_hold = decision.blocked_status.as_ref().is_some_and(|status| {
+            matches!(status, WorkerStatus::Completed | WorkerStatus::Reviewed)
+        });
+        let known_held_conflict = decision.kind == store::SchedulerDecisionKind::ConflictExhaustion
+            && decision.run_id == decision.source_run_id
+            && source.status == WorkerStatus::NeedsHuman
+            && finished_before_hold;
+        let blocked_worker_finished = matches!(
+            blocked.status,
+            WorkerStatus::Completed | WorkerStatus::Reviewed
+        ) || known_held_conflict;
+        ensure!(
+            blocked_worker_finished && finished_before_hold,
+            "scheduler decision's blocked worker is not proven finished; inspect worker liveness before applying a choice"
+        );
+        ensure!(
+            matches!(
+                source.status,
+                WorkerStatus::Completed | WorkerStatus::Reviewed
+            ) || known_held_conflict,
+            "scheduler decision source is not proven finished; inspect and resolve the active worker before applying a choice"
+        );
+        ensure!(
+            source.ticket == decision.ticket && source.role == "implementer",
+            "scheduler decision is no longer bound to its implementation run"
+        );
+        match disposition {
+            store::SchedulerDecisionDisposition::Defer => unreachable!(),
+            store::SchedulerDecisionDisposition::Abandon => {
+                let restore = decision
+                    .blocked_status
+                    .clone()
+                    .context("scheduler decision lacks its prior finished status")?;
+                ensure!(
+                    matches!(restore, WorkerStatus::Completed | WorkerStatus::Reviewed),
+                    "abandon cannot release an unverified active worker"
+                );
+                state.workers.runs[blocked_index].status = restore;
+                state.scheduler_decisions[index].application =
+                    store::SchedulerDecisionApplication::Abandoned;
+                save(dir, state)?;
+            }
+            store::SchedulerDecisionDisposition::Continue => {
+                let context_marker = format!("scheduler-decision:{}", decision.request_id);
+                if let Some(existing) = state.workers.runs.iter().find(|run| {
+                    run.role == "implementer"
+                        && run.source_run.as_deref() == Some(decision.run_id.as_str())
+                        && run
+                            .context
+                            .as_deref()
+                            .is_some_and(|context| context.contains(&context_marker))
+                }) {
+                    state.scheduler_decisions[index].successor_run_id = Some(existing.id.clone());
+                    state.scheduler_decisions[index].application =
+                        store::SchedulerDecisionApplication::Continued;
+                    save(dir, state)?;
+                    continue;
+                }
+                let base_commit = decision
+                    .base_commit
+                    .clone()
+                    .or_else(|| source.base_commit.clone())
+                    .context("scheduler decision has no fixed commit for safe rework")?;
+                let prior_limit = source.rework_round_limit.max(REWORK_ROUNDS);
+                ensure!(
+                    source.rework_round >= prior_limit,
+                    "scheduler continuation is not exhausted at its recorded rework round"
+                );
+                let continued_limit = source.rework_round.saturating_add(1);
+                let human_response = decision
+                    .response
+                    .as_deref()
+                    .context("scheduler disposition has no preserved human response")?;
+                let work = match decision.kind {
+                    store::SchedulerDecisionKind::ReviewExhaustion => format!(
+                        "{context_marker}\nHuman selected one bounded implementation rework round. Rework the exact candidate {base_commit} to address the independent reviewer report: {}. Human's exact response: {human_response}. Preserve the existing attempt and evidence.",
+                        decision.question,
+                    ),
+                    store::SchedulerDecisionKind::ConflictExhaustion => format!(
+                        "{context_marker}\nHuman selected one bounded conflict-repair round. Resolve the integration conflict in a fresh detached worktree against exact feature commit {base_commit}. Human's exact response: {human_response}. Preserve prior attempts and evidence. Details: {}",
+                        decision.question,
+                    ),
+                };
+                new_run(
+                    state,
+                    NewRun {
+                        ticket: decision.ticket,
+                        role: "implementer",
+                        repository,
+                        map,
+                        source_run: Some(decision.run_id.clone()),
+                        base_commit: Some(base_commit),
+                        context: Some(work),
+                    },
+                );
+                let successor = state.workers.runs.last_mut().unwrap();
+                successor.rework_round = source.rework_round.saturating_add(1);
+                successor.rework_round_limit = continued_limit;
+                successor.automatic_retries = source.automatic_retries;
+                let successor_id = successor.id.clone();
+                state.scheduler_decisions[index].successor_run_id = Some(successor_id);
+                state.scheduler_decisions[index].application =
+                    store::SchedulerDecisionApplication::Continued;
+                save(dir, state)?;
+            }
+        }
+    }
+    Ok(())
 }
 
 fn apply_delivery_outcome(
@@ -223,13 +382,26 @@ fn apply_delivery_outcome(
                 .find(|run| run.id == *run_id)
                 .context("conflicted integration source run disappeared")?
                 .clone();
-            if source.rework_round >= REWORK_ROUNDS {
+            if source.rework_round >= source.rework_round_limit {
                 let question = format!(
-                    "The three-round review/rework budget is exhausted while resolving an integration conflict. {detail}"
+                    "The three-round review/rework budget is exhausted while resolving an integration conflict. Choose one explicit action: continue grants one bounded conflict-repair round, defer keeps ticket readiness held while releasing this completed worker slot, or abandon releases this proven-finished run while leaving the ticket unintegrated. {detail}"
                 );
-                store::create_scheduler_decision(state, source.ticket, &source.id, &question)?;
+                store::create_scheduler_decision(
+                    state,
+                    store::NewSchedulerDecision {
+                        ticket: source.ticket,
+                        run_id: &source.id,
+                        source_run_id: &source.id,
+                        kind: store::SchedulerDecisionKind::ConflictExhaustion,
+                        blocked_status: source.status.clone(),
+                        base_commit: Some(base_commit),
+                        question: &question,
+                    },
+                )?;
                 if let Some(worker) = state.workers.runs.iter_mut().find(|run| run.id == *run_id) {
-                    worker.status = WorkerStatus::NeedsHuman;
+                    // A scheduler choice is pending, but this source run is
+                    // already proven finished; ticket readiness is held by
+                    // the durable decision itself, not by consuming a slot.
                     worker.question = Some(question);
                 }
             } else if !state.workers.runs.iter().any(|run| {
@@ -254,6 +426,8 @@ fn apply_delivery_outcome(
                     },
                 );
                 state.workers.runs.last_mut().unwrap().rework_round = source.rework_round + 1;
+                state.workers.runs.last_mut().unwrap().rework_round_limit =
+                    source.rework_round_limit;
                 state.workers.runs.last_mut().unwrap().automatic_retries = source.automatic_retries;
             }
             save(dir, state)?;
@@ -375,6 +549,7 @@ fn new_run(state: &mut State, request: NewRun<'_>) {
         attempt,
         automatic_retries: 0,
         rework_round: 0,
+        rework_round_limit: REWORK_ROUNDS,
         status: WorkerStatus::Queued,
         worktree: path,
         workspace_id: None,
@@ -472,9 +647,232 @@ mod tests {
                 .question
                 .contains("three-round review/rework budget")
         );
-        assert!(decision.response.is_none());
-        assert_eq!(persisted.workers.runs[0].status, WorkerStatus::NeedsHuman);
+        let request_id = decision.request_id.clone();
+        let question = decision.question.clone();
+        let mut legacy = persisted.clone();
+        let legacy_request_id = legacy.scheduler_decisions[0].request_id.clone();
+        legacy.scheduler_decisions[0].source_run_id.clear();
+        legacy.scheduler_decisions[0].blocked_status = None;
+        legacy.scheduler_decisions[0].base_commit = None;
+        legacy.scheduler_decisions[0].response = Some("Legacy freeform answer only".into());
+        let recovered_id = store::create_scheduler_decision(
+            &mut legacy,
+            store::NewSchedulerDecision {
+                ticket: 15,
+                run_id: &run_id,
+                source_run_id: &run_id,
+                kind: store::SchedulerDecisionKind::ConflictExhaustion,
+                blocked_status: WorkerStatus::Completed,
+                base_commit: Some("feature-target"),
+                question: &format!("{question} Choose one explicit action."),
+            },
+        )
+        .unwrap();
+        assert_eq!(recovered_id, legacy_request_id);
+        assert_eq!(legacy.scheduler_decisions.len(), 1);
+        assert_eq!(
+            legacy.scheduler_decisions[0].response.as_deref(),
+            Some("Legacy freeform answer only")
+        );
+        assert_eq!(legacy.scheduler_decisions[0].source_run_id, run_id);
+        assert_eq!(
+            legacy.scheduler_decisions[0].base_commit.as_deref(),
+            Some("feature-target")
+        );
+        assert!(legacy.scheduler_decisions[0].awaits_human_action());
+        store::record_scheduler_decision_response(
+            &mut state,
+            &request_id,
+            "Please repair the conflict once more.",
+            store::SchedulerDecisionDisposition::Continue,
+        )
+        .unwrap();
+        save(&dir, &state).unwrap();
+        let mut restarted = store::read_state(&dir).unwrap();
+        apply_scheduler_decisions(&dir, &mut restarted, &repository, &map).unwrap();
+        let after_apply = store::read_state(&dir).unwrap();
+        let decision = &after_apply.scheduler_decisions[0];
+        assert_eq!(
+            decision.application,
+            store::SchedulerDecisionApplication::Continued
+        );
+        let successor_id = decision.successor_run_id.as_deref().unwrap();
+        let successor = after_apply
+            .workers
+            .runs
+            .iter()
+            .find(|run| run.id == successor_id)
+            .unwrap();
+        assert_eq!(successor.role, "implementer");
+        assert_eq!(successor.status, WorkerStatus::Queued);
+        assert_eq!(successor.rework_round, REWORK_ROUNDS + 1);
+        assert_eq!(successor.rework_round_limit, REWORK_ROUNDS + 1);
+        assert_eq!(successor.source_run.as_deref(), Some(run_id.as_str()));
+        assert!(
+            successor
+                .context
+                .as_deref()
+                .unwrap()
+                .contains("Human's exact response: Please repair the conflict once more.")
+        );
+        let count = after_apply.workers.runs.len();
+        let answer_count = decision.answers.len();
+        store::record_scheduler_decision_response(
+            &mut restarted,
+            &request_id,
+            "Please repair the conflict once more.",
+            store::SchedulerDecisionDisposition::Continue,
+        )
+        .unwrap();
+        assert_eq!(restarted.scheduler_decisions[0].answers.len(), answer_count);
+        assert!(
+            store::record_scheduler_decision_response(
+                &mut restarted,
+                &request_id,
+                "Actually defer this.",
+                store::SchedulerDecisionDisposition::Defer,
+            )
+            .is_err()
+        );
+        let mut restarted_again = store::read_state(&dir).unwrap();
+        apply_scheduler_decisions(&dir, &mut restarted_again, &repository, &map).unwrap();
+        assert_eq!(store::read_state(&dir).unwrap().workers.runs.len(), count);
+        assert_eq!(
+            decision.response.as_deref(),
+            Some("Please repair the conflict once more.")
+        );
+        assert_eq!(persisted.workers.runs[0].status, WorkerStatus::Completed);
         assert_eq!(persisted.workers.runs[0].human_request_id, None);
+    }
+
+    #[test]
+    fn abandon_releases_only_a_proven_finished_run_and_keeps_artifacts() {
+        let temp = tempfile::tempdir().unwrap();
+        let repository = temp.path().join("repo");
+        std::fs::create_dir(&repository).unwrap();
+        let binding = Binding {
+            repository: repository.clone(),
+            herdr_binary: PathBuf::from("/bin/true"),
+            socket: temp.path().join("owned-session.sock"),
+            herdr_config: None,
+        };
+        let (key, _) = store::attach(temp.path(), "example/project#42", binding, 30).unwrap();
+        let dir = store::map_dir(temp.path(), &key).unwrap();
+        let map = MapRef::parse("example/project#42").unwrap();
+        let mut state = store::read_state(&dir).unwrap();
+        new_run(
+            &mut state,
+            NewRun {
+                ticket: 15,
+                role: "implementer",
+                repository: &repository,
+                map: &map,
+                source_run: None,
+                base_commit: Some("feature-target".into()),
+                context: None,
+            },
+        );
+        let run = state.workers.runs.last_mut().unwrap();
+        run.status = WorkerStatus::Completed;
+        run.rework_round = REWORK_ROUNDS;
+        run.result_commit = Some("ticket-commit".into());
+        let evidence = temp.path().join("preserved-result.json");
+        std::fs::write(&evidence, "evidence").unwrap();
+        run.result_evidence = Some(evidence.clone());
+        let run_id = run.id.clone();
+        apply_delivery_outcome(
+            &dir,
+            &mut state,
+            &map,
+            &Outcome::Conflict {
+                run_id: run_id.clone(),
+                base_commit: "feature-target".into(),
+                detail: "cannot apply cleanly".into(),
+            },
+        )
+        .unwrap();
+        let request_id = state.scheduler_decisions[0].request_id.clone();
+        store::record_scheduler_decision_response(
+            &mut state,
+            &request_id,
+            "Leave this ticket incomplete for now.",
+            store::SchedulerDecisionDisposition::Abandon,
+        )
+        .unwrap();
+        save(&dir, &state).unwrap();
+        let mut restarted = store::read_state(&dir).unwrap();
+        apply_scheduler_decisions(&dir, &mut restarted, &repository, &map).unwrap();
+        let abandoned = store::read_state(&dir).unwrap();
+        let worker = &abandoned.workers.runs[0];
+        assert_eq!(worker.status, WorkerStatus::Completed);
+        assert!(!worker.reserves_capacity());
+        assert_eq!(worker.result_commit.as_deref(), Some("ticket-commit"));
+        assert_eq!(worker.result_evidence.as_deref(), Some(evidence.as_path()));
+        assert_eq!(
+            abandoned.scheduler_decisions[0].application,
+            store::SchedulerDecisionApplication::Abandoned
+        );
+        assert!(!abandoned.scheduler_decisions[0].awaits_human_action());
+    }
+
+    #[test]
+    fn scheduler_abandon_refuses_when_worker_liveness_is_uncertain() {
+        let temp = tempfile::tempdir().unwrap();
+        let repository = temp.path().join("repo");
+        std::fs::create_dir(&repository).unwrap();
+        let binding = Binding {
+            repository: repository.clone(),
+            herdr_binary: PathBuf::from("/bin/true"),
+            socket: temp.path().join("owned-session.sock"),
+            herdr_config: None,
+        };
+        let (key, _) = store::attach(temp.path(), "example/project#42", binding, 30).unwrap();
+        let dir = store::map_dir(temp.path(), &key).unwrap();
+        let map = MapRef::parse("example/project#42").unwrap();
+        let mut state = store::read_state(&dir).unwrap();
+        new_run(
+            &mut state,
+            NewRun {
+                ticket: 15,
+                role: "implementer",
+                repository: &repository,
+                map: &map,
+                source_run: None,
+                base_commit: Some("feature-target".into()),
+                context: None,
+            },
+        );
+        let run = state.workers.runs.last_mut().unwrap();
+        run.status = WorkerStatus::Completed;
+        run.rework_round = REWORK_ROUNDS;
+        let run_id = run.id.clone();
+        apply_delivery_outcome(
+            &dir,
+            &mut state,
+            &map,
+            &Outcome::Conflict {
+                run_id: run_id.clone(),
+                base_commit: "feature-target".into(),
+                detail: "conflict".into(),
+            },
+        )
+        .unwrap();
+        let request_id = state.scheduler_decisions[0].request_id.clone();
+        store::record_scheduler_decision_response(
+            &mut state,
+            &request_id,
+            "I cannot confirm the worker stopped.",
+            store::SchedulerDecisionDisposition::Abandon,
+        )
+        .unwrap();
+        state.workers.runs[0].status = WorkerStatus::Uncertain;
+        let error = apply_scheduler_decisions(&dir, &mut state, &repository, &map).unwrap_err();
+        assert!(error.to_string().contains("not proven finished"));
+        assert!(state.workers.runs[0].reserves_capacity());
+        assert_eq!(
+            state.scheduler_decisions[0].application,
+            store::SchedulerDecisionApplication::Awaiting
+        );
     }
 }
 
@@ -1062,7 +1460,7 @@ fn accept_result(
                         .and_then(|id| state.workers.runs.iter().find(|r| &r.id == id))
                         .context("review has no implementation run")?
                         .clone();
-                    if source.rework_round < REWORK_ROUNDS {
+                    if source.rework_round < source.rework_round_limit {
                         let map = MapRef::parse(&state.map)?;
                         let repository = state.binding.repository.clone();
                         new_run(
@@ -1082,13 +1480,15 @@ fn accept_result(
                         );
                         state.workers.runs.last_mut().unwrap().rework_round =
                             source.rework_round + 1;
+                        state.workers.runs.last_mut().unwrap().rework_round_limit =
+                            source.rework_round_limit;
                         state.workers.runs.last_mut().unwrap().automatic_retries =
                             source.automatic_retries;
                     } else {
-                        state.workers.runs[i].status = WorkerStatus::NeedsHuman;
+                        state.workers.runs[i].status = WorkerStatus::Completed;
                         let findings = unresolved_findings.join("; ");
                         let question = format!(
-                            "Three automatic review/rework rounds were exhausted; human decision required. Reviewer report: {}. Unresolved findings: {}",
+                            "Three automatic review/rework rounds were exhausted. Choose one explicit action: continue grants one bounded implementation rework round, defer keeps ticket readiness held while releasing this completed reviewer slot, or abandon releases this proven-finished reviewer while leaving the ticket unintegrated. Reviewer report: {}. Unresolved findings: {}",
                             result.summary,
                             if findings.is_empty() {
                                 "review remained unresolved"
@@ -1096,7 +1496,18 @@ fn accept_result(
                                 &findings
                             }
                         );
-                        store::create_scheduler_decision(state, run.ticket, &run.id, &question)?;
+                        store::create_scheduler_decision(
+                            state,
+                            store::NewSchedulerDecision {
+                                ticket: run.ticket,
+                                run_id: &run.id,
+                                source_run_id: &source.id,
+                                kind: store::SchedulerDecisionKind::ReviewExhaustion,
+                                blocked_status: WorkerStatus::Completed,
+                                base_commit: run.base_commit.as_deref(),
+                                question: &question,
+                            },
+                        )?;
                         state.workers.runs[i].question = Some(question);
                     }
                     save(dir, state)

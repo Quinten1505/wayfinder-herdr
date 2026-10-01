@@ -11,6 +11,7 @@ use std::{
 };
 
 pub const FORMAT: u32 = 1;
+pub const DEFAULT_REWORK_ROUNDS: u8 = 3;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
@@ -99,9 +100,82 @@ pub struct SchedulerDecision {
     pub request_kind: HumanRequestKind,
     pub ticket: u64,
     pub run_id: String,
+    /// Implementation run whose work is blocked, even when the request was
+    /// raised by a separate reviewer run.
+    #[serde(default)]
+    pub source_run_id: String,
+    #[serde(default)]
+    pub kind: SchedulerDecisionKind,
+    #[serde(default)]
+    pub blocked_status: Option<WorkerStatus>,
+    #[serde(default)]
+    pub base_commit: Option<String>,
     pub question: String,
     #[serde(default)]
     pub response: Option<String>,
+    #[serde(default)]
+    pub disposition: Option<SchedulerDecisionDisposition>,
+    #[serde(default)]
+    pub application: SchedulerDecisionApplication,
+    #[serde(default)]
+    pub successor_run_id: Option<String>,
+    /// Keep every exact human response, including a later change from defer.
+    #[serde(default)]
+    pub answers: Vec<SchedulerDecisionAnswer>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum SchedulerDecisionKind {
+    #[default]
+    ReviewExhaustion,
+    ConflictExhaustion,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SchedulerDecisionDisposition {
+    Continue,
+    Defer,
+    Abandon,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum SchedulerDecisionApplication {
+    #[default]
+    Awaiting,
+    Deferred,
+    Continued,
+    Abandoned,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct SchedulerDecisionAnswer {
+    pub response: String,
+    pub disposition: SchedulerDecisionDisposition,
+}
+
+pub struct NewSchedulerDecision<'a> {
+    pub ticket: u64,
+    pub run_id: &'a str,
+    pub source_run_id: &'a str,
+    pub kind: SchedulerDecisionKind,
+    pub blocked_status: WorkerStatus,
+    pub base_commit: Option<&'a str>,
+    pub question: &'a str,
+}
+
+impl SchedulerDecision {
+    /// A response without a typed action (including legacy freeform responses)
+    /// still needs an explicit human action. Defer remains pending by design.
+    pub fn awaits_human_action(&self) -> bool {
+        matches!(
+            self.application,
+            SchedulerDecisionApplication::Awaiting | SchedulerDecisionApplication::Deferred
+        )
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -171,6 +245,10 @@ pub struct WorkerRun {
     pub automatic_retries: u8,
     #[serde(default)]
     pub rework_round: u8,
+    /// Explicit per-run cap. A human may grant one additional round only by
+    /// choosing the typed Continue disposition for a scheduler decision.
+    #[serde(default = "default_rework_round_limit")]
+    pub rework_round_limit: u8,
     pub status: WorkerStatus,
     /// Persisted before a worktree or pane is requested from Herdr.
     pub worktree: PathBuf,
@@ -245,6 +323,10 @@ pub struct WorkerRun {
     pub known_prelaunch_failure: bool,
 }
 
+fn default_rework_round_limit() -> u8 {
+    DEFAULT_REWORK_ROUNDS
+}
+
 impl WorkerRun {
     pub fn reserves_capacity(&self) -> bool {
         self.status.reserves_capacity() && !self.known_prelaunch_failure
@@ -292,39 +374,92 @@ impl HumanRequestKind {
 /// Reconciliation retries with the same ticket, run, and text reuse the ID.
 pub fn create_scheduler_decision(
     state: &mut State,
-    ticket: u64,
-    run_id: &str,
-    question: &str,
+    request: NewSchedulerDecision<'_>,
 ) -> Result<String> {
+    let NewSchedulerDecision {
+        ticket,
+        run_id,
+        source_run_id,
+        kind,
+        blocked_status,
+        base_commit,
+        question,
+    } = request;
     ensure!(
         !question.trim().is_empty(),
         "scheduler question cannot be empty"
     );
+    // Preserve the request ID algorithm shipped with the first scheduler
+    // decision record so a restart can enrich that record instead of emitting
+    // a second chat request during the schema extension.
     let identity = format!("{}\n{ticket}\n{run_id}\n{question}", state.map);
-    let request_id = format!(
+    let generated_request_id = format!(
         "scheduler-{}",
         &format!("{:x}", Sha256::digest(identity.as_bytes()))[..24]
     );
-    if let Some(existing) = state
+    let legacy_request_id = state
         .scheduler_decisions
         .iter()
+        .find(|decision| {
+            decision.ticket == ticket
+                && decision.run_id == run_id
+                && decision.source_run_id.is_empty()
+                && decision.blocked_status.is_none()
+                && !matches!(
+                    decision.application,
+                    SchedulerDecisionApplication::Continued
+                        | SchedulerDecisionApplication::Abandoned
+                )
+        })
+        .map(|decision| decision.request_id.clone());
+    let request_id = legacy_request_id.unwrap_or(generated_request_id);
+    if let Some(existing) = state
+        .scheduler_decisions
+        .iter_mut()
         .find(|decision| decision.request_id == request_id)
     {
         ensure!(
             existing.ticket == ticket
                 && existing.run_id == run_id
-                && existing.question == question
                 && existing.request_kind == HumanRequestKind::SchedulerDecision,
             "scheduler request ID collision or changed request identity"
         );
+        let legacy = existing.source_run_id.is_empty() && existing.blocked_status.is_none();
+        ensure!(
+            legacy || existing.question == question,
+            "scheduler request ID collision or changed question"
+        );
+        ensure!(
+            legacy || (existing.source_run_id == source_run_id && existing.kind == kind),
+            "scheduler request ID collision or changed run relationship"
+        );
+        ensure!(
+            existing.base_commit.is_none() || existing.base_commit.as_deref() == base_commit,
+            "scheduler request ID collision or changed fixed commit"
+        );
+        if legacy {
+            existing.source_run_id = source_run_id.to_owned();
+            existing.kind = kind;
+            existing.blocked_status = Some(blocked_status);
+            existing.base_commit = base_commit.map(str::to_owned);
+            existing.question = question.to_owned();
+        }
     } else {
         state.scheduler_decisions.push(SchedulerDecision {
             request_id: request_id.clone(),
             request_kind: HumanRequestKind::SchedulerDecision,
             ticket,
             run_id: run_id.to_owned(),
+            source_run_id: source_run_id.to_owned(),
+            kind,
+            blocked_status: Some(blocked_status),
+            base_commit: base_commit.map(str::to_owned),
             question: question.to_owned(),
             response: None,
+            disposition: None,
+            application: SchedulerDecisionApplication::Awaiting,
+            successor_run_id: None,
+            answers: Vec::new(),
         });
     }
     Ok(request_id)
@@ -335,6 +470,7 @@ pub fn record_scheduler_decision_response(
     state: &mut State,
     request_id: &str,
     response: &str,
+    disposition: SchedulerDecisionDisposition,
 ) -> Result<()> {
     ensure!(
         !response.trim().is_empty(),
@@ -349,13 +485,27 @@ pub fn record_scheduler_decision_response(
         decision.request_kind == HumanRequestKind::SchedulerDecision,
         "request is not a scheduler decision"
     );
-    match decision.response.as_deref() {
-        Some(existing) => ensure!(
-            existing == response,
-            "scheduler decision was already answered with a different response"
-        ),
-        None => decision.response = Some(response.to_owned()),
+    if decision.response.as_deref() == Some(response) && decision.disposition == Some(disposition) {
+        return Ok(());
     }
+    ensure!(
+        !matches!(
+            decision.application,
+            SchedulerDecisionApplication::Continued | SchedulerDecisionApplication::Abandoned
+        ),
+        "scheduler decision was already applied; create a new request for another action"
+    );
+    decision.response = Some(response.to_owned());
+    decision.disposition = Some(disposition);
+    decision.answers.push(SchedulerDecisionAnswer {
+        response: response.to_owned(),
+        disposition,
+    });
+    decision.application = if disposition == SchedulerDecisionDisposition::Defer {
+        SchedulerDecisionApplication::Deferred
+    } else {
+        SchedulerDecisionApplication::Awaiting
+    };
     Ok(())
 }
 

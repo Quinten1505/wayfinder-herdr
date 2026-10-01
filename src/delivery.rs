@@ -336,7 +336,7 @@ pub fn chat_milestones(dir: &Path) -> Result<Vec<String>> {
         for decision in runtime
             .scheduler_decisions
             .iter()
-            .filter(|decision| decision.response.is_none())
+            .filter(|decision| decision.awaits_human_action())
         {
             if let Some(child) = children
                 .iter()
@@ -825,8 +825,8 @@ fn mark_ready_with(
         workers
             .scheduler_decisions
             .iter()
-            .all(|decision| decision.response.is_some()),
-        "feature PR cannot be ready while a scheduler decision awaits a human response"
+            .all(|decision| !decision.awaits_human_action()),
+        "feature PR cannot be ready while a scheduler decision awaits an explicit human action"
     );
     let reviewer = workers
         .workers
@@ -1307,7 +1307,7 @@ fn feature_review_outcome(
     let pending_scheduler_decision = state
         .scheduler_decisions
         .iter()
-        .any(|decision| decision.response.is_none());
+        .any(|decision| decision.awaits_human_action());
     let unresolved_children = children.iter().any(|child| {
         if child.labels.iter().any(|label| label == "wayfinder:task") {
             !ticket_integrated(delivery, child.number)
@@ -2763,9 +2763,15 @@ mod tests {
         state.workers.runs.pop();
         let request_id = store::create_scheduler_decision(
             &mut state,
-            15,
-            "run-completed-worker",
-            "Choose whether to accept the documented limitation.",
+            store::NewSchedulerDecision {
+                ticket: 15,
+                run_id: "run-completed-worker",
+                source_run_id: "run-completed-worker",
+                kind: store::SchedulerDecisionKind::ConflictExhaustion,
+                blocked_status: WorkerStatus::Completed,
+                base_commit: Some("feature-target"),
+                question: "Choose whether to accept the documented limitation.",
+            },
         )
         .unwrap();
         assert_eq!(
@@ -2773,6 +2779,25 @@ mod tests {
             Outcome::Nothing,
             "an unresolved scheduler decision must gate final review"
         );
+        let abandoned = state.scheduler_decisions.last_mut().unwrap();
+        abandoned.response = Some("Leave this ticket incomplete".into());
+        abandoned.disposition = Some(store::SchedulerDecisionDisposition::Abandon);
+        abandoned.application = store::SchedulerDecisionApplication::Abandoned;
+        delivery.tickets.insert(
+            "run-abandoned-but-unintegrated".into(),
+            TicketDelivery {
+                issue: 16,
+                title: "Abandoned implementation remains incomplete".into(),
+                url: "https://github.com/example/project/issues/16".into(),
+                ..TicketDelivery::default()
+            },
+        );
+        assert_eq!(
+            feature_review_outcome(&state, &delivery, source, &[]).unwrap(),
+            Outcome::Nothing,
+            "abandon releases the known-finished worker but cannot satisfy integration evidence"
+        );
+        delivery.tickets.remove("run-abandoned-but-unintegrated");
         state.scheduler_decisions.pop();
         assert!(!request_id.is_empty());
         let branch_head = git(&f.repo, &["rev-parse", "refs/heads/feature/delivery-test"])
@@ -3124,9 +3149,15 @@ else:
         fs::write(&evidence, serde_json::to_vec(&requested_changes).unwrap()).unwrap();
         store::create_scheduler_decision(
             &mut ready_workers,
-            15,
-            "run-completed-worker",
-            "Choose whether to accept the documented limitation.",
+            store::NewSchedulerDecision {
+                ticket: 15,
+                run_id: "run-completed-worker",
+                source_run_id: "run-completed-worker",
+                kind: store::SchedulerDecisionKind::ConflictExhaustion,
+                blocked_status: WorkerStatus::Completed,
+                base_commit: Some("feature-target"),
+                question: "Choose whether to accept the documented limitation.",
+            },
         )
         .unwrap();
         let pending_decision = mark_ready_with(
@@ -3143,7 +3174,7 @@ else:
         assert!(
             pending_decision
                 .to_string()
-                .contains("scheduler decision awaits a human response")
+                .contains("scheduler decision awaits an explicit human action")
         );
         ready_workers.scheduler_decisions.clear();
         let mut closed_children = read(&state_dir).unwrap();

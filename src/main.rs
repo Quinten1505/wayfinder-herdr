@@ -6,7 +6,7 @@ use wayfinder_herdr::{
     orchestration, runtime,
     store::{
         self, AnswerDisposition, Binding, HumanAnswerEvidence, HumanRequestKind, Lock, Provider,
-        RequestKind, WorkerRun, WorkerStatus,
+        RequestKind, SchedulerDecisionDisposition, WorkerRun, WorkerStatus,
     },
     tracker::{self, MapRef, TicketInput},
 };
@@ -139,6 +139,9 @@ enum CommandName {
         request_id: String,
         #[arg(long)]
         response: String,
+        /// Explicit action selected by the human: continue, defer, or abandon.
+        #[arg(long, value_parser = ["continue", "defer", "abandon"])]
+        disposition: String,
     },
     /// Resume a retained attempt. Uncertain workers require explicit absence confirmation.
     RetryWorker {
@@ -750,13 +753,27 @@ fn run() -> Result<()> {
             map,
             request_id,
             response,
+            disposition,
         } => {
             let (_, dir) = tracker_context(&root, &map)?;
             let _lock = Lock::acquire(&dir.join("state.lock"))?;
             let mut state = store::read_state(&dir)?;
-            store::record_scheduler_decision_response(&mut state, &request_id, &response)?;
+            let disposition = match disposition.as_str() {
+                "continue" => SchedulerDecisionDisposition::Continue,
+                "defer" => SchedulerDecisionDisposition::Defer,
+                "abandon" => SchedulerDecisionDisposition::Abandon,
+                _ => unreachable!("clap validated scheduler disposition"),
+            };
+            store::record_scheduler_decision_response(
+                &mut state,
+                &request_id,
+                &response,
+                disposition,
+            )?;
             store::atomic_json(&dir.join("state.json"), &state)?;
-            println!("Recorded the human response for scheduler decision {request_id}.");
+            println!(
+                "Recorded the human response and {disposition:?} action for scheduler decision {request_id}; runtime reconciliation applies it."
+            );
         }
         CommandName::RetryWorker {
             map,
@@ -808,7 +825,7 @@ fn run() -> Result<()> {
                     map_ref.number, prior.ticket
                 ));
             state.workers.runs.push(WorkerRun {
-                id: format!("run-{number:020}"), ticket: prior.ticket, role: prior.role.clone(), attempt: prior.attempt.saturating_add(1), automatic_retries: 0, rework_round: prior.rework_round,
+                id: format!("run-{number:020}"), ticket: prior.ticket, role: prior.role.clone(), attempt: prior.attempt.saturating_add(1), automatic_retries: 0, rework_round: prior.rework_round, rework_round_limit: prior.rework_round_limit,
                 status: WorkerStatus::Queued, worktree, workspace_id: None, tab_id: None, pane_id: None,
                 base_commit: prior.result_commit.clone().or(prior.base_commit.clone()), result_commit: None,
                 summary: None, question: None, human_response: None, human_decision: None,

@@ -1719,6 +1719,7 @@ fn recovered_open_intent_starts_the_agent_once_without_reopening_the_worktree() 
         attempt: 1,
         automatic_retries: 0,
         rework_round: 0,
+        rework_round_limit: store::DEFAULT_REWORK_ROUNDS,
         status: WorkerStatus::OpenIntent,
         worktree: checkout,
         workspace_id: None,
@@ -3082,6 +3083,7 @@ fn cold_restored_or_replaced_agent_identity_becomes_uncertain_without_effects() 
             attempt: 1,
             automatic_retries: 0,
             rework_round: 0,
+            rework_round_limit: store::DEFAULT_REWORK_ROUNDS,
             status: WorkerStatus::Queued,
             worktree: f._temp.path().join("queued-worktree"),
             workspace_id: None,
@@ -3342,7 +3344,8 @@ fn review_rework_budget_advances_independently_of_failure_retry_budget() {
             );
             assert_eq!(
                 state.workers.runs.last().unwrap().status,
-                WorkerStatus::NeedsHuman
+                WorkerStatus::Completed,
+                "a proven-completed reviewer does not reserve capacity while its ticket awaits a decision"
             );
             assert!(
                 state
@@ -3353,10 +3356,159 @@ fn review_rework_budget_advances_independently_of_failure_retry_budget() {
                     .question
                     .as_deref()
                     .unwrap()
-                    .contains("human decision")
+                    .contains("Choose one explicit action")
             );
         }
     }
+    let decision = f.state().scheduler_decisions.last().unwrap().clone();
+    let launch_count = |requests: &[Value]| {
+        requests
+            .iter()
+            .filter(|request| {
+                matches!(
+                    request["method"].as_str(),
+                    Some("worktree.open" | "agent.start" | "agent.prompt")
+                )
+            })
+            .count()
+    };
+    let request_before = launch_count(&f.herdr_state.lock().unwrap().requests);
+    let output = f
+        .cli()
+        .args([
+            "answer-decision",
+            "--map",
+            MAP,
+            "--request-id",
+            &decision.request_id,
+            "--response",
+            "Please make one bounded correction for the required finding.",
+            "--disposition",
+            "continue",
+        ])
+        .output()
+        .unwrap();
+    success(output);
+    // The command records the actual answer. Runtime reconciliation dispatches
+    // the continuation and does not prompt the completed reviewer.
+    success(f.once());
+    let after_restart = f.state();
+    let continued = &after_restart.scheduler_decisions[0];
+    assert_eq!(
+        continued.application,
+        store::SchedulerDecisionApplication::Continued
+    );
+    let successor_id = continued.successor_run_id.as_deref().unwrap();
+    let successor = after_restart
+        .workers
+        .runs
+        .iter()
+        .find(|run| run.id == successor_id)
+        .unwrap();
+    assert_eq!(successor.role, "implementer");
+    assert_eq!(successor.rework_round, 4);
+    assert_eq!(successor.rework_round_limit, 4);
+    assert_eq!(successor.status, WorkerStatus::Running);
+    assert!(successor.context.as_deref().unwrap().contains(
+        "Human's exact response: Please make one bounded correction for the required finding."
+    ));
+    assert_eq!(
+        successor.source_run.as_deref(),
+        Some(decision.run_id.as_str())
+    );
+    let launches = launch_count(&f.herdr_state.lock().unwrap().requests);
+    assert!(launches > request_before);
+    success(f.once());
+    let replayed = f.state();
+    assert_eq!(
+        replayed
+            .workers
+            .runs
+            .iter()
+            .filter(|run| {
+                run.context.as_deref().is_some_and(|context| {
+                    context.contains(&format!("scheduler-decision:{}", decision.request_id))
+                })
+            })
+            .count(),
+        1,
+        "replay after restart must not create another implementation worker"
+    );
+    assert_eq!(
+        launch_count(&f.herdr_state.lock().unwrap().requests),
+        launches,
+        "replay may inspect the worker but must not launch or prompt a duplicate"
+    );
+}
+
+#[test]
+fn deferred_scheduler_decision_for_finished_worker_does_not_block_capacity() {
+    let f = Fixture::new();
+    let mut github = serde_json::from_slice::<Value>(&fs::read(&f.gh_state).unwrap()).unwrap();
+    github["assigned"] = json!(true);
+    github["second_ticket"] = json!(true);
+    fs::write(&f.gh_state, serde_json::to_vec(&github).unwrap()).unwrap();
+
+    let completed = insert_uncertain_run(&f);
+    let mut state = f.state();
+    state.authorization = wayfinder_herdr::store::Authorization::Started;
+    state.concurrency = 1;
+    state.workers.runs[0].status = WorkerStatus::Completed;
+    state.workers.runs[0].rework_round = 3;
+    state.workers.runs[0].base_commit = Some("ticket-13-commit".into());
+    let request_id = store::create_scheduler_decision(
+        &mut state,
+        store::NewSchedulerDecision {
+            ticket: 13,
+            run_id: &completed.id,
+            source_run_id: &completed.id,
+            kind: store::SchedulerDecisionKind::ConflictExhaustion,
+            blocked_status: WorkerStatus::Completed,
+            base_commit: Some("feature-target"),
+            question: "Choose how to handle the exhausted conflict repair.",
+        },
+    )
+    .unwrap();
+    store::record_scheduler_decision_response(
+        &mut state,
+        &request_id,
+        "I need to defer this ticket.",
+        store::SchedulerDecisionDisposition::Defer,
+    )
+    .unwrap();
+    store::atomic_json(&f.dir.join("state.json"), &state).unwrap();
+
+    success(f.once());
+    let after = f.state();
+    assert_eq!(
+        after.scheduler_decisions[0].application,
+        store::SchedulerDecisionApplication::Deferred
+    );
+    let blocked = after
+        .workers
+        .runs
+        .iter()
+        .find(|run| run.id == completed.id)
+        .unwrap();
+    assert_eq!(blocked.status, WorkerStatus::Completed);
+    assert!(!blocked.reserves_capacity());
+    let independent = after
+        .workers
+        .runs
+        .iter()
+        .find(|run| run.ticket == 14)
+        .unwrap();
+    assert_eq!(independent.status, WorkerStatus::Running);
+    assert_eq!(
+        after
+            .workers
+            .runs
+            .iter()
+            .filter(|run| run.reserves_capacity())
+            .count(),
+        1,
+        "the deferred decision holds ticket readiness without reserving an agent slot"
+    );
 }
 
 #[test]
@@ -3365,9 +3517,15 @@ fn scheduler_decision_response_is_durable_and_never_prompts_a_worker() {
     let mut state = f.state();
     let request_id = store::create_scheduler_decision(
         &mut state,
-        13,
-        "run-completed-worker",
-        "Choose how to resolve the exhausted review findings.",
+        store::NewSchedulerDecision {
+            ticket: 13,
+            run_id: "run-completed-worker",
+            source_run_id: "run-completed-worker",
+            kind: store::SchedulerDecisionKind::ConflictExhaustion,
+            blocked_status: WorkerStatus::Completed,
+            base_commit: Some("feature-target"),
+            question: "Choose how to resolve the exhausted review findings.",
+        },
     )
     .unwrap();
     store::atomic_json(&f.dir.join("state.json"), &state).unwrap();
@@ -3381,6 +3539,8 @@ fn scheduler_decision_response_is_durable_and_never_prompts_a_worker() {
             MAP,
             "--request-id",
             &request_id,
+            "--disposition",
+            "defer",
             "--response",
             "Keep the limitation and document the fallback.",
         ])
@@ -3393,6 +3553,103 @@ fn scheduler_decision_response_is_durable_and_never_prompts_a_worker() {
         answered.response.as_deref(),
         Some("Keep the limitation and document the fallback.")
     );
+    assert_eq!(
+        answered.disposition,
+        Some(store::SchedulerDecisionDisposition::Defer)
+    );
+    assert_eq!(
+        answered.application,
+        store::SchedulerDecisionApplication::Deferred,
+        "defer keeps ticket readiness held until a later explicit decision is reconciled"
+    );
+    assert_eq!(answered.answers.len(), 1);
+    let repeat = f
+        .cli()
+        .args([
+            "answer-decision",
+            "--map",
+            MAP,
+            "--request-id",
+            &request_id,
+            "--disposition",
+            "defer",
+            "--response",
+            "Keep the limitation and document the fallback.",
+        ])
+        .output()
+        .unwrap();
+    success(repeat);
+    assert_eq!(f.state().scheduler_decisions[0].answers.len(), 1);
+    let continue_answer = f
+        .cli()
+        .args([
+            "answer-decision",
+            "--map",
+            MAP,
+            "--request-id",
+            &request_id,
+            "--disposition",
+            "continue",
+            "--response",
+            "I choose one bounded continuation.",
+        ])
+        .output()
+        .unwrap();
+    success(continue_answer);
+    assert_eq!(f.state().scheduler_decisions[0].answers.len(), 2);
+    assert_eq!(
+        f.state().scheduler_decisions[0].response.as_deref(),
+        Some("I choose one bounded continuation.")
+    );
+    let repeated_continue = f
+        .cli()
+        .args([
+            "answer-decision",
+            "--map",
+            MAP,
+            "--request-id",
+            &request_id,
+            "--disposition",
+            "continue",
+            "--response",
+            "I choose one bounded continuation.",
+        ])
+        .output()
+        .unwrap();
+    success(repeated_continue);
+    assert_eq!(f.state().scheduler_decisions[0].answers.len(), 2);
+    let invalid_action = f
+        .cli()
+        .args([
+            "answer-decision",
+            "--map",
+            MAP,
+            "--request-id",
+            &request_id,
+            "--disposition",
+            "retry",
+            "--response",
+            "Retry it.",
+        ])
+        .output()
+        .unwrap();
+    assert!(!invalid_action.status.success());
+    let old_request = f
+        .cli()
+        .args([
+            "answer-decision",
+            "--map",
+            MAP,
+            "--request-id",
+            "scheduler-obsolete-request",
+            "--disposition",
+            "abandon",
+            "--response",
+            "Abandon it.",
+        ])
+        .output()
+        .unwrap();
+    assert!(!old_request.status.success());
     assert_eq!(
         f.herdr_state.lock().unwrap().requests.len(),
         requests_before
@@ -3744,6 +4001,7 @@ fn insert_uncertain_run(f: &Fixture) -> WorkerRun {
         attempt: 1,
         automatic_retries: 0,
         rework_round: 0,
+        rework_round_limit: store::DEFAULT_REWORK_ROUNDS,
         status: WorkerStatus::Uncertain,
         worktree: f._temp.path().join("retained-worktree"),
         workspace_id: Some("owned-workspace".into()),
