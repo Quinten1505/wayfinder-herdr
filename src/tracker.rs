@@ -397,6 +397,7 @@ impl GitHub {
                 Ok(after["state"] == "open"
                     && still_child
                     && no_open_blockers
+                    && !assigned.is_empty()
                     && assigned
                         .iter()
                         .all(|assignee| assignee["login"] == login))

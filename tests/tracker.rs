@@ -172,18 +172,29 @@ elif len(segments)>=5 and segments[3]=='issues':
             sys.stderr.write('simulated lost response after comment write\n'); sys.exit(1)
     elif method=='POST' and len(segments)==6 and segments[5]=='assignees':
         target=db['issues'][str(parent)]
-        race=db.get('claim_race_to')
-        if race:
-            target['assignees']=[{'login':race}]
-            del db['claim_race_to']
-        for login in body['assignees']:
-            if not any(a['login']==login for a in target['assignees']): target['assignees'].append({'login':login})
         db['claim_write_count']=db.get('claim_write_count',0)+1
-        if db.get('close_race_on_claim'):
-            target['state']='closed'
-            del db['close_race_on_claim']
-        result=target
-        changed=True
+        if db.get('claim_no_persist') or db.get('claim_error_no_persist'):
+            fail=db.pop('claim_error_no_persist',False)
+            db.pop('claim_no_persist',None)
+            result=target
+            with open(data_path,'w') as f: json.dump(db,f)
+            if fail:
+                sys.stderr.write('simulated assignment write error without persistence\n'); sys.exit(1)
+            # Simulate a successful API response that did not persist the claim.
+            changed=False
+            target=None
+        else:
+            race=db.get('claim_race_to')
+            if race:
+                target['assignees']=[{'login':race}]
+                del db['claim_race_to']
+            for login in body['assignees']:
+                if not any(a['login']==login for a in target['assignees']): target['assignees'].append({'login':login})
+            if db.get('close_race_on_claim'):
+                target['state']='closed'
+                del db['close_race_on_claim']
+            result=target
+            changed=True
     elif method=='GET' and len(segments)==5:
         result=db['issues'][str(parent)]
     elif method=='PATCH' and len(segments)==5:
@@ -453,6 +464,35 @@ fn closed_child_is_rejected_before_claim_and_closure_race_retains_uncertain_inte
     )
     .unwrap();
     assert_eq!(intent["stage"], "uncertain-claim");
+}
+
+#[test]
+fn claim_without_persisted_assignment_fails_and_keeps_uncertain_intent() {
+    for flag in ["claim_no_persist", "claim_error_no_persist"] {
+        let f = Fixture::new(true);
+        let mut db = f.github();
+        db[flag] = json!(true);
+        f.set_github(db);
+
+        let result = f.api(&["tracker", "claim", "--map", MAP, "--ticket", "3"]);
+        assert!(!result.status.success(), "{flag} was incorrectly accepted");
+        assert!(
+            f.github()["issues"]["3"]["assignees"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(f.github()["claim_write_count"], 1);
+        let intent: Value = serde_json::from_slice(
+            &fs::read_dir(f.dir.join("tracker/intents"))
+                .unwrap()
+                .map(|entry| fs::read(entry.unwrap().path()).unwrap())
+                .next()
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(intent["stage"], "uncertain-claim");
+    }
 }
 
 #[test]
