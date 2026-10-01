@@ -1,13 +1,3 @@
 # How should the orchestrating chat present decisions and delegated work?
 
-Parent: ../map.md
-Label: wayfinder:prototype
-Type: prototype
-Mode: HITL
-Status: open
-Assignee: unassigned
-Blocked by: 04-state-and-claims, 05-review-and-handoff
-
-## Question
-
-Prototype the user journey from a loose idea through map creation, human decisions, automatic dispatch, visible worker/reviewer panes, and merge handoff. Get live human feedback on attention, status, interruptions, and control before committing to the interface.
+Moved to [How should the orchestrating chat present decisions and delegated work?](https://github.com/Quinten1505/wayfinder-herdr/issues/7). GitHub Issues is canonical; update that issue. This file preserves the old local link.
