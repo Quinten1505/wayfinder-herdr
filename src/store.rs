@@ -1,0 +1,339 @@
+use anyhow::{Context, Result, bail, ensure};
+use fs2::FileExt;
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+use std::{
+    fs::{self, File, OpenOptions},
+    io::Write,
+    os::unix::fs::{OpenOptionsExt, PermissionsExt},
+    path::{Path, PathBuf},
+};
+
+pub const FORMAT: u32 = 1;
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct Binding {
+    pub repository: PathBuf,
+    pub herdr_binary: PathBuf,
+    pub socket: PathBuf,
+    pub herdr_config: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum Authorization {
+    AwaitingStart,
+    Started,
+    Paused,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct State {
+    pub format_version: u32,
+    pub map: String,
+    pub binding: Binding,
+    pub authorization: Authorization,
+    pub poll_seconds: u64,
+    pub concurrency: u32,
+    /// Always false in this foundation: compatibility alone is not reconciliation.
+    pub reconciled: bool,
+    pub suspension: String,
+    /// Request IDs are retained to make replay after commit-before-unlink safe.
+    pub history: Vec<Applied>,
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Applied {
+    pub id: String,
+    pub command: RequestKind,
+    pub outcome: String,
+}
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RequestKind {
+    Start,
+    Pause,
+    Resume,
+    Reconcile,
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Request {
+    pub format_version: u32,
+    pub sequence: u64,
+    pub id: String,
+    pub command: RequestKind,
+}
+
+pub fn map_identity(input: &str) -> Result<(String, String)> {
+    let (repo, number) = input
+        .rsplit_once('#')
+        .context("map must be OWNER/REPO#NUMBER")?;
+    let parts: Vec<_> = repo.split('/').collect();
+    ensure!(
+        parts.len() == 2
+            && parts.iter().all(|p| !p.is_empty()
+                && p.bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b))),
+        "map must be OWNER/REPO#NUMBER"
+    );
+    let number: u64 = number
+        .parse()
+        .context("map number must be a positive integer")?;
+    ensure!(number > 0, "map number must be positive");
+    let map = format!("{}#{number}", repo.to_ascii_lowercase());
+    let key = format!("{:x}", Sha256::digest(map.as_bytes()));
+    Ok((map, key))
+}
+
+pub fn map_dir(root: &Path, key: &str) -> Result<PathBuf> {
+    ensure!(
+        key.len() == 64
+            && key
+                .bytes()
+                .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase()),
+        "invalid map key"
+    );
+    Ok(root.join("maps").join(key))
+}
+
+pub fn private_dir(path: &Path) -> Result<()> {
+    fs::create_dir_all(path)?;
+    fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
+    File::open(path)?.sync_all()?;
+    if let Some(parent) = path.parent() {
+        File::open(parent)?.sync_all()?;
+    }
+    Ok(())
+}
+
+/// Never unlink a lock file: contenders must lock the same inode across restarts.
+pub struct Lock {
+    _file: File,
+}
+impl Drop for Lock {
+    fn drop(&mut self) {
+        // Explicit unlock also releases a descriptor temporarily inherited across a
+        // concurrent fork before CLOEXEC runs in another test/host command.
+        let _ = FileExt::unlock(&self._file);
+    }
+}
+impl Lock {
+    pub fn acquire(path: &Path) -> Result<Self> {
+        let file = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .mode(0o600)
+            .open(path)?;
+        file.try_lock_exclusive().with_context(|| {
+            format!(
+                "lock busy: {} (another runtime or command owns this map)",
+                path.display()
+            )
+        })?;
+        Ok(Self { _file: file })
+    }
+}
+
+/// Commit in the same directory: sync data, atomic rename, then sync directory.
+pub fn atomic_json<T: Serialize>(path: &Path, value: &T) -> Result<()> {
+    let parent = path.parent().context("state path has no parent")?;
+    let mut tmp = tempfile::NamedTempFile::new_in(parent)?;
+    serde_json::to_writer_pretty(&mut tmp, value)?;
+    tmp.write_all(b"\n")?;
+    tmp.as_file().sync_all()?;
+    tmp.persist(path).map_err(|e| e.error)?;
+    File::open(parent)?.sync_all()?;
+    Ok(())
+}
+
+pub fn read_versioned<T: for<'de> Deserialize<'de>>(path: &Path) -> Result<T> {
+    let bytes = fs::read(path).with_context(|| format!("read {}", path.display()))?;
+    let value: serde_json::Value = serde_json::from_slice(&bytes).with_context(|| {
+        format!(
+            "invalid JSON in {}; restore a known-good backup; file was not changed",
+            path.display()
+        )
+    })?;
+    if value.get("format_version").and_then(|v| v.as_u64()) != Some(FORMAT as u64) {
+        bail!(
+            "unsupported state/request format in {}; install a Wayfinder version supporting this format or restore a compatible backup; no state was changed",
+            path.display()
+        );
+    }
+    serde_json::from_value(value).with_context(|| format!("unsupported or corrupt fields in {}; keep this file and use a compatible Wayfinder version; no state was changed", path.display()))
+}
+
+pub fn read_state(dir: &Path) -> Result<State> {
+    let state: State = read_versioned(&dir.join("state.json"))?;
+    let (_, expected) = map_identity(&state.map)?;
+    ensure!(
+        dir.file_name().and_then(|n| n.to_str()) == Some(&expected),
+        "map identity does not match state directory"
+    );
+    ensure!(
+        (1..=3600).contains(&state.poll_seconds) && state.concurrency > 0,
+        "invalid runtime settings; state unchanged"
+    );
+    Ok(state)
+}
+
+pub fn attach(
+    root: &Path,
+    map: &str,
+    binding: Binding,
+    poll_seconds: u64,
+) -> Result<(String, State)> {
+    ensure!(
+        (1..=3600).contains(&poll_seconds),
+        "poll seconds must be 1..3600"
+    );
+    let (map, key) = map_identity(map)?;
+    let dir = map_dir(root, &key)?;
+    private_dir(root)?;
+    private_dir(&root.join("maps"))?;
+    private_dir(&dir)?;
+    private_dir(&dir.join("inbox"))?;
+    let _lock = Lock::acquire(&dir.join("state.lock"))?;
+    let path = dir.join("state.json");
+    let state = if path.exists() {
+        let state = read_state(&dir)?;
+        ensure!(
+            state.binding == binding,
+            "map already bound to another repository or herdr endpoint; existing state preserved"
+        );
+        state
+    } else {
+        let state = State {
+            format_version: FORMAT,
+            map,
+            binding,
+            authorization: Authorization::AwaitingStart,
+            poll_seconds,
+            concurrency: 3,
+            reconciled: false,
+            suspension:
+                "First attachment: explicit Start required; tracker reconciliation not implemented"
+                    .into(),
+            history: vec![],
+        };
+        atomic_json(&path, &state)?;
+        state
+    };
+    Ok((key, state))
+}
+
+pub fn enqueue(dir: &Path, command: RequestKind) -> Result<String> {
+    // Validate before adding requests; unsupported state must remain untouched.
+    read_state(dir)?;
+    let inbox = dir.join("inbox");
+    // Serialize submissions independently from the runtime state transaction. Persist
+    // the sequence before publishing a request: crashes may leave gaps, never reuse IDs.
+    let _queue_lock = Lock::acquire(&dir.join("inbox.lock"))?;
+    #[derive(Serialize, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Sequence {
+        format_version: u32,
+        next: u64,
+    }
+    let sequence_path = dir.join("sequence.json");
+    let sequence: Sequence = if sequence_path.exists() {
+        read_versioned(&sequence_path)?
+    } else {
+        Sequence {
+            format_version: FORMAT,
+            next: 1,
+        }
+    };
+    let next = sequence
+        .next
+        .checked_add(1)
+        .context("request sequence exhausted")?;
+    atomic_json(
+        &sequence_path,
+        &Sequence {
+            format_version: FORMAT,
+            next,
+        },
+    )?;
+    let id = format!("request-{:020}", sequence.next);
+    let request = Request {
+        format_version: FORMAT,
+        sequence: sequence.next,
+        id: id.clone(),
+        command,
+    };
+    atomic_json(&inbox.join(format!("{id}.json")), &request)?;
+    Ok(id)
+}
+
+pub fn process_requests(dir: &Path, state: &mut State) -> Result<()> {
+    let mut paths = fs::read_dir(dir.join("inbox"))?
+        .map(|r| r.map(|e| e.path()))
+        .collect::<std::io::Result<Vec<_>>>()?;
+    paths.retain(|p| p.extension().is_some_and(|e| e == "json"));
+    let mut requests = paths
+        .into_iter()
+        .map(|path| {
+            let request: Request = read_versioned(&path)?;
+            Ok((request.sequence, path, request))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    requests.sort_by_key(|(sequence, _, _)| *sequence);
+    for (_, path, request) in requests {
+        ensure!(
+            path.file_stem().and_then(|p| p.to_str()) == Some(&request.id),
+            "request ID does not match filename; request retained"
+        );
+        if !state.history.iter().any(|r| r.id == request.id) {
+            let outcome = match request.command {
+                RequestKind::Start => {
+                    if state.authorization == Authorization::AwaitingStart {
+                        state.authorization = Authorization::Started;
+                    }
+                    "Start recorded; dispatch still requires successful reconciliation"
+                }
+                RequestKind::Pause => {
+                    state.authorization = Authorization::Paused;
+                    "Dispatch paused"
+                }
+                RequestKind::Resume => {
+                    if state
+                        .history
+                        .iter()
+                        .any(|r| r.command == RequestKind::Start)
+                    {
+                        state.authorization = Authorization::Started;
+                        "Resume recorded; dispatch still requires successful reconciliation"
+                    } else {
+                        "Resume rejected: explicit Start required first"
+                    }
+                }
+                RequestKind::Reconcile => "Reconciliation requested",
+            };
+            // Pause before first Start must not prevent the first explicit Start.
+            if request.command == RequestKind::Start
+                && !state
+                    .history
+                    .iter()
+                    .any(|r| r.command == RequestKind::Start)
+            {
+                state.authorization = Authorization::Started;
+            }
+            state.history.push(Applied {
+                id: request.id,
+                command: request.command,
+                outcome: outcome.into(),
+            });
+            state.reconciled = false;
+            atomic_json(&dir.join("state.json"), state)?;
+        }
+        fs::remove_file(&path)?;
+        File::open(dir.join("inbox"))?.sync_all()?;
+    }
+    Ok(())
+}
