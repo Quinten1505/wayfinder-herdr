@@ -77,15 +77,53 @@ fn reconcile(dir: &Path, state: &mut State) -> Result<String> {
         &delivery::reconcile(dir, state, &children)?,
     )?;
     let delivery_milestones = delivery::chat_milestones(dir)?;
-    // Scheduler-decision adaptation is added after the issue-15 state commit
-    // is replayed; chat transport and ticket-delivery state remain separate.
+    let delivery_state = delivery::read(dir)?;
+    let scheduler_decisions = state
+        .scheduler_decisions
+        .iter()
+        .map(|decision| {
+            let child = children
+                .iter()
+                .find(|child| child.number == decision.ticket);
+            let ticket = delivery_state
+                .tickets
+                .values()
+                .find(|ticket| ticket.issue == decision.ticket);
+            let title = child
+                .map(|child| child.title.as_str())
+                .filter(|title| !title.trim().is_empty())
+                .or_else(|| ticket.map(|ticket| ticket.title.as_str()))
+                .filter(|title| !title.trim().is_empty())
+                .unwrap_or("Wayfinder ticket with missing title metadata");
+            let url = child
+                .map(|child| child.url.as_str())
+                .filter(|url| !url.trim().is_empty())
+                .or_else(|| ticket.map(|ticket| ticket.url.as_str()))
+                .filter(|url| !url.trim().is_empty())
+                .map(str::to_owned)
+                .unwrap_or_else(|| {
+                    format!(
+                        "https://github.com/{}/{}/issues/{}",
+                        map.owner, map.repository, decision.ticket
+                    )
+                });
+            crate::orchestration::SchedulerDecisionNotice {
+                request_id: decision.request_id.clone(),
+                ticket_link: format!("[{title}]({url})"),
+                run_id: decision.run_id.clone(),
+                question: decision.question.clone(),
+                response: decision.response.clone(),
+                action_required: decision.awaits_human_action(),
+            }
+        })
+        .collect::<Vec<_>>();
     crate::orchestration::reconcile(
         dir,
         state,
         &herdr,
         &github,
         &delivery_milestones,
-        &[],
+        &scheduler_decisions,
     )?;
     state.reconciled = true;
     match state.authorization {

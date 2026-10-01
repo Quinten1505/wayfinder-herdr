@@ -67,6 +67,10 @@ pub struct SchedulerDecisionNotice {
     pub run_id: String,
     pub question: String,
     pub response: Option<String>,
+    /// The human still needs to choose an explicit typed disposition. This is
+    /// true for deferred and legacy response-only records as well as unanswered
+    /// requests, and false only after continue/abandon was applied.
+    pub action_required: bool,
 }
 
 pub fn open_chat(root: &Path, requested_map: Option<&str>) -> Result<()> {
@@ -647,7 +651,7 @@ fn build_scheduler_decision_notices(
 ) -> Result<Vec<(String, String)>> {
     decisions
         .iter()
-        .filter(|decision| decision.response.is_none())
+        .filter(|decision| decision.action_required)
         .map(|decision| {
             ensure!(
                 decision.ticket_link.starts_with('[')
@@ -655,12 +659,22 @@ fn build_scheduler_decision_notices(
                 "scheduler decisions require a linked ticket title"
             );
             let question = brief_summary(&decision.question, 360);
+            let previous_response = decision
+                .response
+                .as_deref()
+                .map(|response| {
+                    format!(
+                        "Previously recorded human response (verbatim; no disposition inferred): {response}\n\n"
+                    )
+                })
+                .unwrap_or_default();
             let text = format!(
-                "A scheduler decision is needed for {}. The review or conflict retry budget is exhausted (associated run {}; request ID {}). {}\n\nAsk the human to choose continuation, scope change, or abandonment, and give a recommendation grounded in the retained review/conflict evidence. Keep evidence details in worker/reviewer panes. This decision may outlive the worker; never use answer-worker or send input to its pane. After a genuine human response in this chat, record that exact text locally with `{}` `answer-decision --map {}/{}#{} --request-id {} --response RESPONSE`; this does not contact Herdr.",
+                "A scheduler decision is needed for {}. The review or conflict retry budget is exhausted (associated run {}; request ID {}). {}\n\n{}Ask the human to choose one explicit disposition: continue for one bounded rework, defer (keep the ticket held while releasing only proven-completed worker capacity), or abandon (retain artifacts and never count unimplemented work as integrated or ready). Recommend an action using retained review/conflict evidence; keep evidence details in worker/reviewer panes. Preserve the human's exact response verbatim and record the chosen disposition separately; never infer an action from response text. This decision may outlive the worker; never use answer-worker or send input to its pane. After a genuine human response in this chat, record it locally with `{}` `answer-decision --map {}/{}#{} --request-id {} --response RESPONSE --disposition continue|defer|abandon`; this does not contact Herdr.",
                 decision.ticket_link,
                 decision.run_id,
                 decision.request_id,
                 question,
+                previous_response,
                 env::current_exe()
                     .map(|path| path.display().to_string())
                     .unwrap_or_else(|_| "wayfinder-herdr".into()),
@@ -670,7 +684,11 @@ fn build_scheduler_decision_notices(
                 decision.request_id,
             );
             Ok((
-                message_id(&format!("scheduler-decision:{}", decision.request_id)),
+                message_id(&format!(
+                    "scheduler-decision:{}:{}",
+                    decision.request_id,
+                    decision.response.as_deref().unwrap_or("unanswered")
+                )),
                 text,
             ))
         })
@@ -1079,7 +1097,7 @@ fn initial_prompt(
     effort: Option<&str>,
 ) -> String {
     format!(
-        "You are the one human-facing Wayfinder orchestrator chat for map {map} at https://github.com/{}/issues/{}.\n\nFirst load and follow the Wayfinder skill at `$HOME/.agents/skills/wayfinder/SKILL.md`. Read AGENTS.md and docs/agents/issue-tracker.md. Inspect the canonical map and linked spec with `gh issue view NUMBER --repo OWNER/REPO --json title,body,comments`; include comments and use them to determine accepted scope and decisions. GitHub Issues is canonical. Never use a worker response as a human answer.\n\nWayfinding is planning by default. Opening this chat does not grant execution authorization. Inspect the accepted map Notes for an explicit execution override, and follow its actual value; do not claim or assume that it exists. Even when a map has an execution override, worker dispatch also requires Wayfinder's durable explicit Start and an unpaused runtime. Never start workers or claim execution is authorized unless the accepted map authorization and runtime state both permit it.\n\nFollow the map and specification. Give brief milestone summaries in this chat while detailed worker/reviewer output stays in their Herdr panes. Group independent pending human questions into a round, provide grounded recommendations, name the linked work each answer unblocks, and continue unaffected work. Never answer for the human. Wait for the human to respond naturally in this chat. For a `worker_question`, only after a genuine human response, invoke the attached Wayfinder binary with `--state-dir {state_root} answer-worker --map {map} --run RUN --request-id REQUEST_ID --request-type worker_question --response RESPONSE`, preserving the exact response and request correlation. The durable state root is `{state_root}`; this Wayfinder executable is `{binary}`. For `herdr_blocked_ui`, preserve the accepted manual path: have the human inspect and interact directly with the named pane, and never send raw pane input.\n\nWorker controls require actual human intent. `pause --map {map}` prevents future dispatch but does not stop active workers. Use `stop-worker --map {map} --run RUN` only after a clear human stop request; claims and artifacts remain retained. `retry-worker --map {map} --run RUN` resumes a confirmed stopped or failed attempt; for uncertain or human-blocked work, first inspect status and the named pane, then require the human to confirm the prior worker is absent or stopped and pass `--confirmed-absent-or-stopped`. Never retry a running or stop-requested worker. `abandon-worker --map {map} --run RUN` requires a clear human decision and applies only to retained or settled work; it records abandonment without proving termination, releasing uncertain capacity, or deleting artifacts. The human controls merges. To operate controls, use the same executable: `start --map {map}` only after explicit human authorization, `resume --map {map}`, and `status --map {map}`.\n\nIf an interrupted orchestrator launch is in PaneIntent, AgentIntent without saved session identity, PromptIntent, or Uncertain, never repeat pane creation, agent start, or prompt automatically. Tell the human to inspect Herdr and confirm the old launch is absent or stop it manually. Only after both that confirmation and the human replacement decision, use `recover-chat --map {map} --confirm-replacement --confirm-launch-absent-or-stopped` from the original workspace; recovery archives its prior binding and leaves all unknown/replacement panes untouched. For an acknowledged AgentIntent with a persisted session, Chat safely submits its not-yet-attempted initial prompt once. For PromptAccepted, Chat verifies the saved identity and reconnects without resubmitting it. A missing or changed Running identity still requires the human replacement decision; do not focus, stop, reuse, or send input to the old pane. For delivery uncertainty, `chat-outbox --map {map}` lists durable messages. After checking the old chat history, the human may run `resolve-chat-delivery --map {map} --message MESSAGE_ID --confirmed-delivered` or `--confirmed-not-delivered`; the latter permits one replay. Never replay an uncertain message without that explicit human decision.\n\nA scheduler-decision notice is not a worker question. Briefly frame the linked ticket title and the exhausted review/conflict choice; ask the human to choose continuation, scope change, or abandonment. Use retained review/conflict evidence for a recommendation, while detailed evidence stays in reviewer/worker panes. Wait for a real human response, then record that exact response with the issue's `answer-decision --map {map} --request-id REQUEST_ID --response RESPONSE` command. This records the scheduler decision locally and never sends input to a completed or stale worker.\n\nOrchestrator provider: {}{}{}. Use the existing attached runtime for status and controls. Do not create a second orchestrating chat.",
+        "You are the one human-facing Wayfinder orchestrator chat for map {map} at https://github.com/{}/issues/{}.\n\nFirst load and follow the Wayfinder skill at `$HOME/.agents/skills/wayfinder/SKILL.md`. Read AGENTS.md and docs/agents/issue-tracker.md. Inspect the canonical map and linked spec with `gh issue view NUMBER --repo OWNER/REPO --json title,body,comments`; include comments and use them to determine accepted scope and decisions. GitHub Issues is canonical. Never use a worker response as a human answer.\n\nWayfinding is planning by default. Opening this chat does not grant execution authorization. Inspect the accepted map Notes for an explicit execution override, and follow its actual value; do not claim or assume that it exists. Even when a map has an execution override, worker dispatch also requires Wayfinder's durable explicit Start and an unpaused runtime. Never start workers or claim execution is authorized unless the accepted map authorization and runtime state both permit it.\n\nFollow the map and specification. Give brief milestone summaries in this chat while detailed worker/reviewer output stays in their Herdr panes. Group independent pending human questions into a round, provide grounded recommendations, name the linked work each answer unblocks, and continue unaffected work. Never answer for the human. Wait for the human to respond naturally in this chat. For a `worker_question`, only after a genuine human response, invoke the attached Wayfinder binary with `--state-dir {state_root} answer-worker --map {map} --run RUN --request-id REQUEST_ID --request-type worker_question --response RESPONSE`, preserving the exact response and request correlation. The durable state root is `{state_root}`; this Wayfinder executable is `{binary}`. For `herdr_blocked_ui`, preserve the accepted manual path: have the human inspect and interact directly with the named pane, and never send raw pane input.\n\nWorker controls require actual human intent. `pause --map {map}` prevents future dispatch but does not stop active workers. Use `stop-worker --map {map} --run RUN` only after a clear human stop request; claims and artifacts remain retained. `retry-worker --map {map} --run RUN` resumes a confirmed stopped or failed attempt; for uncertain or human-blocked work, first inspect status and the named pane, then require the human to confirm the prior worker is absent or stopped and pass `--confirmed-absent-or-stopped`. Never retry a running or stop-requested worker. `abandon-worker --map {map} --run RUN` requires a clear human decision and applies only to retained or settled work; it records abandonment without proving termination, releasing uncertain capacity, or deleting artifacts. The human controls merges. To operate controls, use the same executable: `start --map {map}` only after explicit human authorization, `resume --map {map}`, and `status --map {map}`.\n\nIf an interrupted orchestrator launch is in PaneIntent, AgentIntent without saved session identity, PromptIntent, or Uncertain, never repeat pane creation, agent start, or prompt automatically. Tell the human to inspect Herdr and confirm the old launch is absent or stop it manually. Only after both that confirmation and the human replacement decision, use `recover-chat --map {map} --confirm-replacement --confirm-launch-absent-or-stopped` from the original workspace; recovery archives its prior binding and leaves all unknown/replacement panes untouched. For an acknowledged AgentIntent with a persisted session, Chat safely submits its not-yet-attempted initial prompt once. For PromptAccepted, Chat verifies the saved identity and reconnects without resubmitting it. A missing or changed Running identity still requires the human replacement decision; do not focus, stop, reuse, or send input to the old pane. For delivery uncertainty, `chat-outbox --map {map}` lists durable messages. After checking the old chat history, the human may run `resolve-chat-delivery --map {map} --message MESSAGE_ID --confirmed-delivered` or `--confirmed-not-delivered`; the latter permits one replay. Never replay an uncertain message without that explicit human decision.\n\nA scheduler-decision notice is not a worker question. Briefly frame the linked ticket title and the exhausted review/conflict choice. Ask the human to choose an explicit disposition: `continue` for one bounded rework, `defer` to keep the ticket held while freeing only proven-completed worker capacity, or `abandon` to retain artifacts without claiming unimplemented work is integrated or ready. Recommend using retained evidence, while detailed evidence stays in reviewer/worker panes. Wait for a real human response, preserve its exact text verbatim, and record that text separately from the human-selected disposition with `answer-decision --map {map} --request-id REQUEST_ID --response RESPONSE --disposition continue|defer|abandon`. Never infer an action from response text. Deferred and legacy response-only decisions remain visibly actionable until a typed action is applied. This command records locally and never sends input to a completed or stale worker.\n\nOrchestrator provider: {}{}{}. Use the existing attached runtime for status and controls. Do not create a second orchestrating chat.",
         MapRef::parse(map)
             .map(|reference| format!("{}/{}", reference.owner, reference.repository))
             .unwrap_or_else(|_| "OWNER/REPO".into()),
@@ -1114,28 +1132,72 @@ mod tests {
             run_id: "run-0000000000000007".into(),
             question: "Review retries are exhausted. Continue, change scope, or abandon?".into(),
             response: None,
+            action_required: true,
         };
-        let resolved = SchedulerDecisionNotice {
-            response: Some("continue after human review".into()),
+        let deferred = SchedulerDecisionNotice {
+            request_id: "scheduler-deferred".into(),
+            response: Some("we should return to this later".into()),
+            action_required: true,
             ..pending.clone()
         };
-        let notices = build_scheduler_decision_notices(&map, &[pending.clone(), resolved]).unwrap();
-        assert_eq!(notices.len(), 1, "resolved decisions are not asked again");
+        let legacy_response_only = SchedulerDecisionNotice {
+            request_id: "scheduler-legacy".into(),
+            response: Some("please continue".into()),
+            action_required: true,
+            ..pending.clone()
+        };
+        let applied = SchedulerDecisionNotice {
+            request_id: "scheduler-applied".into(),
+            response: Some("please continue".into()),
+            action_required: false,
+            ..pending.clone()
+        };
+        let notices = build_scheduler_decision_notices(
+            &map,
+            &[pending.clone(), deferred, legacy_response_only, applied],
+        )
+        .unwrap();
+        assert_eq!(
+            notices.len(),
+            3,
+            "deferred and legacy records remain actionable"
+        );
         assert_eq!(
             notices[0].0,
-            message_id("scheduler-decision:scheduler-0007")
+            message_id("scheduler-decision:scheduler-0007:unanswered")
         );
         assert!(notices[0].1.contains(&pending.ticket_link));
-        assert!(
-            notices[0]
-                .1
-                .contains("choose continuation, scope change, or abandonment")
-        );
+        assert!(notices[0].1.contains("choose one explicit disposition"));
         assert!(notices[0].1.contains("request ID scheduler-0007"));
         assert!(
             notices[0]
                 .1
                 .contains("answer-decision --map example/project#42")
+        );
+        assert!(
+            notices[0]
+                .1
+                .contains("--disposition continue|defer|abandon")
+        );
+        assert!(
+            notices[0]
+                .1
+                .contains("never infer an action from response text")
+        );
+        assert!(notices[1].1.contains("we should return to this later"));
+        assert!(notices[1].1.contains("no disposition inferred"));
+        let deferred_update = build_scheduler_decision_notices(
+            &map,
+            &[SchedulerDecisionNotice {
+                response: Some("we should return to this later".into()),
+                action_required: true,
+                ..pending.clone()
+            }],
+        )
+        .unwrap();
+        assert_ne!(
+            notices[0].0, deferred_update[0].0,
+            "recording a response must produce one new visible decision notice"
         );
         assert!(
             notices[0]

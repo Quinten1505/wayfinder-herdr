@@ -246,7 +246,9 @@ fn approved_review(run: &crate::store::WorkerRun, expected_commit: &str) -> Resu
     })
 }
 
-/// Human-readable, read-only delivery milestones for the orchestrating chat.
+/// Human-readable, read-only ticket and handoff milestones for the orchestrating chat.
+/// Scheduler decisions are supplied separately as typed notices so they have one
+/// actionable message instead of a duplicate summary here.
 pub fn chat_milestones(dir: &Path) -> Result<Vec<String>> {
     let state = read(dir)?;
     let mut milestones = Vec::new();
@@ -331,30 +333,6 @@ pub fn chat_milestones(dir: &Path) -> Result<Vec<String>> {
                 });
             if let Some((title, url)) = title_url {
                 milestones.push(format!("A human decision is pending for [{title}]({url})."));
-            }
-        }
-        for decision in runtime
-            .scheduler_decisions
-            .iter()
-            .filter(|decision| decision.awaits_human_action())
-        {
-            if let Some(child) = children
-                .iter()
-                .find(|child| child.number == decision.ticket)
-            {
-                milestones.push(format!(
-                    "A scheduler decision is pending for [{}]({}): {}",
-                    child.title, child.url, decision.question
-                ));
-            } else if let Some(ticket) = state
-                .tickets
-                .values()
-                .find(|ticket| ticket.issue == decision.ticket && !ticket.title.is_empty())
-            {
-                milestones.push(format!(
-                    "A scheduler decision is pending for [{}]({}): {}",
-                    ticket.title, ticket.url, decision.question
-                ));
             }
         }
     }

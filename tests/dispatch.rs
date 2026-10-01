@@ -19,6 +19,7 @@ use wayfinder_herdr::store::{
     Provider, RequestKind, WorkerRun, WorkerStatus,
 };
 use wayfinder_herdr::{
+    delivery::{DeliveryState, TicketDelivery},
     herdr::Client,
     orchestration::{self, SchedulerDecisionNotice},
     tracker::GitHub,
@@ -1042,7 +1043,9 @@ fn explicit_chat_recovery_archives_changed_identity_and_preserves_pending_human_
         assert_eq!(occupant["terminal_id"], "replacement-terminal");
         herdr.agent_status = "idle".into();
     }
+    f.herdr_state.lock().unwrap().agent_status = "idle".into();
     success(f.once());
+    f.herdr_state.lock().unwrap().agent_status = "idle".into();
     success(f.once());
     let herdr = f.herdr_state.lock().unwrap();
     assert_eq!(herdr.agents[&old.pane_id]["agent"], "claude");
@@ -1644,10 +1647,7 @@ fn scheduler_decision_notice_reaches_chat_without_worker_input() {
         run_id: "run-completed-0007".into(),
         question: "Review retries are exhausted. Continue, change scope, or abandon?".into(),
         response: None,
-    };
-    let resolved = SchedulerDecisionNotice {
-        response: Some("continue after human review".into()),
-        ..pending.clone()
+        action_required: true,
     };
     let herdr = Client::new(&state.binding.socket);
     let github = GitHub::default();
@@ -1659,7 +1659,7 @@ fn scheduler_decision_notice_reaches_chat_without_worker_input() {
             &herdr,
             &github,
             &[],
-            &[pending.clone(), resolved.clone()],
+            std::slice::from_ref(&pending),
         )
         .unwrap();
         f.herdr_state.lock().unwrap().agent_status = "idle".into();
@@ -1674,7 +1674,9 @@ fn scheduler_decision_notice_reaches_chat_without_worker_input() {
         .collect::<Vec<_>>();
     assert_eq!(decision_prompts.len(), 1);
     assert!(decision_prompts[0].contains(&pending.ticket_link));
-    assert!(decision_prompts[0].contains("choose continuation, scope change, or abandonment"));
+    assert!(decision_prompts[0].contains("choose one explicit disposition"));
+    assert!(decision_prompts[0].contains("--disposition continue|defer|abandon"));
+    assert!(decision_prompts[0].contains("never infer an action from response text"));
     assert!(decision_prompts[0].contains("answer-decision --map example/project#42"));
     assert!(decision_prompts[0].contains("never use answer-worker or send input to its pane"));
     assert!(calls.iter().any(|call| {
@@ -3361,6 +3363,67 @@ fn review_rework_budget_advances_independently_of_failure_retry_budget() {
         }
     }
     let decision = f.state().scheduler_decisions.last().unwrap().clone();
+    // Exercise the real runtime adapter end-to-end: durable delivery milestones
+    // and an exhausted scheduler decision are sent to the verified chat pane.
+    fs::write(
+        f.dir.join("chat-outbox.json"),
+        json!({"format_version": 1, "messages": []}).to_string(),
+    )
+    .unwrap();
+    success(f.chat());
+    let mut delivery = DeliveryState::default();
+    delivery.tickets.insert(
+        "review-handoff-fixture".into(),
+        TicketDelivery {
+            issue: decision.ticket,
+            title: "Implement sample task 13".into(),
+            url: "https://github.com/example/project/issues/13".into(),
+            last_error: Some("fixture handoff needs human inspection".into()),
+            ..TicketDelivery::default()
+        },
+    );
+    store::atomic_json(&f.dir.join("delivery.json"), &delivery).unwrap();
+    f.herdr_state.lock().unwrap().agent_status = "idle".into();
+    success(f.once());
+    let mut outbox: Value =
+        serde_json::from_slice(&fs::read(f.dir.join("chat-outbox.json")).unwrap()).unwrap();
+    for message in outbox["messages"].as_array_mut().unwrap() {
+        let text = message["text"].as_str().unwrap_or_default();
+        if !text.contains("A scheduler decision is needed")
+            && !text.contains("fixture handoff needs human inspection")
+        {
+            message["status"] = json!("delivered");
+        }
+    }
+    store::atomic_json(&f.dir.join("chat-outbox.json"), &outbox).unwrap();
+    f.herdr_state.lock().unwrap().agent_status = "idle".into();
+    success(f.once());
+    f.herdr_state.lock().unwrap().agent_status = "idle".into();
+    success(f.once());
+    let chat_prompts = f
+        .herdr_state
+        .lock()
+        .unwrap()
+        .requests
+        .iter()
+        .filter(|request| request["method"] == "agent.prompt")
+        .filter_map(|request| request["params"]["text"].as_str())
+        .filter(|text| text.contains("[WAYFINDER OUTBOX MESSAGE"))
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    assert!(
+        chat_prompts.iter().any(|text| {
+            text.contains(&decision.request_id)
+                && text.contains(
+                    "[Implement sample task 13](https://github.com/example/project/issues/13)",
+                )
+                && text.contains("--disposition continue|defer|abandon")
+        }),
+        "chat prompts: {chat_prompts:#?}"
+    );
+    assert!(chat_prompts.iter().any(|text| {
+        text.contains("Delivery for [Implement sample task 13](https://github.com/example/project/issues/13) is held: fixture handoff needs human inspection")
+    }));
     let launch_count = |requests: &[Value]| {
         requests
             .iter()
