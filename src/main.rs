@@ -607,8 +607,16 @@ fn run() -> Result<()> {
                                 wayfinder_herdr::herdr::HerdrApiError::is_agent_blocked,
                             ) =>
                 {
-                    let question = herdr.read_recent(&pane)?["read"]["text"]
-                        .as_str().context("Herdr rejected the worker prompt as blocked and omitted its current prompt")?.to_owned();
+                    let question = herdr
+                        .read_recent(&pane)
+                        .ok()
+                        .and_then(|value| value["read"]["text"].as_str().map(str::to_owned))
+                        .filter(|text| !text.trim().is_empty())
+                        .unwrap_or_else(|| {
+                            format!(
+                                "Herdr confirmed this worker is blocked, but its prompt could not be read. Inspect the named pane {pane} directly before responding."
+                            )
+                        });
                     let worker = &mut state.workers.runs[index];
                     worker.status = WorkerStatus::NeedsHuman;
                     if let Some(answer) = worker.answer_history.last_mut() {
@@ -618,7 +626,7 @@ fn run() -> Result<()> {
                     worker.question = Some(question);
                     store::atomic_json(&dir.join("state.json"), &state)?;
                     anyhow::bail!(
-                        "Herdr confirmed the prompt was rejected before input; no answer was submitted. Review the current prompt and use its new request ID/type"
+                        "Herdr confirmed the prompt was rejected before input; no answer was submitted. Inspect the named pane {pane} directly and use the new manual request ID/type after reviewing its current UI"
                     );
                 }
                 Err(error) => {

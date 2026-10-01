@@ -58,6 +58,7 @@ struct HerdrState {
     ambiguous_start_response: bool,
     ambiguous_close_response: bool,
     reject_next_prompt_as_blocked: bool,
+    fail_next_read: bool,
     changed_read: bool,
     opened_worktrees: Vec<OpenedWorktree>,
     agents: HashMap<String, Value>,
@@ -344,12 +345,18 @@ fn handle_request(mut stream: std::os::unix::net::UnixStream, state: &Arc<Mutex<
             }
         }
         "agent.read" => {
-            let text = if state.changed_read {
-                "Approval required: allow running a shell command?"
+            if state.fail_next_read {
+                state.fail_next_read = false;
+                error =
+                    Some(json!({"code":"read_failed","message":"simulated pane snapshot failure"}));
             } else {
-                "Question: Which option should I use, A or B?"
-            };
-            result = json!({"type":"pane_read","read":{"text":text}})
+                let text = if state.changed_read {
+                    "Approval required: allow running a shell command?"
+                } else {
+                    "Question: Which option should I use, A or B?"
+                };
+                result = json!({"type":"pane_read","read":{"text":text}})
+            }
         }
         "pane.close" => {
             let pane = request["params"]["pane_id"].as_str().unwrap().to_owned();
@@ -769,6 +776,94 @@ fn recorded_worker_question_uses_correlated_agent_prompt() {
         .collect::<Vec<_>>();
     assert_eq!(prompts.len(), 2);
     assert_eq!(prompts[1]["params"]["text"], "Choose option A.");
+    assert!(
+        !records
+            .requests
+            .iter()
+            .any(|r| r["method"] == "pane.send_input")
+    );
+}
+
+#[test]
+fn blocked_pre_effect_read_failure_persists_manual_request_across_runtime_restart() {
+    let f = Fixture::new();
+    f.apply(RequestKind::Start);
+    let original = f.state().workers.runs[0].clone();
+    write_worker_result(
+        &original,
+        json!({
+            "format_version":1,
+            "run_id":original.id,
+            "ticket":original.ticket,
+            "role":original.role,
+            "status":"blocked",
+            "summary":"needs a human decision",
+            "question":"Which option should I use, A or B?"
+        }),
+    );
+    f.herdr_state.lock().unwrap().agent_status = "idle".into();
+    success(f.once());
+    let pending = f.state().workers.runs[0].clone();
+    f.herdr_state.lock().unwrap().reject_next_prompt_as_blocked = true;
+    f.herdr_state.lock().unwrap().fail_next_read = true;
+    let rejected = answer_cli(&f, &pending, "worker_question", "Choose option A.");
+    assert!(!rejected.status.success());
+
+    let fallback = f.state().workers.runs[0].clone();
+    assert_eq!(fallback.status, WorkerStatus::NeedsHuman);
+    assert!(fallback.status.reserves_capacity());
+    assert_eq!(
+        fallback.human_request_kind,
+        Some(store::HumanRequestKind::HerdrBlockedUi)
+    );
+    assert_ne!(fallback.human_request_id, pending.human_request_id);
+    assert!(
+        fallback
+            .question
+            .as_deref()
+            .unwrap()
+            .contains("Inspect the named pane pane-owned directly")
+    );
+    assert_eq!(fallback.human_response.as_deref(), Some("Choose option A."));
+    assert_eq!(fallback.answer_history.len(), 1);
+    assert_eq!(
+        fallback.answer_history[0].request_id,
+        pending.human_request_id.unwrap()
+    );
+    assert_eq!(
+        fallback.answer_history[0].disposition,
+        store::AnswerDisposition::RejectedBeforeEffect
+    );
+
+    // A later daemon/runtime process can recover the actual UI snapshot and
+    // refresh the manual request without replaying the rejected response.
+    success(f.once());
+    let recovered = f.state().workers.runs[0].clone();
+    assert_eq!(recovered.status, WorkerStatus::NeedsHuman);
+    assert!(recovered.status.reserves_capacity());
+    assert_eq!(
+        recovered.human_request_kind,
+        Some(store::HumanRequestKind::HerdrBlockedUi)
+    );
+    assert_ne!(recovered.human_request_id, fallback.human_request_id);
+    assert_eq!(
+        recovered.question.as_deref(),
+        Some("Question: Which option should I use, A or B?")
+    );
+    assert_eq!(
+        recovered.human_response.as_deref(),
+        Some("Choose option A.")
+    );
+    assert_eq!(recovered.answer_history.len(), 1);
+    let records = f.herdr_state.lock().unwrap();
+    assert_eq!(
+        records
+            .requests
+            .iter()
+            .filter(|r| r["method"] == "agent.prompt")
+            .count(),
+        2
+    );
     assert!(
         !records
             .requests
