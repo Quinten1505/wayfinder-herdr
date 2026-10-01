@@ -8,7 +8,7 @@ use crate::{
     },
     tracker::{GitHub, MapRef},
 };
-use anyhow::{Context, Result, ensure};
+use anyhow::{Context, Result, bail, ensure};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -367,6 +367,7 @@ fn launch_chat(mut state: State, launch: ChatLaunch<'_>) -> Result<()> {
             .get("agent")
             .context("Herdr omitted orchestrator identity after startup")?,
         &provider.kind,
+        false,
     )?;
     state.orchestrator.as_mut().unwrap().foreground_process = Some(process);
     store::atomic_json(&dir.join("state.json"), &state)?;
@@ -399,12 +400,14 @@ fn launch_chat(mut state: State, launch: ChatLaunch<'_>) -> Result<()> {
         );
     }
     let observed = client.agent(&pane_id)?;
+    verify_orchestrator_observation(client, state.orchestrator.as_ref().unwrap(), &observed)?;
     bind_agent(
         &mut state,
         observed
             .get("agent")
             .context("Herdr omitted orchestrator identity")?,
         &provider.kind,
+        true,
     )?;
     verify_agent_record(&observed, state.orchestrator.as_ref().unwrap())?;
     state.orchestrator.as_mut().unwrap().status = OrchestratorStatus::PromptAccepted;
@@ -564,12 +567,18 @@ fn persist_prompt_acceptance(dir: &Path, state: &mut State, client: &Client) -> 
         .clone();
     let observed = client.agent(&pane_id)?;
     let provider = state.orchestrator.as_ref().unwrap().provider.clone();
+    // The initial prompt is the bootstrap boundary for providers such as
+    // Codex whose session ID is unavailable until the first prompt. Keep the
+    // already persisted terminal/provider/process proof authoritative before
+    // learning any session the provider now reports.
+    verify_orchestrator(client, state.orchestrator.as_ref().unwrap())?;
     bind_agent(
         state,
         observed
             .get("agent")
             .context("Herdr omitted orchestrator identity")?,
         &provider,
+        true,
     )?;
     verify_agent_record(&observed, state.orchestrator.as_ref().unwrap())?;
     state.orchestrator.as_mut().unwrap().status = OrchestratorStatus::PromptAccepted;
@@ -711,7 +720,7 @@ pub fn reconcile(
         let map = state.map.clone();
         resume_acknowledged_agent(dir, &map, root, herdr, state)?;
     }
-    let Some(binding) = state.orchestrator.as_ref() else {
+    let Some(binding) = state.orchestrator.clone() else {
         return Ok(());
     };
     ensure!(
@@ -719,7 +728,8 @@ pub fn reconcile(
         "orchestrator is {:?}; chat delivery is held for explicit reconciliation",
         binding.status
     );
-    let agent = verify_orchestrator(herdr, binding)?;
+    let agent = verify_orchestrator(herdr, &binding)?;
+    pin_observed_session(dir, state, &agent)?;
     if !matches!(
         agent["agent"]["agent_status"].as_str(),
         Some("idle" | "done")
@@ -1211,7 +1221,12 @@ fn required<'a>(value: &'a Value, key: &str) -> Result<&'a str> {
         .with_context(|| format!("Herdr identity omitted {key}"))
 }
 
-fn bind_agent(state: &mut State, agent: &Value, provider: &str) -> Result<()> {
+fn bind_agent(
+    state: &mut State,
+    agent: &Value,
+    provider: &str,
+    allow_first_session_pin: bool,
+) -> Result<()> {
     let binding = state
         .orchestrator
         .as_mut()
@@ -1237,7 +1252,7 @@ fn bind_agent(state: &mut State, agent: &Value, provider: &str) -> Result<()> {
     );
     binding.terminal_id = Some(required(agent, "terminal_id")?.to_owned());
     binding.provider = observed_provider.to_owned();
-    binding.session = agent
+    let observed_session = agent
         .get("agent_session")
         .filter(|value| !value.is_null())
         .map(|session| -> Result<crate::store::AgentSessionIdentity> {
@@ -1249,24 +1264,76 @@ fn bind_agent(state: &mut State, agent: &Value, provider: &str) -> Result<()> {
             })
         })
         .transpose()?;
+    match (&binding.session, observed_session, allow_first_session_pin) {
+        (Some(pinned), Some(observed), _) => ensure!(
+            pinned == &observed,
+            "orchestrator session identity changed; the pinned session was preserved"
+        ),
+        (Some(_), None, _) => {
+            bail!("Herdr omitted the pinned orchestrator session; the saved identity was preserved")
+        }
+        (None, Some(observed), true) => binding.session = Some(observed),
+        (None, _, _) => {}
+    }
+    Ok(())
+}
+
+/// Pin a session that became observable after the initial prompt. The caller
+/// must first verify the same terminal/provider and foreground process saved
+/// before bootstrap; a session alone never authorizes adopting another PID.
+fn pin_observed_session(dir: &Path, state: &mut State, observed: &Value) -> Result<()> {
+    let binding = state
+        .orchestrator
+        .as_ref()
+        .context("orchestrator binding disappeared during session capture")?;
+    if binding.session.is_some() {
+        return Ok(());
+    }
+    let agent = observed
+        .get("agent")
+        .context("Herdr omitted orchestrator agent identity")?;
+    if agent.get("agent_session").is_none_or(Value::is_null) {
+        return Ok(());
+    }
+    ensure!(
+        binding.status == OrchestratorStatus::Running
+            && binding.initial_prompt_attempted == Some(true),
+        "cannot pin an orchestrator session before initial-prompt bootstrap is acknowledged"
+    );
+    let provider = state
+        .workers
+        .providers
+        .for_role("orchestrator")
+        .kind
+        .clone();
+    bind_agent(state, agent, &provider, true)?;
+    store::atomic_json(&dir.join("state.json"), state)
+        .context("persist verified orchestrator session before chat delivery")?;
     Ok(())
 }
 
 fn verify_orchestrator(client: &Client, binding: &OrchestratorBinding) -> Result<Value> {
     let observed = client.agent(&binding.pane_id)?;
-    verify_agent_record(&observed, binding)?;
-    if binding.session.is_none() {
-        let expected = binding
-            .foreground_process
-            .as_ref()
-            .context("orchestrator has neither session nor foreground process identity")?;
-        let process = client.pane_process_info(&binding.pane_id)?;
-        ensure!(
-            crate::herdr::capture_foreground_process(&process, &binding.pane_id)? == *expected,
-            "orchestrator foreground process identity changed"
-        );
-    }
+    verify_orchestrator_observation(client, binding, &observed)?;
     Ok(observed)
+}
+
+fn verify_orchestrator_observation(
+    client: &Client,
+    binding: &OrchestratorBinding,
+    observed: &Value,
+) -> Result<()> {
+    verify_agent_record(observed, binding)?;
+    let expected = binding
+        .foreground_process
+        .as_ref()
+        .context("orchestrator has no saved foreground process identity")?;
+    let process = client.pane_process_info(&binding.pane_id)?;
+    ensure!(
+        crate::herdr::capture_foreground_process(&process, &binding.pane_id)? == *expected,
+        "orchestrator foreground process identity changed"
+    );
+    Ok(())
 }
 
 /// Return an observation only when it proves the exact persisted session identity.
@@ -1276,7 +1343,7 @@ fn matching_orchestrator_agent(
     binding: &OrchestratorBinding,
 ) -> Result<Option<Value>> {
     match client.agent(&binding.pane_id) {
-        Ok(observed) if verify_agent_record(&observed, binding).is_ok() => Ok(Some(observed)),
+        Ok(observed) if verify_orchestrator(client, binding).is_ok() => Ok(Some(observed)),
         Ok(_) => Ok(None),
         Err(error) if is_missing_agent_target(&error) => Ok(None),
         Err(error) => Err(error).context("could not inspect saved orchestrator identity"),

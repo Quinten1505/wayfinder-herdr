@@ -97,6 +97,9 @@ struct HerdrState {
     omit_start_provider: bool,
     process_info_sequence: Vec<(u32, String)>,
     process_info_reads: usize,
+    hide_session_reads: usize,
+    durable_state_path: Option<PathBuf>,
+    session_pinned_before_notice: Option<bool>,
     ambiguous_open_response: bool,
     fail_open_without_resource: bool,
     ambiguous_split_response: bool,
@@ -229,6 +232,9 @@ impl Fixture {
         let root = temp.path().join("state");
         let (key, _) = store::attach(&root, MAP, binding.clone(), 1).unwrap();
         let dir = store::map_dir(&root, &key).unwrap();
+        if with_session {
+            state.lock().unwrap().durable_state_path = Some(dir.join("state.json"));
+        }
         Self {
             _temp: temp,
             root,
@@ -363,6 +369,171 @@ fn record_pending_worker_question(f: &Fixture) -> store::State {
     });
     store::atomic_json(&f.dir.join("state.json"), &state).unwrap();
     state
+}
+
+#[test]
+fn late_orchestrator_session_is_pinned_for_the_same_process_before_chat_delivery() {
+    let f = Fixture::new();
+    f.herdr_state.lock().unwrap().hide_session_reads = 1;
+
+    success(f.chat());
+    let after_bootstrap = f.state().orchestrator.unwrap();
+    assert!(after_bootstrap.session.is_none());
+    let process = after_bootstrap.foreground_process.clone().unwrap();
+
+    record_pending_worker_question(&f);
+    success(f.once());
+
+    let pinned = f.state().orchestrator.unwrap();
+    assert_eq!(
+        pinned.session.as_ref().unwrap().value,
+        "conversation-orchestrator-pane"
+    );
+    assert_eq!(pinned.foreground_process.as_ref(), Some(&process));
+    assert_eq!(
+        f.herdr_state.lock().unwrap().session_pinned_before_notice,
+        Some(true),
+        "the durable session identity must be saved before the outbox prompt is sent"
+    );
+}
+
+#[test]
+fn process_replacement_after_initial_prompt_does_not_pin_its_session() {
+    let f = Fixture::new();
+    let mut replacement = Command::new("sleep").arg("30").spawn().unwrap();
+    {
+        let mut herdr = f.herdr_state.lock().unwrap();
+        herdr.process_info_sequence = vec![
+            (std::process::id(), "codex".into()),
+            (replacement.id(), "codex".into()),
+        ];
+    }
+
+    let output = f.chat();
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("foreground process identity changed")
+    );
+    let retained = f.state().orchestrator.unwrap();
+    assert!(retained.session.is_none());
+    assert_eq!(
+        retained.terminal_id.as_deref(),
+        Some("orchestrator-terminal-1")
+    );
+    assert_eq!(
+        retained.foreground_process.as_ref().unwrap().pid,
+        std::process::id()
+    );
+    assert_eq!(retained.initial_prompt_attempted, Some(true));
+    assert_eq!(
+        f.herdr_state
+            .lock()
+            .unwrap()
+            .requests
+            .iter()
+            .filter(|request| {
+                request["method"] == "agent.prompt"
+                    && request["params"]["target"] == "orchestrator-pane"
+            })
+            .count(),
+        1,
+        "the accepted bootstrap is retained, but replacement session metadata is not adopted"
+    );
+    replacement.kill().unwrap();
+    replacement.wait().unwrap();
+}
+
+#[test]
+fn pinned_orchestrator_session_does_not_authorize_a_replacement_process() {
+    let f = Fixture::new();
+    success(f.chat());
+    let original = f.state().orchestrator.unwrap();
+    record_pending_worker_question(&f);
+    let prompts_before_replacement = f
+        .herdr_state
+        .lock()
+        .unwrap()
+        .requests
+        .iter()
+        .filter(|request| {
+            request["method"] == "agent.prompt"
+                && request["params"]["target"] == "orchestrator-pane"
+        })
+        .count();
+
+    let mut replacement = Command::new("sleep").arg("30").spawn().unwrap();
+    {
+        let mut herdr = f.herdr_state.lock().unwrap();
+        herdr.agent_status = "idle".into();
+        herdr.process_info_sequence = vec![(replacement.id(), "codex".into())];
+    }
+    success(f.once());
+
+    let retained = f.state().orchestrator.unwrap();
+    assert_eq!(retained.session, original.session);
+    assert_eq!(retained.foreground_process, original.foreground_process);
+    assert_eq!(
+        f.herdr_state
+            .lock()
+            .unwrap()
+            .requests
+            .iter()
+            .filter(|request| {
+                request["method"] == "agent.prompt"
+                    && request["params"]["target"] == "orchestrator-pane"
+            })
+            .count(),
+        prompts_before_replacement,
+        "neither the saved session nor a replacement PID may authorize outbox delivery"
+    );
+    replacement.kill().unwrap();
+    replacement.wait().unwrap();
+}
+
+#[test]
+fn changed_pinned_orchestrator_session_is_held_without_overwriting_identity() {
+    let f = Fixture::new();
+    success(f.chat());
+    let original = f.state().orchestrator.unwrap();
+    record_pending_worker_question(&f);
+    let prompts_before_session_change = f
+        .herdr_state
+        .lock()
+        .unwrap()
+        .requests
+        .iter()
+        .filter(|request| {
+            request["method"] == "agent.prompt"
+                && request["params"]["target"] == "orchestrator-pane"
+        })
+        .count();
+    {
+        let mut herdr = f.herdr_state.lock().unwrap();
+        herdr.agent_status = "idle".into();
+        herdr.sessions.insert(
+            "orchestrator-pane".into(),
+            json!({"source":"fixture","agent":"codex","kind":"id","value":"replacement-session"}),
+        );
+    }
+    success(f.once());
+
+    let retained = f.state().orchestrator.unwrap();
+    assert_eq!(retained.session, original.session);
+    assert_eq!(retained.foreground_process, original.foreground_process);
+    assert_eq!(
+        f.herdr_state
+            .lock()
+            .unwrap()
+            .requests
+            .iter()
+            .filter(|request| {
+                request["method"] == "agent.prompt"
+                    && request["params"]["target"] == "orchestrator-pane"
+            })
+            .count(),
+        prompts_before_session_change,
+        "a new session on the saved pane must not receive pending chat"
+    );
 }
 
 fn handle_request(mut stream: std::os::unix::net::UnixStream, state: &Arc<Mutex<HerdrState>>) {
@@ -527,6 +698,18 @@ fn handle_request(mut stream: std::os::unix::net::UnixStream, state: &Arc<Mutex<
         }
         "agent.prompt" => {
             let pane = request["params"]["target"].as_str().unwrap().to_owned();
+            if request["params"]["text"]
+                .as_str()
+                .is_some_and(|prompt| prompt.starts_with("[WAYFINDER OUTBOX MESSAGE"))
+            {
+                state.session_pinned_before_notice =
+                    state.durable_state_path.as_ref().map(|path| {
+                        fs::read(path)
+                            .ok()
+                            .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+                            .is_some_and(|saved| !saved["orchestrator"]["session"].is_null())
+                    });
+            }
             if state.reject_next_chat_prompt_as_not_ready && state.chat_panes.contains_key(&pane) {
                 state.reject_next_chat_prompt_as_not_ready = false;
                 error = Some(
@@ -567,7 +750,12 @@ fn handle_request(mut stream: std::os::unix::net::UnixStream, state: &Arc<Mutex<
             if let Some(info) = state.agents.get(pane) {
                 let mut current = info.clone();
                 current["agent_status"] = json!(state.agent_status);
-                current["agent_session"] = state.sessions.get(pane).cloned().unwrap_or(Value::Null);
+                let mut session = state.sessions.get(pane).cloned().unwrap_or(Value::Null);
+                if !session.is_null() && state.hide_session_reads > 0 {
+                    state.hide_session_reads -= 1;
+                    session = Value::Null;
+                }
+                current["agent_session"] = session;
                 result = json!({"type":"agent_info","agent":current});
             } else {
                 error = Some(json!({"code":"agent_not_found","message":"no agent on pane"}));

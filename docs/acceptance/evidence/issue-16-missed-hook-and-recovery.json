@@ -158,15 +158,19 @@
       "pane_id": "w2:p7",
       "terminal_id": "term_65ccf5049057216",
       "provider": "codex",
-      "session": null,
+      "session": {
+        "source": "herdr:codex",
+        "agent": "codex",
+        "kind": "id",
+        "value": "01a0f9ae-2cbf-70e2-8622-ea8fd7c9fff0"
+      },
       "foreground_process": {
         "boot_id": "a093fcea-966d-46f2-8931-2d79488ce85b",
         "pid": 1327454,
         "start_time_ticks": 5276413
       },
       "initial_prompt_attempted": true,
-      "observed_herdr_session_after_bootstrap": "01a0f9ae-2cbf-70e2-8622-ea8fd7c9fff0",
-      "saved_session_limitation": "Wayfinder retains the exact boot/PID/start foreground process and running status; this snapshot still has session=null even though Herdr later reports a session ID."
+      "observed_herdr_session_after_bootstrap": "01a0f9ae-2cbf-70e2-8622-ea8fd7c9fff0"
     },
     "old_chat_archive_count": 5,
     "old_chat_archive_tail": {
@@ -255,7 +259,29 @@
       "request-00000000000000000244"
     ],
     "worker_run_count_before_and_after": 21,
-    "meaning": "Multiple real native pane.agent_status_changed executions during one recovered-chat startup were processed without extra worker dispatch or outbox duplication. Herdr logs omit event payload/correlation IDs, so they prove repeated native executions, not redelivery of one identical event instance."
+    "meaning": "Multiple real native pane.agent_status_changed executions during one recovered-chat startup were processed without extra worker dispatch or outbox duplication. Herdr logs omit event payload/correlation IDs, so they prove repeated native executions, not redelivery of one identical event instance.",
+    "explicit_same_context_hook_replay": {
+      "evidence": "issue-16-native-hook-duplicate-after.json",
+      "native_events": [
+        "plugin-log-131",
+        "plugin-log-132"
+      ],
+      "original_command": [
+        "./bin/wayfinder-herdr",
+        "reconcile"
+      ],
+      "replayed_twice_per_native_context": true,
+      "request_ids": [
+        "request-00000000000000000245",
+        "request-00000000000000000246",
+        "request-00000000000000000247",
+        "request-00000000000000000248"
+      ],
+      "all_four_processed_and_inbox_empty": true,
+      "worker_runs_unchanged": 21,
+      "outbox_messages_unchanged": 77,
+      "original_installed_manifest_restored_sha256": "482e59c9bff5adeeeaea2dcde7cf73ced7d4391cd99557345d3df9149af6b1ca"
+    }
   },
   "accepted_feature_preserved": {
     "commit": "f9c55676781e3163747e0fc466dc012132bf0f32",
@@ -268,8 +294,42 @@
     "tests/runtime.rs::queued_start_survives_restart_and_duplicate_request_is_not_reapplied"
   ],
   "limitations": [
-    "A Herdr API callback event ID is not correlated to a Wayfinder inbox request ID in Herdr 0.9.3 logs.",
-    "The real live experiment proves a deliberately missed pane.exited callback is recovered by the periodic runtime pass; native callbacks were restored before explicit chat recovery.",
-    "Repeated successful native callbacks were observed live, but exact duplicate delivery of the same event instance cannot be established from available Herdr log fields."
-  ]
+    "Herdr 0.9.3 plugin logs do not expose event-instance IDs or correlate native callbacks one-to-one with inbox request IDs.",
+    "The deliberately missed pane.exited callback was recovered by the real periodic runtime pass; this was proven live.",
+    "Herdr itself was not observed redelivering one event instance. The original installed hook command was instead invoked twice per captured real native-event context through the isolated wrapper; that exact-context replay completed without duplicate worker or outbox effects."
+  ],
+  "late_session_capture": {
+    "observed_at_utc": "2026-10-01T23:15:49Z",
+    "map_key": "a17b3c907d0d945e87e2bb22ba9e1b3751b80d2885e472dfd6222e28405db1ab",
+    "pane_id": "w2:p7",
+    "terminal_id": "term_65ccf5049057216",
+    "provider": "codex",
+    "herdr_agent_name": "wf-orch-a17b3c907d0d945e87e2bb22",
+    "session": {
+      "source": "herdr:codex",
+      "agent": "codex",
+      "kind": "id",
+      "value": "01a0f9ae-2cbf-70e2-8622-ea8fd7c9fff0"
+    },
+    "foreground_process": {
+      "boot_id": "a093fcea-966d-46f2-8931-2d79488ce85b",
+      "pid": 1327454,
+      "start_time_ticks": 5276413
+    },
+    "same_process_verified_live": true,
+    "session_persisted_before_any_later_outbox_delivery": true,
+    "initial_prompt_replayed": false,
+    "worker_run_count_before_and_after": 21,
+    "outbox_message_count_before_and_after": 77,
+    "delivered_outbox_count_before_and_after": 77,
+    "outbox_sha256_before_and_after": "3d974bd78dc7934e75401fa043cf70c28be3506c9d9aba4ced421c60765421ff",
+    "service_unit": "wayfinder-acceptance-20261001-issue16-runtime.service",
+    "service_invocation": "fc4c041643f1434bb814447ea1eb5902",
+    "service_main_pid": 1371234,
+    "runtime_binary": "/tmp/wf16-acceptance/install/bin/wayfinder-herdr",
+    "runtime_binary_sha256": "cfce7d2f37bcf72cd580af5d42242034e365a95cc85dfc0d0405755afa4ad3d5",
+    "previous_runtime_binary_sha256": "33d76b42ce6b9579a267b35458d6060fab3c7e295180aac0f7b097cf8ce477fa",
+    "upgrade_method": "cargo build --release --locked into an external target directory, then replace only the binary below explicit WAYFINDER_INSTALL_DIR=/tmp/wf16-acceptance/install; the linked plugin manifest and production install were not changed",
+    "installer_preflight_attempt": "The source installer exited before build or writes because systemctl --user list-units could not connect to the inherited local user bus; it was not retried. The isolated runtime was stopped, its binary was built and replaced directly, and it was restarted via explicit systemd machine/user transport."
+  }
 }

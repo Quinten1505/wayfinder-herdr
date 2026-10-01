@@ -1,0 +1,169 @@
+{
+  "format_version": 1,
+  "observed_at_utc": "2026-10-01T23:27:10Z",
+  "session": "wayfinder-acceptance-20261001-issue16",
+  "map": "quinten1505/wayfinder-herdr-acceptance-20261001-issue16-7c4a#1",
+  "native_event": "pane.agent_status_changed",
+  "method": "For each of two actual Herdr native status events, the temporary wrapper captured only the inherited HERDR_PLUGIN_CONTEXT_JSON and invoked the original installed reconcile command twice with identical context. Both invocations returned exit 0.",
+  "status_turn": {
+    "target": "w2:p7",
+    "session_id": "01a0f9ae-2cbf-70e2-8622-ea8fd7c9fff0",
+    "prompt": "Please respond with only: status check received. Do not run tools, edit files, dispatch or stop work, make decisions, or answer any human question.",
+    "herdr_agent_prompt_succeeded": true,
+    "final_agent_status": "idle",
+    "completion_seq": 126,
+    "human_decision_or_answer_created": false
+  },
+  "runtime_unit": "wayfinder-acceptance-20261001-issue16-runtime.service",
+  "runtime_invocation": "c74a22f45360400da1f9a67e8aede0ad",
+  "runtime_binary_sha256": "6a2fcc6f981e78db97babffffbf240aac14052ae7bd7457cdb8e4e509f9a2dd6",
+  "temporary_manifest_sha256": "dfb75de78b271868dd1a4ecb65dfc2548a02e52d990b6c6efd94b7bc5f5fceff",
+  "original_manifest_restored_sha256": "482e59c9bff5adeeeaea2dcde7cf73ced7d4391cd99557345d3df9149af6b1ca",
+  "original_hooks_enabled_after_restore": true,
+  "temporary_wrapper_preserved_outside_checkout": "/tmp/wf16-acceptance/evidence/live-duplicate-native-hook/wrapper.py",
+  "raw_contexts_preserved_outside_checkout": [
+    "/tmp/wf16-acceptance/evidence/live-duplicate-native-hook/event-uugl09en/context.json",
+    "/tmp/wf16-acceptance/evidence/live-duplicate-native-hook/event-bsa2zlqn/context.json"
+  ],
+  "actual_native_hook_executions": [
+    {
+      "context_path": "/tmp/wf16-acceptance/evidence/live-duplicate-native-hook/event-uugl09en/context.json",
+      "context_sha256": "c4a3e0ba5b119fffb7c57dd1d2bad1faec1efb6b691438d10fb4ab17a7ae30b0",
+      "context_bytes": 541,
+      "native_context": {
+        "correlation_id": "pane.agent_status_changed",
+        "invocation_source": "api",
+        "workspace_id": "w2",
+        "tab_id": "w2:t1",
+        "focused_pane_id": "w2:p7",
+        "focused_pane_status": "working"
+      },
+      "replay_count": 2,
+      "same_inherited_context_for_both": true,
+      "replay_results": [
+        {
+          "invocation": 1,
+          "exit_code": 0,
+          "stdout_bytes": 0,
+          "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "stderr_bytes": 0,
+          "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        {
+          "invocation": 2,
+          "exit_code": 0,
+          "stdout_bytes": 0,
+          "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "stderr_bytes": 0,
+          "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        }
+      ],
+      "herdr_plugin_log_id": "plugin-log-131",
+      "herdr_hook_command": "./bin/wf16-duplicate-hook",
+      "herdr_hook_exit_code": 0,
+      "herdr_hook_status": "succeeded"
+    },
+    {
+      "context_path": "/tmp/wf16-acceptance/evidence/live-duplicate-native-hook/event-bsa2zlqn/context.json",
+      "context_sha256": "25c06a763d6f61a1d77e5cd12ec0659379b4cd2242ae73fd679a8b7f8dccb5df",
+      "context_bytes": 538,
+      "native_context": {
+        "correlation_id": "pane.agent_status_changed",
+        "invocation_source": "api",
+        "workspace_id": "w2",
+        "tab_id": "w2:t1",
+        "focused_pane_id": "w2:p7",
+        "focused_pane_status": "idle"
+      },
+      "replay_count": 2,
+      "same_inherited_context_for_both": true,
+      "replay_results": [
+        {
+          "invocation": 1,
+          "exit_code": 0,
+          "stdout_bytes": 0,
+          "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "stderr_bytes": 0,
+          "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        {
+          "invocation": 2,
+          "exit_code": 0,
+          "stdout_bytes": 0,
+          "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "stderr_bytes": 0,
+          "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        }
+      ],
+      "herdr_plugin_log_id": "plugin-log-132",
+      "herdr_hook_command": "./bin/wf16-duplicate-hook",
+      "herdr_hook_exit_code": 0,
+      "herdr_hook_status": "succeeded"
+    }
+  ],
+  "request_history_ids_created_by_four_original_command_invocations": [
+    "request-00000000000000000245",
+    "request-00000000000000000246",
+    "request-00000000000000000247",
+    "request-00000000000000000248"
+  ],
+  "request_history_outcome": "All four reconcile requests were processed; inbox is empty.",
+  "before_after_effects": {
+    "worker_runs": [
+      21,
+      21
+    ],
+    "outbox_messages": [
+      77,
+      77
+    ],
+    "delivered_outbox_messages": [
+      77,
+      77
+    ],
+    "outbox_sha256": [
+      "3d974bd78dc7934e75401fa043cf70c28be3506c9d9aba4ced421c60765421ff",
+      "3d974bd78dc7934e75401fa043cf70c28be3506c9d9aba4ced421c60765421ff"
+    ],
+    "history_count_before": 244,
+    "history_count_after": 248,
+    "next_request_sequence_before_after": [
+      245,
+      249
+    ],
+    "pending_inbox_files_after": []
+  },
+  "p7_binding_after_status_turn": {
+    "saved_identity": {
+      "status": "running",
+      "pane_id": "w2:p7",
+      "terminal_id": "term_65ccf5049057216",
+      "provider": "codex",
+      "session": {
+        "source": "herdr:codex",
+        "agent": "codex",
+        "kind": "id",
+        "value": "01a0f9ae-2cbf-70e2-8622-ea8fd7c9fff0"
+      },
+      "foreground_process": {
+        "boot_id": "a093fcea-966d-46f2-8931-2d79488ce85b",
+        "pid": 1327454,
+        "start_time_ticks": 5276413
+      },
+      "initial_prompt_attempted": true
+    },
+    "saved_provider_pid_exists": true,
+    "note": "An initial non-escalated /proc read was unable to see this PID due to sandbox visibility. The authorized escalated read confirmed the original PID/start/boot and Herdr session still match the durable binding; no replacement was adopted or prompted.",
+    "kernel_verified_after_turn": {
+      "boot_id": "a093fcea-966d-46f2-8931-2d79488ce85b",
+      "pid": 1327454,
+      "start_time_ticks": 5276413,
+      "argv": "codex --approve-for-me -c service_tier=\"priority\" --model gpt-6-luna -c model_reasoning_effort=high",
+      "verification": "require_escalated read of /proc/1327454/stat and ps; exact saved fingerprint matched",
+      "observed_at_utc": "2026-10-01T23:31:00Z",
+      "service_invocation": "c74a22f45360400da1f9a67e8aede0ad",
+      "suspension": "Host and GitHub reconciled; 0/2 worker slots reserved"
+    }
+  },
+  "classification": "This is a real same-context replay at the installed native hook-command boundary, not proof Herdr itself redelivered one event instance. Herdr logs expose event type and command outcome but no event-instance ID."
+}
