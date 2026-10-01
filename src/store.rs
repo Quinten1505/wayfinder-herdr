@@ -52,6 +52,9 @@ pub struct State {
     /// Former chats are evidence only. Recovery never sends commands to these panes.
     #[serde(default)]
     pub orchestrator_history: Vec<OrchestratorArchive>,
+    /// Scheduler decisions never target a possibly completed worker pane.
+    #[serde(default)]
+    pub scheduler_decisions: Vec<SchedulerDecision>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -87,6 +90,18 @@ pub enum OrchestratorStatus {
     PromptAccepted,
     Running,
     Uncertain,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct SchedulerDecision {
+    pub request_id: String,
+    pub request_kind: HumanRequestKind,
+    pub ticket: u64,
+    pub run_id: String,
+    pub question: String,
+    #[serde(default)]
+    pub response: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -241,6 +256,7 @@ impl WorkerRun {
 pub enum HumanRequestKind {
     WorkerQuestion,
     HerdrBlockedUi,
+    SchedulerDecision,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -267,8 +283,80 @@ impl HumanRequestKind {
         match self {
             Self::WorkerQuestion => "worker_question",
             Self::HerdrBlockedUi => "herdr_blocked_ui",
+            Self::SchedulerDecision => "scheduler_decision",
         }
     }
+}
+
+/// Persist one stable scheduler question for issue 14's orchestrating chat.
+/// Reconciliation retries with the same ticket, run, and text reuse the ID.
+pub fn create_scheduler_decision(
+    state: &mut State,
+    ticket: u64,
+    run_id: &str,
+    question: &str,
+) -> Result<String> {
+    ensure!(
+        !question.trim().is_empty(),
+        "scheduler question cannot be empty"
+    );
+    let identity = format!("{}\n{ticket}\n{run_id}\n{question}", state.map);
+    let request_id = format!(
+        "scheduler-{}",
+        &format!("{:x}", Sha256::digest(identity.as_bytes()))[..24]
+    );
+    if let Some(existing) = state
+        .scheduler_decisions
+        .iter()
+        .find(|decision| decision.request_id == request_id)
+    {
+        ensure!(
+            existing.ticket == ticket
+                && existing.run_id == run_id
+                && existing.question == question
+                && existing.request_kind == HumanRequestKind::SchedulerDecision,
+            "scheduler request ID collision or changed request identity"
+        );
+    } else {
+        state.scheduler_decisions.push(SchedulerDecision {
+            request_id: request_id.clone(),
+            request_kind: HumanRequestKind::SchedulerDecision,
+            ticket,
+            run_id: run_id.to_owned(),
+            question: question.to_owned(),
+            response: None,
+        });
+    }
+    Ok(request_id)
+}
+
+/// Record the actual human response without contacting a worker or Herdr.
+pub fn record_scheduler_decision_response(
+    state: &mut State,
+    request_id: &str,
+    response: &str,
+) -> Result<()> {
+    ensure!(
+        !response.trim().is_empty(),
+        "human response cannot be empty"
+    );
+    let decision = state
+        .scheduler_decisions
+        .iter_mut()
+        .find(|decision| decision.request_id == request_id)
+        .context("scheduler decision request not found")?;
+    ensure!(
+        decision.request_kind == HumanRequestKind::SchedulerDecision,
+        "request is not a scheduler decision"
+    );
+    match decision.response.as_deref() {
+        Some(existing) => ensure!(
+            existing == response,
+            "scheduler decision was already answered with a different response"
+        ),
+        None => decision.response = Some(response.to_owned()),
+    }
+    Ok(())
 }
 
 impl WorkerRun {
@@ -533,6 +621,7 @@ pub fn attach(
             workers: WorkerState::default(),
             orchestrator: None,
             orchestrator_history: vec![],
+            scheduler_decisions: Vec::new(),
         };
         atomic_json(&path, &state)?;
         state

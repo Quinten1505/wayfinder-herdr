@@ -130,6 +130,16 @@ enum CommandName {
         #[arg(long)]
         response: String,
     },
+    /// Record the human's answer to a scheduler decision without contacting a worker.
+    AnswerDecision {
+        #[arg(long)]
+        map: String,
+        /// Exact scheduler request ID shown by status and the orchestrator.
+        #[arg(long)]
+        request_id: String,
+        #[arg(long)]
+        response: String,
+    },
     /// Resume a retained attempt. Uncertain workers require explicit absence confirmation.
     RetryWorker {
         #[arg(long)]
@@ -735,6 +745,18 @@ fn run() -> Result<()> {
                     );
                 }
             }
+        }
+        CommandName::AnswerDecision {
+            map,
+            request_id,
+            response,
+        } => {
+            let (_, dir) = tracker_context(&root, &map)?;
+            let _lock = Lock::acquire(&dir.join("state.lock"))?;
+            let mut state = store::read_state(&dir)?;
+            store::record_scheduler_decision_response(&mut state, &request_id, &response)?;
+            store::atomic_json(&dir.join("state.json"), &state)?;
+            println!("Recorded the human response for scheduler decision {request_id}.");
         }
         CommandName::RetryWorker {
             map,

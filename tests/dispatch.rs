@@ -3262,7 +3262,7 @@ fn confirmed_worker_failures_create_exactly_two_automatic_retries() {
 fn review_rework_budget_advances_independently_of_failure_retry_budget() {
     let f = Fixture::new();
     f.apply(RequestKind::Start);
-    for expected_round in 1..=2 {
+    for expected_round in 1..=4 {
         let implementer = f
             .state()
             .workers
@@ -3306,24 +3306,97 @@ fn review_rework_budget_advances_independently_of_failure_retry_budget() {
                 "status":"completed",
                 "summary":"changes are required",
                 "reviewed_commit":commit,
-                "verdict":"changes_requested"
+                "verdict":"changes_requested",
+                "unresolved_findings":["Required behavior is incomplete."],
+                "known_limitations":[]
             }),
         );
         f.herdr_state.lock().unwrap().agent_status = "idle".into();
         success(f.once());
         let state = f.state();
-        let rework = state
-            .workers
-            .runs
-            .iter()
-            .filter(|run| run.role == "implementer")
-            .max_by_key(|run| run.attempt)
-            .unwrap();
-        assert_eq!(rework.status, WorkerStatus::Running);
-        assert_eq!(rework.rework_round, expected_round);
-        assert_eq!(rework.automatic_retries, 0);
-        f.herdr_state.lock().unwrap().agent_status = "working".into();
+        if expected_round < 4 {
+            let rework = state
+                .workers
+                .runs
+                .iter()
+                .filter(|run| run.role == "implementer")
+                .max_by_key(|run| run.attempt)
+                .unwrap();
+            assert_eq!(rework.status, WorkerStatus::Running);
+            assert_eq!(rework.rework_round, expected_round);
+            assert_eq!(rework.automatic_retries, 0);
+            f.herdr_state.lock().unwrap().agent_status = "working".into();
+        } else {
+            let decision = state.scheduler_decisions.last().unwrap();
+            assert_eq!(
+                decision.request_kind,
+                store::HumanRequestKind::SchedulerDecision
+            );
+            assert_eq!(decision.ticket, reviewer.ticket);
+            assert_eq!(decision.run_id, reviewer.id);
+            assert!(decision.response.is_none());
+            assert!(
+                decision
+                    .question
+                    .contains("Three automatic review/rework rounds")
+            );
+            assert_eq!(
+                state.workers.runs.last().unwrap().status,
+                WorkerStatus::NeedsHuman
+            );
+            assert!(
+                state
+                    .workers
+                    .runs
+                    .last()
+                    .unwrap()
+                    .question
+                    .as_deref()
+                    .unwrap()
+                    .contains("human decision")
+            );
+        }
     }
+}
+
+#[test]
+fn scheduler_decision_response_is_durable_and_never_prompts_a_worker() {
+    let f = Fixture::new_without_session();
+    let mut state = f.state();
+    let request_id = store::create_scheduler_decision(
+        &mut state,
+        13,
+        "run-completed-worker",
+        "Choose how to resolve the exhausted review findings.",
+    )
+    .unwrap();
+    store::atomic_json(&f.dir.join("state.json"), &state).unwrap();
+    let requests_before = f.herdr_state.lock().unwrap().requests.len();
+
+    let output = f
+        .cli()
+        .args([
+            "answer-decision",
+            "--map",
+            MAP,
+            "--request-id",
+            &request_id,
+            "--response",
+            "Keep the limitation and document the fallback.",
+        ])
+        .output()
+        .unwrap();
+    success(output);
+    let answered = f.state().scheduler_decisions.pop().unwrap();
+    assert_eq!(answered.request_id, request_id);
+    assert_eq!(
+        answered.response.as_deref(),
+        Some("Keep the limitation and document the fallback.")
+    );
+    assert_eq!(
+        f.herdr_state.lock().unwrap().requests.len(),
+        requests_before
+    );
 }
 
 #[test]
@@ -3393,7 +3466,9 @@ fn archived_result_allows_replay_but_unrelated_review_changes_still_block_accept
             "status":"completed",
             "summary":"reviewed the fixed implementation",
             "reviewed_commit":commit,
-            "verdict":"approved"
+            "verdict":"approved",
+            "unresolved_findings":[],
+            "known_limitations":[]
         }))
         .unwrap(),
     )

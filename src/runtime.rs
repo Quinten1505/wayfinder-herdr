@@ -224,11 +224,13 @@ fn apply_delivery_outcome(
                 .context("conflicted integration source run disappeared")?
                 .clone();
             if source.rework_round >= REWORK_ROUNDS {
+                let question = format!(
+                    "The three-round review/rework budget is exhausted while resolving an integration conflict. {detail}"
+                );
+                store::create_scheduler_decision(state, source.ticket, &source.id, &question)?;
                 if let Some(worker) = state.workers.runs.iter_mut().find(|run| run.id == *run_id) {
                     worker.status = WorkerStatus::NeedsHuman;
-                    worker.question = Some(format!(
-                        "The three-round review/rework budget is exhausted. {detail}"
-                    ));
+                    worker.question = Some(question);
                 }
             } else if !state.workers.runs.iter().any(|run| {
                 run.role == "implementer"
@@ -405,6 +407,75 @@ fn new_run(state: &mut State, request: NewRun<'_>) {
         initial_prompt_reconnect_pending: false,
         known_prelaunch_failure: false,
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{delivery::Outcome, store::Binding};
+    use std::path::PathBuf;
+
+    #[test]
+    fn exhausted_conflict_persists_scheduler_decision_for_completed_worker() {
+        let temp = tempfile::tempdir().unwrap();
+        let repository = temp.path().join("repo");
+        std::fs::create_dir(&repository).unwrap();
+        let binding = Binding {
+            repository: repository.clone(),
+            herdr_binary: PathBuf::from("/bin/true"),
+            socket: temp.path().join("owned-session.sock"),
+            herdr_config: None,
+        };
+        let (key, _) = store::attach(temp.path(), "example/project#42", binding, 30).unwrap();
+        let dir = store::map_dir(temp.path(), &key).unwrap();
+        let map = MapRef::parse("example/project#42").unwrap();
+        let mut state = store::read_state(&dir).unwrap();
+        state.authorization = Authorization::Started;
+        new_run(
+            &mut state,
+            NewRun {
+                ticket: 15,
+                role: "implementer",
+                repository: &repository,
+                map: &map,
+                source_run: None,
+                base_commit: Some("feature-target".into()),
+                context: None,
+            },
+        );
+        let run = state.workers.runs.last_mut().unwrap();
+        run.status = WorkerStatus::Completed;
+        run.rework_round = REWORK_ROUNDS;
+        let run_id = run.id.clone();
+        apply_delivery_outcome(
+            &dir,
+            &mut state,
+            &map,
+            &Outcome::Conflict {
+                run_id: run_id.clone(),
+                base_commit: "feature-target".into(),
+                detail: "the same file conflicts again".into(),
+            },
+        )
+        .unwrap();
+
+        let persisted = store::read_state(&dir).unwrap();
+        let decision = persisted.scheduler_decisions.first().unwrap();
+        assert_eq!(
+            decision.request_kind,
+            store::HumanRequestKind::SchedulerDecision
+        );
+        assert_eq!(decision.run_id, run_id);
+        assert_eq!(decision.ticket, 15);
+        assert!(
+            decision
+                .question
+                .contains("three-round review/rework budget")
+        );
+        assert!(decision.response.is_none());
+        assert_eq!(persisted.workers.runs[0].status, WorkerStatus::NeedsHuman);
+        assert_eq!(persisted.workers.runs[0].human_request_id, None);
+    }
 }
 
 fn reconcile_workers(
@@ -752,6 +823,10 @@ struct WorkerResult {
     reviewed_commit: Option<String>,
     #[serde(default)]
     verdict: Option<String>,
+    #[serde(default)]
+    unresolved_findings: Option<Vec<String>>,
+    #[serde(default)]
+    known_limitations: Option<Vec<String>>,
 }
 fn decode_result(bytes: &[u8]) -> Result<WorkerResult> {
     let value: WorkerResult = serde_json::from_slice(bytes).context("decode worker result")?;
@@ -957,8 +1032,16 @@ fn accept_result(
                     .is_empty(),
                 "reviewer worktree contains edits; review result is not accepted"
             );
+            let unresolved_findings = result
+                .unresolved_findings
+                .as_ref()
+                .context("reviewer artifact omitted unresolved_findings")?;
+            ensure!(
+                result.known_limitations.is_some(),
+                "reviewer artifact omitted known_limitations"
+            );
             match result.verdict.as_deref() {
-                Some("approved") => {
+                Some("approved") if unresolved_findings.is_empty() => {
                     state.workers.runs[i].status = WorkerStatus::Completed;
                     state.workers.runs[i].summary = Some(result.summary.clone());
                     if let Some(source) = run.source_run.as_ref() {
@@ -970,7 +1053,7 @@ fn accept_result(
                     }
                     save(dir, state)
                 }
-                Some("changes_requested") => {
+                Some("changes_requested") | Some("approved") => {
                     state.workers.runs[i].status = WorkerStatus::Completed;
                     state.workers.runs[i].summary = Some(result.summary.clone());
                     let source = run
@@ -1003,7 +1086,18 @@ fn accept_result(
                             source.automatic_retries;
                     } else {
                         state.workers.runs[i].status = WorkerStatus::NeedsHuman;
-                        state.workers.runs[i].question=Some("Three automatic review/rework rounds were exhausted; human decision required.".into());
+                        let findings = unresolved_findings.join("; ");
+                        let question = format!(
+                            "Three automatic review/rework rounds were exhausted; human decision required. Reviewer report: {}. Unresolved findings: {}",
+                            result.summary,
+                            if findings.is_empty() {
+                                "review remained unresolved"
+                            } else {
+                                &findings
+                            }
+                        );
+                        store::create_scheduler_decision(state, run.ticket, &run.id, &question)?;
+                        state.workers.runs[i].question = Some(question);
                     }
                     save(dir, state)
                 }
@@ -1448,7 +1542,7 @@ fn worker_prompt(run: &WorkerRun, state: &State) -> String {
         )
     };
     format!(
-        "Wayfinder delegated {} work.\nMap identity: {repository}#{} ({map_url}).\nTicket identity: {repository}#{} ({ticket_url}).\nRun ID: {}.\n\nStart by reading the repository's `AGENTS.md` and, when available, the `{}` skill from `.agents/skills/{}/SKILL.md` or `$HOME/.agents/skills/{}/SKILL.md`; follow any more specific instructions. If changing domain terminology, read `CONTEXT.md`.\n\nBefore acting, read the actual GitHub ticket and comments with `gh issue view {} --repo {repository} --json body,title,comments`. Read the map and its accepted comments with `gh issue view {} --repo {repository} --json body,title,comments`; if it links a specification, follow that repository-qualified link and read the spec and its comments with `--json body,title,comments`. Read map/spec comments for accepted decisions that have not yet been refreshed into their bodies. Accepted automation policy: map/spec updates use append-only comments and explicitly leave body refresh pending for a human; never patch existing map or spec bodies. If a target ticket, map, linked spec, required comment, or applicable decision cannot be read, report exactly what is missing and pause dependent work. Do not invent, infer, or answer a human response.\n\n{}\n\n{}\n\nWrite `.wayfinder-result.json` with JSON fields `format_version`=1, `run_id`=`{}`, `ticket`={}, `role`=`{}`, `status`=`completed|failed|blocked`, nonempty `summary`, and optional `question`. For implementation include `commit` with the full HEAD hash. For reviewer include `reviewed_commit` equal to the pinned commit and verdict `approved` or `changes_requested`. Idle/done is not success. If a human decision is needed, include its actual question and stop.",
+        "Wayfinder delegated {} work.\nMap identity: {repository}#{} ({map_url}).\nTicket identity: {repository}#{} ({ticket_url}).\nRun ID: {}.\n\nStart by reading the repository's `AGENTS.md` and, when available, the `{}` skill from `.agents/skills/{}/SKILL.md` or `$HOME/.agents/skills/{}/SKILL.md`; follow any more specific instructions. If changing domain terminology, read `CONTEXT.md`.\n\nBefore acting, read the actual GitHub ticket and comments with `gh issue view {} --repo {repository} --json body,title,comments`. Read the map and its accepted comments with `gh issue view {} --repo {repository} --json body,title,comments`; if it links a specification, follow that repository-qualified link and read the spec and its comments with `--json body,title,comments`. Read map/spec comments for accepted decisions that have not yet been refreshed into their bodies. Accepted automation policy: map/spec updates use append-only comments and explicitly leave body refresh pending for a human; never patch existing map or spec bodies. If a target ticket, map, linked spec, required comment, or applicable decision cannot be read, report exactly what is missing and pause dependent work. Do not invent, infer, or answer a human response.\n\n{}\n\n{}\n\nWrite `.wayfinder-result.json` with JSON fields `format_version`=1, `run_id`=`{}`, `ticket`={}, `role`=`{}`, `status`=`completed|failed|blocked`, nonempty `summary`, and optional `question`. For implementation include `commit` with the full HEAD hash. For reviewer include `reviewed_commit` equal to the pinned commit, verdict `approved` or `changes_requested`, `unresolved_findings` as an array, and `known_limitations` as an array. Use empty arrays only when there are none; `approved` requires empty `unresolved_findings`. Idle/done is not success. If a human decision is needed, include its actual question and stop.",
         run.role,
         map.number,
         run.ticket,

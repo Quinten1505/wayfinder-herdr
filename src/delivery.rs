@@ -11,6 +11,7 @@ use serde::{Deserialize, Serialize};
 use std::{
     collections::BTreeMap,
     fs,
+    io::Write,
     path::{Path, PathBuf},
     process::{Command, Stdio},
 };
@@ -24,10 +25,19 @@ pub struct DeliveryState {
     pub feature_branch: Option<String>,
     #[serde(default)]
     pub tickets: BTreeMap<String, TicketDelivery>,
-    /// Latest open direct children of the map. Delivery-completed tasks remain
-    /// here until the orchestrator closes them, so chat can report that state.
+    /// Complete latest direct-child snapshot. Closed task tickets remain visible
+    /// so external closure cannot stand in for integration evidence.
+    #[serde(default)]
+    pub map_children: Option<Vec<ChildTicket>>,
+    /// Compatibility snapshot written by the first issue-15 implementation.
     #[serde(default)]
     pub open_children: Vec<ChildTicket>,
+    #[serde(default)]
+    pub final_review: Option<ReviewSummary>,
+    #[serde(default)]
+    pub final_checks: Vec<CheckEvidence>,
+    #[serde(default)]
+    pub feature_checks: Vec<CheckEvidence>,
     #[serde(default)]
     pub draft_pr: Option<PullRequest>,
     #[serde(default)]
@@ -61,6 +71,46 @@ pub struct TicketDelivery {
     pub last_error: Option<String>,
     #[serde(default)]
     pub conflict_base: Option<String>,
+    #[serde(default)]
+    pub superseded_by: Option<String>,
+    #[serde(default)]
+    pub superseded_reason: Option<String>,
+    #[serde(default)]
+    pub review: Option<ReviewSummary>,
+    #[serde(default)]
+    pub checks: Vec<CheckEvidence>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(deny_unknown_fields)]
+pub struct ReviewSummary {
+    pub commit: String,
+    pub summary: String,
+    pub unresolved_findings: Vec<String>,
+    pub known_limitations: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct CheckEvidence {
+    pub commit: String,
+    pub command: String,
+    pub result: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ArchivedReview {
+    format_version: u32,
+    run_id: String,
+    ticket: u64,
+    role: String,
+    status: String,
+    summary: String,
+    reviewed_commit: String,
+    verdict: String,
+    unresolved_findings: Option<Vec<String>>,
+    known_limitations: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -112,6 +162,57 @@ pub fn read(dir: &Path) -> Result<DeliveryState> {
     serde_json::from_slice(&bytes).context("decode delivery state")
 }
 
+fn archived_review(run: &crate::store::WorkerRun, expected_commit: &str) -> Result<ArchivedReview> {
+    ensure!(
+        run.role == "reviewer" && run.status == WorkerStatus::Completed,
+        "review gate requires a completed reviewer run"
+    );
+    let path = run
+        .result_evidence
+        .as_deref()
+        .context("review has no retained evidence")?;
+    let review: ArchivedReview =
+        serde_json::from_slice(&fs::read(path)?).context("decode retained reviewer evidence")?;
+    ensure!(
+        review.format_version == 1
+            && review.run_id == run.id
+            && review.ticket == run.ticket
+            && review.role == "reviewer"
+            && review.status == "completed"
+            && !review.summary.trim().is_empty(),
+        "review evidence identity or required summary does not match the completed reviewer run"
+    );
+    ensure!(
+        review.reviewed_commit == expected_commit
+            && run.base_commit.as_deref() == Some(expected_commit),
+        "review evidence is stale for the expected exact commit"
+    );
+    ensure!(
+        review.unresolved_findings.is_some() && review.known_limitations.is_some(),
+        "review evidence omitted required unresolved_findings or known_limitations"
+    );
+    Ok(review)
+}
+
+fn approved_review(run: &crate::store::WorkerRun, expected_commit: &str) -> Result<ReviewSummary> {
+    let review = archived_review(run, expected_commit)?;
+    ensure!(
+        review.verdict == "approved",
+        "review verdict is not approved"
+    );
+    let findings = review.unresolved_findings.unwrap_or_default();
+    ensure!(
+        findings.is_empty(),
+        "review approved while unresolved required findings remain"
+    );
+    Ok(ReviewSummary {
+        commit: expected_commit.to_owned(),
+        summary: review.summary,
+        unresolved_findings: findings,
+        known_limitations: review.known_limitations.unwrap_or_default(),
+    })
+}
+
 /// Human-readable, read-only delivery milestones for the orchestrating chat.
 pub fn chat_milestones(dir: &Path) -> Result<Vec<String>> {
     let state = read(dir)?;
@@ -153,7 +254,11 @@ pub fn chat_milestones(dir: &Path) -> Result<Vec<String>> {
             milestones.push(format!("Delivery for [{title}]({link}) is held: {}", error));
         }
     }
-    for child in &state.open_children {
+    let children = state
+        .map_children
+        .as_deref()
+        .unwrap_or(&state.open_children);
+    for child in children.iter().filter(|child| child.state == "open") {
         let link = format!("[{}]({})", child.title, child.url);
         let is_task = child.labels.iter().any(|label| label == "wayfinder:task");
         let integrated = is_task
@@ -181,8 +286,7 @@ pub fn chat_milestones(dir: &Path) -> Result<Vec<String>> {
                 run.status == WorkerStatus::NeedsHuman && run.human_request_id.is_some()
             })
         {
-            let title_url = state
-                .open_children
+            let title_url = children
                 .iter()
                 .find(|child| child.number == run.ticket)
                 .map(|child| (child.title.as_str(), child.url.as_str()))
@@ -194,6 +298,30 @@ pub fn chat_milestones(dir: &Path) -> Result<Vec<String>> {
                 });
             if let Some((title, url)) = title_url {
                 milestones.push(format!("A human decision is pending for [{title}]({url})."));
+            }
+        }
+        for decision in runtime
+            .scheduler_decisions
+            .iter()
+            .filter(|decision| decision.response.is_none())
+        {
+            if let Some(child) = children
+                .iter()
+                .find(|child| child.number == decision.ticket)
+            {
+                milestones.push(format!(
+                    "A scheduler decision is pending for [{}]({}): {}",
+                    child.title, child.url, decision.question
+                ));
+            } else if let Some(ticket) = state
+                .tickets
+                .values()
+                .find(|ticket| ticket.issue == decision.ticket && !ticket.title.is_empty())
+            {
+                milestones.push(format!(
+                    "A scheduler decision is pending for [{}]({}): {}",
+                    ticket.title, ticket.url, decision.question
+                ));
             }
         }
     }
@@ -270,20 +398,35 @@ fn mark_ready_with(
     workers: &State,
     review_run: &str,
     commit: &str,
-    checks: impl FnOnce(&Path) -> Result<()>,
+    checks: impl FnOnce(&Path) -> Result<Vec<CheckEvidence>>,
     gh: &Path,
 ) -> Result<()> {
     let mut delivery = read(dir)?;
+    let children = delivery
+        .map_children
+        .as_deref()
+        .context("PR readiness requires a current complete map-child snapshot")?;
+    ensure!(
+        all_children_resolved(children, &delivery),
+        "feature PR cannot be ready while a map child is unresolved or any implementation child lacks verified integration evidence"
+    );
     ensure!(
         delivery
             .tickets
             .values()
-            .all(|ticket| ticket.integrated_commit.is_some()),
+            .all(|ticket| ticket.superseded_by.is_some() || ticket.integrated_commit.is_some()),
         "feature PR cannot be ready while ticket integrations remain"
     );
     ensure!(
         !delivery.tickets.is_empty(),
         "feature PR cannot be ready without integrated ticket evidence"
+    );
+    ensure!(
+        workers
+            .scheduler_decisions
+            .iter()
+            .all(|decision| decision.response.is_some()),
+        "feature PR cannot be ready while a scheduler decision awaits a human response"
     );
     let reviewer = workers
         .workers
@@ -291,8 +434,15 @@ fn mark_ready_with(
         .iter()
         .find(|run| run.id == review_run)
         .context("final reviewer run disappeared")?;
+    let review_source = reviewer
+        .source_run
+        .as_deref()
+        .and_then(|source_id| workers.workers.runs.iter().find(|run| run.id == source_id))
+        .context("final reviewer source run disappeared")?;
     ensure!(
         reviewer.role == "reviewer"
+            && review_source.role == "implementer"
+            && review_source.ticket == reviewer.ticket
             && reviewer
                 .context
                 .as_deref()
@@ -304,16 +454,7 @@ fn mark_ready_with(
             && reviewer.status == WorkerStatus::Completed,
         "final reviewer did not complete against the current feature commit"
     );
-    let evidence = reviewer
-        .result_evidence
-        .as_deref()
-        .context("final reviewer has no archived result evidence")?;
-    let result: serde_json::Value = serde_json::from_slice(&fs::read(evidence)?)?;
-    ensure!(
-        result["reviewed_commit"].as_str() == Some(commit)
-            && result["verdict"].as_str() == Some("approved"),
-        "final review evidence does not approve this exact feature commit"
-    );
+    let review_summary = approved_review(reviewer, commit)?;
     ensure!(
         git(&reviewer.worktree, &["rev-parse", "HEAD"])?.trim() == commit,
         "final reviewer checkout moved away from reviewed feature commit"
@@ -333,7 +474,7 @@ fn mark_ready_with(
         git(repository, &["rev-parse", &reference])?.trim() == commit,
         "feature branch changed after final review"
     );
-    checks(&reviewer.worktree)?;
+    let final_checks = checks(&reviewer.worktree)?;
     run(repository, "git", &["fetch", "origin", "develop"])?;
     let base = git(repository, &["rev-parse", "refs/remotes/origin/develop"])?
         .trim()
@@ -377,6 +518,9 @@ fn mark_ready_with(
     delivery.draft_pr = Some(parse_pr(&viewed)?);
     delivery.ready_commit = Some(commit.to_owned());
     delivery.final_review_commit = Some(commit.to_owned());
+    delivery.final_review = Some(review_summary);
+    delivery.final_checks = final_checks.clone();
+    delivery.feature_checks = final_checks;
     delivery.pr_base_commit = Some(base);
     delivery.handoff_error = None;
     delivery.ready_error = None;
@@ -386,6 +530,7 @@ fn mark_ready_with(
 pub fn reconcile(dir: &Path, state: &State, children: &[ChildTicket]) -> Result<Outcome> {
     let _lock = Lock::acquire(&dir.join("integration.lock"))?;
     let mut delivery = read(dir)?;
+    delivery.map_children = Some(children.to_vec());
     delivery.open_children = children
         .iter()
         .filter(|child| child.state == "open")
@@ -411,6 +556,7 @@ pub fn reconcile(dir: &Path, state: &State, children: &[ChildTicket]) -> Result<
     if delivery.repository.is_none() {
         delivery.repository = Some(state.map.split('#').next().unwrap_or_default().to_owned());
     }
+    supersede_delivery_ancestors(state, &mut delivery, run);
     let entry = delivery
         .tickets
         .entry(run.id.clone())
@@ -435,6 +581,7 @@ pub fn reconcile(dir: &Path, state: &State, children: &[ChildTicket]) -> Result<
     let expected_review = entry.candidate_commit.as_deref().unwrap_or(reviewed_commit);
     let reviewer = state.workers.runs.iter().rev().find(|candidate| {
         candidate.role == "reviewer"
+            && candidate.ticket == run.ticket
             && candidate.source_run.as_deref() == Some(&run.id)
             && candidate.status == WorkerStatus::Completed
             && candidate.base_commit.as_deref() == Some(expected_review)
@@ -445,21 +592,23 @@ pub fn reconcile(dir: &Path, state: &State, children: &[ChildTicket]) -> Result<
             detail: format!("independent approval for {expected_review} is missing"),
         });
     };
-    let evidence = reviewer
-        .result_evidence
-        .as_deref()
-        .context("review has no retained evidence")?;
-    let evidence_bytes = fs::read(evidence).context("read retained reviewer evidence")?;
-    let value: serde_json::Value =
-        serde_json::from_slice(&evidence_bytes).context("decode retained reviewer evidence")?;
-    ensure!(
-        value["reviewed_commit"].as_str() == Some(expected_review),
-        "review evidence is stale for the candidate commit"
-    );
-    ensure!(
-        value["verdict"].as_str() == Some("approved"),
-        "ticket integration requires an approved independent review"
-    );
+    let review = archived_review(reviewer, expected_review)?;
+    let findings = review.unresolved_findings.as_deref().unwrap_or_default();
+    if review.verdict != "approved" || !findings.is_empty() {
+        let findings_text = if findings.is_empty() {
+            "none recorded".to_owned()
+        } else {
+            findings.join("; ")
+        };
+        return Ok(Outcome::Held {
+            run_id: run.id.clone(),
+            detail: format!(
+                "independent review {} did not approve candidate {expected_review}; unresolved findings: {}",
+                review.verdict, findings_text
+            ),
+        });
+    }
+    entry.review = Some(approved_review(reviewer, expected_review)?);
     let repository =
         fs::canonicalize(&state.binding.repository).context("resolve bound repository")?;
     let branch = match &delivery.feature_branch {
@@ -604,14 +753,21 @@ pub fn reconcile(dir: &Path, state: &State, children: &[ChildTicket]) -> Result<
         git(&check_path, &["rev-parse", "HEAD"])?.trim() == candidate,
         "integration checkout no longer matches reviewed candidate"
     );
-    if let Err(error) = required_checks(&check_path) {
-        entry.last_error = Some(format!("required checks failed: {error:#}"));
-        save(dir, &delivery)?;
-        return Ok(Outcome::Held {
-            run_id: run.id.clone(),
-            detail: format!("required checks failed; worktree and evidence retained: {error:#}"),
-        });
-    }
+    entry.checks.clear();
+    let checks = match required_checks(&check_path) {
+        Ok(checks) => checks,
+        Err(error) => {
+            entry.last_error = Some(format!("required checks failed: {error:#}"));
+            save(dir, &delivery)?;
+            return Ok(Outcome::Held {
+                run_id: run.id.clone(),
+                detail: format!(
+                    "required checks failed; worktree and evidence retained: {error:#}"
+                ),
+            });
+        }
+    };
+    entry.checks = checks;
     ensure!(
         git(&check_path, &["status", "--porcelain"])?
             .trim()
@@ -640,6 +796,95 @@ pub fn reconcile(dir: &Path, state: &State, children: &[ChildTicket]) -> Result<
     })
 }
 
+fn ticket_integrated(delivery: &DeliveryState, issue: u64) -> bool {
+    delivery.tickets.values().any(|entry| {
+        entry.issue == issue && entry.integrated_commit.is_some() && entry.superseded_by.is_none()
+    })
+}
+
+fn all_children_resolved(children: &[ChildTicket], delivery: &DeliveryState) -> bool {
+    children.iter().all(|child| {
+        if child.labels.iter().any(|label| label == "wayfinder:task") {
+            ticket_integrated(delivery, child.number)
+        } else {
+            child.state != "open"
+        }
+    })
+}
+
+fn supersedable_ancestors(
+    state: &State,
+    delivery: &DeliveryState,
+    run: &crate::store::WorkerRun,
+) -> Vec<(String, String)> {
+    let mut supersedable = Vec::new();
+    let mut cursor = run.source_run.as_deref();
+    let mut visited = std::collections::BTreeSet::new();
+    while let Some(source_id) = cursor {
+        if !visited.insert(source_id.to_owned()) {
+            break;
+        }
+        let Some(ancestor) = state
+            .workers
+            .runs
+            .iter()
+            .find(|candidate| candidate.id == source_id)
+        else {
+            break;
+        };
+        if ancestor.role == "implementer" {
+            if let Some(record) = delivery.tickets.get(&ancestor.id) {
+                if record.integrated_commit.is_none() {
+                    if record.conflict_base.as_deref() == run.base_commit.as_deref()
+                        && record.conflict_base.is_some()
+                    {
+                        supersedable.push((
+                            ancestor.id.clone(),
+                            "integration conflict was resolved in this reviewed repair run".into(),
+                        ));
+                    } else if record.candidate_commit.as_deref() == run.base_commit.as_deref() {
+                        if let Some(reviewer) = state.workers.runs.iter().find(|candidate| {
+                            candidate.role == "reviewer"
+                                && candidate.source_run.as_deref() == Some(&ancestor.id)
+                                && candidate.base_commit.as_deref() == run.base_commit.as_deref()
+                                && candidate.status == WorkerStatus::Completed
+                        }) {
+                            if archived_review(
+                                reviewer,
+                                run.base_commit.as_deref().unwrap_or_default(),
+                            )
+                            .is_ok_and(|review| review.verdict == "changes_requested")
+                            {
+                                supersedable.push((
+                                    ancestor.id.clone(),
+                                    "reviewer requested changes to this exact candidate; reviewed repair run supersedes it".into(),
+                                ));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        cursor = ancestor.source_run.as_deref();
+    }
+    supersedable
+}
+
+fn supersede_delivery_ancestors(
+    state: &State,
+    delivery: &mut DeliveryState,
+    run: &crate::store::WorkerRun,
+) {
+    for (prior_run, reason) in supersedable_ancestors(state, delivery, run) {
+        if let Some(prior) = delivery.tickets.get_mut(&prior_run) {
+            if prior.integrated_commit.is_none() && prior.superseded_by.is_none() {
+                prior.superseded_by = Some(run.id.clone());
+                prior.superseded_reason = Some(reason);
+            }
+        }
+    }
+}
+
 fn feature_review_outcome(
     state: &State,
     delivery: &DeliveryState,
@@ -662,23 +907,25 @@ fn feature_review_outcome(
                     .as_deref()
                     .is_some_and(|text| text.starts_with("wayfinder-final-feature-review")))
     });
-    let unresolved_children = children
+    let pending_scheduler_decision = state
+        .scheduler_decisions
         .iter()
-        .filter(|child| child.state == "open")
-        .any(|child| {
-            !child.labels.iter().any(|label| label == "wayfinder:task")
-                || !delivery
-                    .tickets
-                    .values()
-                    .any(|entry| entry.issue == child.number && entry.integrated_commit.is_some())
-        });
+        .any(|decision| decision.response.is_none());
+    let unresolved_children = children.iter().any(|child| {
+        if child.labels.iter().any(|label| label == "wayfinder:task") {
+            !ticket_integrated(delivery, child.number)
+        } else {
+            child.state == "open"
+        }
+    });
     if unresolved_children
         || delivery.tickets.is_empty()
         || delivery
             .tickets
             .values()
-            .any(|ticket| ticket.integrated_commit.is_none())
+            .any(|ticket| ticket.superseded_by.is_none() && ticket.integrated_commit.is_none())
         || pending_implementation_or_human_work
+        || pending_scheduler_decision
     {
         return Ok(Outcome::Nothing);
     }
@@ -696,6 +943,7 @@ fn feature_review_outcome(
         .to_owned();
     let final_review = state.workers.runs.iter().rev().find(|candidate| {
         candidate.role == "reviewer"
+            && candidate.ticket == source.ticket
             && candidate.source_run.as_deref() == Some(&source.id)
             && candidate
                 .context
@@ -710,21 +958,22 @@ fn feature_review_outcome(
             commit: head,
         });
     };
-    let Some(evidence) = final_review.result_evidence.as_deref() else {
+    let report = archived_review(final_review, &head)?;
+    let findings = report.unresolved_findings.as_deref().unwrap_or_default();
+    if report.verdict != "approved" || !findings.is_empty() {
         return Ok(Outcome::Held {
             run_id: final_review.id.clone(),
-            detail: "final feature review has no archived evidence".into(),
+            detail: format!(
+                "final independent review {} did not approve feature commit {head}; unresolved findings: {}",
+                report.verdict,
+                if findings.is_empty() {
+                    "none recorded".to_owned()
+                } else {
+                    findings.join("; ")
+                }
+            ),
         });
-    };
-    let result: serde_json::Value = serde_json::from_slice(&fs::read(evidence)?)?;
-    ensure!(
-        result["reviewed_commit"].as_str() == Some(&head),
-        "final feature review is stale for the current feature head"
-    );
-    ensure!(
-        result["verdict"].as_str() == Some("approved"),
-        "final feature review did not approve the current feature head"
-    );
+    }
     ensure!(
         git(&final_review.worktree, &["rev-parse", "HEAD"])?.trim() == head,
         "final reviewer worktree moved away from the reviewed feature head"
@@ -789,6 +1038,25 @@ fn ensure_draft_pr_with_gh(
     {
         return Ok(None);
     }
+    ensure!(
+        delivery
+            .tickets
+            .values()
+            .filter(|ticket| ticket.integrated_commit.is_some())
+            .all(|ticket| {
+                ticket.review.as_ref().is_some_and(|review| {
+                    review.commit == ticket.integrated_commit.as_deref().unwrap_or_default()
+                        && !review.summary.trim().is_empty()
+                        && review.unresolved_findings.is_empty()
+                }) && !ticket.checks.is_empty()
+                    && ticket.checks.iter().all(|check| {
+                        check.commit == ticket.integrated_commit.as_deref().unwrap_or_default()
+                            && !check.command.trim().is_empty()
+                            && !check.result.trim().is_empty()
+                    })
+            }),
+        "draft PR handoff requires exact-commit ticket review and required-check evidence for every integrated ticket"
+    );
     let branch = delivery
         .feature_branch
         .clone()
@@ -907,6 +1175,7 @@ fn ensure_draft_pr_with_gh(
         parsed
     } else {
         let body = pr_body(&delivery);
+        let body_file = write_pr_body_file(&body)?;
         let output = gh_text(
             gh,
             &[
@@ -921,8 +1190,8 @@ fn ensure_draft_pr_with_gh(
                 &branch,
                 "--title",
                 &format!("Wayfinder delivery: {}", map_ref.number),
-                "--body",
-                &body,
+                "--body-file",
+                body_file.path().to_str().context("non-UTF8 PR body path")?,
             ],
         );
         match output {
@@ -1010,6 +1279,7 @@ fn ensure_draft_pr_with_gh(
         }
     }
     let body = pr_body(&delivery);
+    let body_file = write_pr_body_file(&body)?;
     let _ = gh_text(
         gh,
         &[
@@ -1018,8 +1288,8 @@ fn ensure_draft_pr_with_gh(
             &pr.number.to_string(),
             "--repo",
             &repo,
-            "--body",
-            &body,
+            "--body-file",
+            body_file.path().to_str().context("non-UTF8 PR body path")?,
         ],
     )?;
     delivery.draft_pr = Some(pr.clone());
@@ -1029,6 +1299,13 @@ fn ensure_draft_pr_with_gh(
     }
     save(dir, &delivery)?;
     Ok(Some(pr))
+}
+
+fn write_pr_body_file(body: &str) -> Result<tempfile::NamedTempFile> {
+    let mut file = tempfile::NamedTempFile::new()?;
+    file.write_all(body.as_bytes())?;
+    file.as_file().sync_all()?;
+    Ok(file)
 }
 
 fn remote_ref(repository: &Path, namespace: &str, branch: &str) -> Result<Option<String>> {
@@ -1057,7 +1334,9 @@ fn sync_develop_target(
     feature_branch: &str,
     delivery: &mut DeliveryState,
 ) -> Result<(String, bool)> {
-    sync_develop_target_with_checks(dir, repository, feature_branch, delivery, required_checks)
+    sync_develop_target_with_checks(dir, repository, feature_branch, delivery, |path| {
+        required_checks(path).map(|_| ())
+    })
 }
 
 fn sync_develop_target_with_checks(
@@ -1161,7 +1440,9 @@ fn sync_develop_target_with_checks(
 }
 
 fn pr_body(delivery: &DeliveryState) -> String {
-    let mut body = String::from("Wayfinder ticket integration evidence\n\n");
+    let mut body = String::from(
+        "## Summary\n\nThis feature branch contains independently reviewed Wayfinder ticket work. The human decides whether the feature PR is merged into `develop`.\n\n## Evidence\n\n",
+    );
     for ticket in delivery.tickets.values() {
         if let Some(commit) = &ticket.integrated_commit {
             let title = if ticket.title.is_empty() {
@@ -1178,11 +1459,78 @@ fn pr_body(delivery: &DeliveryState) -> String {
             } else {
                 ticket.url.clone()
             };
-            body.push_str(&format!("- [{title}]({url}): reviewed commit `{}`; integrated as `{}`. Required checks: fmt, clippy, and all-target tests passed.\n", ticket.reviewed_commit.as_deref().unwrap_or("unknown"), commit));
+            body.push_str(&format!(
+                "### [{title}]({url})\n\n- Reviewed commit: `{}`\n- Integrated commit: `{commit}`\n",
+                ticket
+                    .review
+                    .as_ref()
+                    .map(|review| review.commit.as_str())
+                    .or(ticket.reviewed_commit.as_deref())
+                    .unwrap_or("unknown")
+            ));
+            if let Some(review) = &ticket.review {
+                body.push_str(&format!("- Independent review: {}\n", review.summary));
+                append_report_list(
+                    &mut body,
+                    "Unresolved findings",
+                    &review.unresolved_findings,
+                );
+                append_report_list(&mut body, "Known limitations", &review.known_limitations);
+            } else {
+                body.push_str(
+                    "- Independent review report is missing from local delivery evidence.\n",
+                );
+            }
+            body.push_str("- Required checks:\n");
+            append_checks(&mut body, &ticket.checks);
+            body.push('\n');
         }
     }
-    body.push_str("\nKnown limitations and unresolved findings: see each linked ticket's retained review and implementation evidence. The human decides whether this feature PR is merged into `develop`.\n");
+    if let Some(review) = &delivery.final_review {
+        body.push_str(&format!(
+            "### Final feature review at `{}`\n\n{}\n\n",
+            review.commit, review.summary
+        ));
+        append_report_list(
+            &mut body,
+            "Unresolved findings",
+            &review.unresolved_findings,
+        );
+        append_report_list(&mut body, "Known limitations", &review.known_limitations);
+    }
+    if !delivery.final_checks.is_empty() {
+        body.push_str("### Final required checks\n\n");
+        append_checks(&mut body, &delivery.final_checks);
+        body.push('\n');
+    }
+    body.push_str(
+        "## Merge Danger\n\n**Door:** Two-way\n\n**Blast Radius:** delivery\n\nThe human controls the feature merge into `develop`; automation does not merge this PR.\n",
+    );
     body
+}
+
+fn append_report_list(body: &mut String, title: &str, entries: &[String]) {
+    body.push_str(&format!("- {title}:\n"));
+    if entries.is_empty() {
+        body.push_str("  - None reported.\n");
+    } else {
+        for entry in entries {
+            body.push_str(&format!("  - {entry}\n"));
+        }
+    }
+}
+
+fn append_checks(body: &mut String, checks: &[CheckEvidence]) {
+    if checks.is_empty() {
+        body.push_str("  - No check evidence recorded.\n");
+        return;
+    }
+    for check in checks {
+        body.push_str(&format!(
+            "  - `{}` at `{}`: {}\n",
+            check.command, check.commit, check.result
+        ));
+    }
 }
 
 fn short_commit(commit: &str) -> &str {
@@ -1310,22 +1658,47 @@ fn cleanup_merged_worktrees(
     Ok(())
 }
 
-fn required_checks(path: &Path) -> Result<()> {
-    run(path, "cargo", &["fmt", "--all", "--", "--check"])?;
-    run(
-        path,
-        "cargo",
-        &[
-            "clippy",
-            "--locked",
-            "--all-targets",
-            "--",
-            "-D",
-            "warnings",
-        ],
-    )?;
-    run(path, "cargo", &["test", "--locked", "--all-targets"])?;
-    Ok(())
+fn required_checks(path: &Path) -> Result<Vec<CheckEvidence>> {
+    let commit = git(path, &["rev-parse", "HEAD"])?.trim().to_owned();
+    let commands: [(&str, &[&str]); 3] = [
+        ("cargo", &["fmt", "--all", "--", "--check"]),
+        (
+            "cargo",
+            &[
+                "clippy",
+                "--locked",
+                "--all-targets",
+                "--",
+                "-D",
+                "warnings",
+            ],
+        ),
+        ("cargo", &["test", "--locked", "--all-targets"]),
+    ];
+    commands
+        .into_iter()
+        .map(|(program, args)| {
+            let output = Command::new(program)
+                .args(args)
+                .current_dir(path)
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .output()
+                .with_context(|| format!("launch {program} {}", args.join(" ")))?;
+            ensure!(
+                output.status.success(),
+                "{program} {} failed: {}{}",
+                args.join(" "),
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            Ok(CheckEvidence {
+                commit: commit.clone(),
+                command: format!("{program} {}", args.join(" ")),
+                result: format!("passed (exit {})", output.status),
+            })
+        })
+        .collect()
 }
 
 fn run(path: &Path, program: &str, args: &[&str]) -> Result<()> {
@@ -1495,9 +1868,9 @@ mod tests {
             );
             let evidence = temp.path().join("review.json");
             fs::write(&evidence, serde_json::to_vec(&json!({
-                "format_version":1,"run_id":"review-1","ticket":15,"role":"reviewer",
+                "format_version":1,"run_id":"run-00000000000000000002","ticket":15,"role":"reviewer",
                 "status":"completed","summary":"review approved","reviewed_commit":(if stale_evidence { &base } else { &implementation }),
-                "verdict":"approved"
+                "verdict":"approved","unresolved_findings":[],"known_limitations":["fixture-only local repository"]
             })).unwrap()).unwrap();
 
             let target_path = temp.path().join("target");
@@ -1561,7 +1934,7 @@ mod tests {
             reconcile(&f.dir, &f.state, &[])
                 .unwrap_err()
                 .to_string()
-                .contains("stale for the candidate")
+                .contains("stale for the expected exact commit")
         );
         assert!(read(&f.dir).unwrap().tickets.is_empty());
     }
@@ -1599,6 +1972,49 @@ mod tests {
                 .as_deref(),
             Some(commit.as_str())
         );
+
+        let mut renewed_reviewer = f.state.workers.runs[1].clone();
+        renewed_reviewer.id = "run-renewed-review".into();
+        renewed_reviewer.base_commit = Some(commit.clone());
+        let evidence = f._temp.path().join("renewed-review.json");
+        fs::write(
+            &evidence,
+            serde_json::to_vec(&json!({
+                "format_version":1,"run_id":"run-renewed-review","ticket":15,
+                "role":"reviewer","status":"completed","summary":"The rebased candidate still has a required defect.",
+                "reviewed_commit":commit,"verdict":"changes_requested",
+                "unresolved_findings":["The conflict repair changes required behavior."],
+                "known_limitations":[]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        renewed_reviewer.result_evidence = Some(evidence);
+        let mut renewed_state = f.state.clone();
+        renewed_state.workers.runs.push(renewed_reviewer);
+        let held = reconcile(&f.dir, &renewed_state, &[]).unwrap();
+        assert!(matches!(held, Outcome::Held { .. }));
+        assert_eq!(
+            command(&f.repo, &["rev-parse", "refs/heads/feature/delivery-test"]),
+            delivery
+                .tickets
+                .values()
+                .next()
+                .unwrap()
+                .candidate_base
+                .clone()
+                .unwrap()
+        );
+        assert!(
+            read(&f.dir)
+                .unwrap()
+                .tickets
+                .values()
+                .next()
+                .unwrap()
+                .integrated_commit
+                .is_none()
+        );
     }
 
     #[test]
@@ -1623,6 +2039,7 @@ mod tests {
         let f = Fixture::new(false, false);
         let mut delivery = DeliveryState {
             feature_branch: Some("feature/delivery-test".into()),
+            map_children: Some(vec![open_child(15, "Integrate exact-commit reviews", true)]),
             ..DeliveryState::default()
         };
         delivery.tickets.insert(
@@ -1648,8 +2065,77 @@ mod tests {
         let blocked = feature_review_outcome(&f.state, &delivery, source, &children).unwrap();
         assert_eq!(blocked, Outcome::Nothing);
         children.pop();
+        let mut externally_closed = open_child(16, "Externally closed implementation", true);
+        externally_closed.state = "closed".into();
+        children.push(externally_closed);
+        assert_eq!(
+            feature_review_outcome(&f.state, &delivery, source, &children).unwrap(),
+            Outcome::Nothing,
+            "external closure without verified integration evidence must block final review"
+        );
+        children.pop();
         let ready = feature_review_outcome(&f.state, &delivery, source, &children).unwrap();
         assert!(matches!(ready, Outcome::FinalReviewNeeded { .. }));
+    }
+
+    #[test]
+    fn conflict_repair_supersedes_old_blocker_without_erasing_conflict_evidence() {
+        let f = Fixture::new(true, false);
+        let Outcome::Conflict { base_commit, .. } = reconcile(&f.dir, &f.state, &[]).unwrap()
+        else {
+            panic!("expected initial integration conflict")
+        };
+        let mut delivery = read(&f.dir).unwrap();
+        let original = delivery.tickets.values().next().unwrap().clone();
+        assert!(original.last_error.is_some());
+        assert_eq!(
+            original.conflict_base.as_deref(),
+            Some(base_commit.as_str())
+        );
+
+        let original_run = f
+            .state
+            .workers
+            .runs
+            .iter()
+            .find(|run| run.role == "implementer")
+            .unwrap();
+        let mut repair = original_run.clone();
+        repair.id = "run-conflict-repair".into();
+        repair.source_run = Some(original_run.id.clone());
+        repair.base_commit = Some(base_commit.clone());
+        repair.status = WorkerStatus::Reviewed;
+        let mut repair_state = f.state.clone();
+        repair_state.workers.runs.push(repair.clone());
+        supersede_delivery_ancestors(&repair_state, &mut delivery, &repair);
+
+        let superseded = delivery.tickets.get(&original_run.id).unwrap();
+        assert_eq!(
+            superseded.superseded_by.as_deref(),
+            Some(repair.id.as_str())
+        );
+        assert_eq!(
+            superseded.conflict_base.as_deref(),
+            Some(base_commit.as_str())
+        );
+        assert!(superseded.last_error.is_some());
+        delivery.tickets.insert(
+            repair.id.clone(),
+            TicketDelivery {
+                issue: repair.ticket,
+                title: "Implement exact-commit review".into(),
+                url: "https://github.com/example/project/issues/15".into(),
+                reviewed_commit: repair.result_commit.clone(),
+                integrated_commit: Some(base_commit),
+                ..TicketDelivery::default()
+            },
+        );
+        delivery.feature_branch = Some("feature/delivery-test".into());
+        let children = [open_child(15, "Implement exact-commit review", true)];
+        assert!(matches!(
+            feature_review_outcome(&repair_state, &delivery, &repair, &children).unwrap(),
+            Outcome::FinalReviewNeeded { .. }
+        ));
     }
 
     #[test]
@@ -1745,6 +2231,20 @@ mod tests {
         }));
 
         state.workers.runs.pop();
+        let request_id = store::create_scheduler_decision(
+            &mut state,
+            15,
+            "run-completed-worker",
+            "Choose whether to accept the documented limitation.",
+        )
+        .unwrap();
+        assert_eq!(
+            feature_review_outcome(&state, &delivery, source, &[]).unwrap(),
+            Outcome::Nothing,
+            "an unresolved scheduler decision must gate final review"
+        );
+        state.scheduler_decisions.pop();
+        assert!(!request_id.is_empty());
         let branch_head = git(&f.repo, &["rev-parse", "refs/heads/feature/delivery-test"])
             .unwrap()
             .trim()
@@ -1888,6 +2388,7 @@ mod tests {
         fs::create_dir_all(&state_dir).unwrap();
         let mut delivery = DeliveryState {
             feature_branch: Some("feature/delivery-test".into()),
+            map_children: Some(vec![open_child(15, "Integrate exact-commit reviews", true)]),
             ..DeliveryState::default()
         };
         delivery.tickets.insert(
@@ -1897,6 +2398,19 @@ mod tests {
                 candidate_commit: Some(head.clone()),
                 integrated_commit: Some(head.clone()),
                 issue: 15,
+                title: "Integrate exact-commit reviews".into(),
+                url: "https://github.com/example/project/issues/15".into(),
+                review: Some(ReviewSummary {
+                    commit: head.clone(),
+                    summary: "The ticket implementation passes its independent review.".into(),
+                    unresolved_findings: vec![],
+                    known_limitations: vec!["The test exercises a disposable local remote.".into()],
+                }),
+                checks: vec![CheckEvidence {
+                    commit: head.clone(),
+                    command: "cargo test --locked --all-targets".into(),
+                    result: "passed (exit 0)".into(),
+                }],
                 ..TicketDelivery::default()
             },
         );
@@ -1906,7 +2420,9 @@ mod tests {
 import json, os, sys
 path=os.path.join(os.path.dirname(__file__), 'pr.json')
 args=sys.argv[1:]
-state=json.load(open(path)) if os.path.exists(path) else {'creates':0,'edits':0,'pr':None}
+state=json.load(open(path)) if os.path.exists(path) else {'creates':0,'edits':0,'pr':None,'body':''}
+if '--body-file' in args:
+    state['body']=open(args[args.index('--body-file')+1]).read()
 if args[:2] == ['pr','list']:
     print(json.dumps([state['pr']] if state['pr'] else []))
 elif args[:2] == ['pr','create']:
@@ -1935,6 +2451,18 @@ else:
         });
         let workers: State = serde_json::from_value(state_json.take()).unwrap();
         fs::write(gh.with_file_name("meta.json"), serde_json::to_vec(&json!({"head":head,"base":command(&repo, &["rev-parse", "refs/remotes/origin/develop"])})).unwrap()).unwrap();
+        let mut missing_evidence = delivery.clone();
+        let ticket = missing_evidence.tickets.get_mut("run-1").unwrap();
+        ticket.review = None;
+        ticket.checks.clear();
+        save(&state_dir, &missing_evidence).unwrap();
+        assert!(
+            ensure_draft_pr_with_gh(&state_dir, &repo, "example/project#42", &workers, &gh)
+                .unwrap_err()
+                .to_string()
+                .contains("exact-commit ticket review and required-check evidence")
+        );
+        save(&state_dir, &delivery).unwrap();
         let first = ensure_draft_pr_with_gh(&state_dir, &repo, "example/project#42", &workers, &gh)
             .unwrap()
             .unwrap();
@@ -1949,6 +2477,24 @@ else:
         assert_eq!(calls["creates"], 1);
         assert_eq!(calls["edits"], 2);
         assert!(read(&state_dir).unwrap().draft_pr.unwrap().draft);
+        assert!(
+            calls["body"]
+                .as_str()
+                .unwrap()
+                .contains("The ticket implementation passes its independent review.")
+        );
+        assert!(
+            calls["body"]
+                .as_str()
+                .unwrap()
+                .contains("The test exercises a disposable local remote.")
+        );
+        assert!(
+            calls["body"]
+                .as_str()
+                .unwrap()
+                .contains("cargo test --locked --all-targets")
+        );
 
         let reviewer_path = temp.path().join("final-reviewer");
         command(
@@ -1964,11 +2510,86 @@ else:
         let evidence = temp.path().join("final-review.json");
         fs::write(
             &evidence,
-            serde_json::to_vec(&json!({"reviewed_commit":head,"verdict":"approved"})).unwrap(),
+            serde_json::to_vec(&json!({
+                "format_version":1,"run_id":"run-final-review","ticket":15,"role":"reviewer",
+                "status":"completed","summary":"Final review found the integration boundaries correct.",
+                "reviewed_commit":head,"verdict":"approved","unresolved_findings":[],
+                "known_limitations":["The test used a disposable local GitHub endpoint."]
+            })).unwrap(),
         )
         .unwrap();
         let reviewer = json!({"id":"run-final-review","ticket":15,"role":"reviewer","attempt":1,"rework_round":0,"status":"completed","worktree":reviewer_path,"workspace_id":null,"tab_id":null,"pane_id":null,"base_commit":head,"result_commit":null,"summary":"feature approved","question":null,"source_run":"run-1","claim_login":"fixture","context":"wayfinder-final-feature-review","last_activity_ms":null,"terminal_id":null,"agent_provider":null,"agent_session":null,"foreground_process":null,"result_evidence":evidence});
-        let ready_workers: State = serde_json::from_value(json!({"format_version":1,"map":"example/project#42","binding":{"repository":repo,"herdr_binary":"/bin/true","socket":"/tmp/test.sock","herdr_config":null},"authorization":"started","poll_seconds":30,"concurrency":3,"reconciled":true,"suspension":"","history":[],"workers":{"next_run":3,"runs":[reviewer],"providers":{}}})).unwrap();
+        let mut ready_workers: State = serde_json::from_value(json!({"format_version":1,"map":"example/project#42","binding":{"repository":repo,"herdr_binary":"/bin/true","socket":"/tmp/test.sock","herdr_config":null},"authorization":"started","poll_seconds":30,"concurrency":3,"reconciled":true,"suspension":"","history":[],"workers":{"next_run":3,"runs":[reviewer,{"id":"run-1","ticket":15,"role":"implementer","attempt":1,"status":"reviewed","worktree":repo,"base_commit":head,"result_commit":head}],"providers":{}}})).unwrap();
+        let mut requested_changes: serde_json::Value =
+            serde_json::from_slice(&fs::read(&evidence).unwrap()).unwrap();
+        requested_changes["verdict"] = json!("changes_requested");
+        requested_changes["unresolved_findings"] =
+            json!(["The final feature still has a required defect."]);
+        fs::write(&evidence, serde_json::to_vec(&requested_changes).unwrap()).unwrap();
+        assert!(
+            mark_ready_with(
+                &state_dir,
+                &repo,
+                "example/project#42",
+                &ready_workers,
+                "run-final-review",
+                &head,
+                |_| panic!("changes-requested final review must block checks and readiness"),
+                &gh,
+            )
+            .is_err()
+        );
+        assert!(read(&state_dir).unwrap().ready_commit.is_none());
+        requested_changes["verdict"] = json!("approved");
+        requested_changes["unresolved_findings"] = json!([]);
+        fs::write(&evidence, serde_json::to_vec(&requested_changes).unwrap()).unwrap();
+        store::create_scheduler_decision(
+            &mut ready_workers,
+            15,
+            "run-completed-worker",
+            "Choose whether to accept the documented limitation.",
+        )
+        .unwrap();
+        let pending_decision = mark_ready_with(
+            &state_dir,
+            &repo,
+            "example/project#42",
+            &ready_workers,
+            "run-final-review",
+            &head,
+            |_| panic!("pending scheduler decision must block readiness before checks"),
+            &gh,
+        )
+        .unwrap_err();
+        assert!(
+            pending_decision
+                .to_string()
+                .contains("scheduler decision awaits a human response")
+        );
+        ready_workers.scheduler_decisions.clear();
+        let mut closed_children = read(&state_dir).unwrap();
+        let mut closed_task = open_child(16, "Externally closed implementation", true);
+        closed_task.state = "closed".into();
+        closed_children
+            .map_children
+            .as_mut()
+            .unwrap()
+            .push(closed_task);
+        save(&state_dir, &closed_children).unwrap();
+        let blocked = mark_ready_with(
+            &state_dir,
+            &repo,
+            "example/project#42",
+            &ready_workers,
+            "run-final-review",
+            &head,
+            |_| panic!("readiness gate must reject closed child before checks"),
+            &gh,
+        );
+        assert!(blocked.is_err());
+        assert!(read(&state_dir).unwrap().ready_commit.is_none());
+        closed_children.map_children.as_mut().unwrap().pop();
+        save(&state_dir, &closed_children).unwrap();
         mark_ready_with(
             &state_dir,
             &repo,
@@ -1976,13 +2597,43 @@ else:
             &ready_workers,
             "run-final-review",
             &head,
-            |_| Ok(()),
+            |_| {
+                Ok(vec![CheckEvidence {
+                    commit: head.clone(),
+                    command: "cargo test --locked --all-targets".into(),
+                    result: "passed (exit 0)".into(),
+                }])
+            },
             &gh,
         )
         .unwrap();
         let ready = read(&state_dir).unwrap();
         assert_eq!(ready.ready_commit.as_deref(), Some(head.as_str()));
         assert!(!ready.draft_pr.unwrap().draft);
+        ensure_draft_pr_with_gh(&state_dir, &repo, "example/project#42", &ready_workers, &gh)
+            .unwrap();
+        let calls: serde_json::Value =
+            serde_json::from_slice(&fs::read(temp.path().join("pr.json")).unwrap()).unwrap();
+        assert!(
+            calls["body"]
+                .as_str()
+                .unwrap()
+                .contains("Final review found the integration boundaries correct.")
+        );
+        assert!(
+            calls["body"]
+                .as_str()
+                .unwrap()
+                .contains("The test used a disposable local GitHub endpoint.")
+        );
+        assert!(
+            calls["body"]
+                .as_str()
+                .unwrap()
+                .contains("**Door:** Two-way")
+        );
+        let ready = read(&state_dir).unwrap();
+        assert_eq!(ready.final_checks.len(), 1);
     }
 
     #[test]
