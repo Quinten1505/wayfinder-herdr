@@ -1,5 +1,6 @@
 //! One per-map process supervises durable dispatch and reconciliation.
 use crate::{
+    delivery::{self, Outcome as DeliveryOutcome},
     herdr::Client,
     host,
     store::{self, Authorization, Lock, Provider, State, WorkerRun, WorkerStatus},
@@ -66,10 +67,24 @@ fn reconcile(dir: &Path, state: &mut State) -> Result<String> {
     store::atomic_json(&tracker_dir.join("frontier.json"), &frontier)?;
     let herdr = Client::new(&state.binding.socket);
     reconcile_workers(dir, state, &map, &github, &herdr)?;
-    // Issue 15 owns delivery milestones and State.scheduler_decisions. After
-    // its rebase, root maps delivery::chat_milestones(dir) and those persisted
-    // records into these additive chat adapters; transport stays in this module.
-    crate::orchestration::reconcile(dir, state, &herdr, &github, &[], &[])?;
+    let children = github.child_tickets(&map)?;
+    apply_delivery_outcome(
+        dir,
+        state,
+        &map,
+        &delivery::reconcile(dir, state, &children)?,
+    )?;
+    let delivery_milestones = delivery::chat_milestones(dir)?;
+    // Scheduler-decision adaptation is added after the issue-15 state commit
+    // is replayed; chat transport and ticket-delivery state remain separate.
+    crate::orchestration::reconcile(
+        dir,
+        state,
+        &herdr,
+        &github,
+        &delivery_milestones,
+        &[],
+    )?;
     state.reconciled = true;
     match state.authorization {
         Authorization::AwaitingStart => {
@@ -102,6 +117,162 @@ fn reconcile(dir: &Path, state: &mut State) -> Result<String> {
         "Host and GitHub reconciled; {active}/{} worker slots reserved",
         state.concurrency
     ))
+}
+
+fn apply_delivery_outcome(
+    dir: &Path,
+    state: &mut State,
+    map: &MapRef,
+    outcome: &DeliveryOutcome,
+) -> Result<()> {
+    let repository = state.binding.repository.clone();
+    match outcome {
+        DeliveryOutcome::Nothing | DeliveryOutcome::Integrated { .. } => {}
+        DeliveryOutcome::FinalReviewNeeded { run_id, commit } => {
+            if state.authorization != Authorization::Started {
+                return Ok(());
+            }
+            if !state.workers.runs.iter().any(|run| {
+                run.role == "reviewer"
+                    && run.source_run.as_deref() == Some(run_id)
+                    && run
+                        .context
+                        .as_deref()
+                        .is_some_and(|text| text.starts_with("wayfinder-final-feature-review"))
+                    && run.base_commit.as_deref() == Some(commit)
+                    && !matches!(run.status, WorkerStatus::Failed | WorkerStatus::Stopped)
+            }) {
+                let source = state
+                    .workers
+                    .runs
+                    .iter()
+                    .find(|run| run.id == *run_id)
+                    .context("final review source run disappeared")?;
+                let ticket = source.ticket;
+                let rework_round = source.rework_round;
+                new_run(
+                    state,
+                    NewRun {
+                        ticket,
+                        role: "reviewer",
+                        repository: &repository,
+                        map,
+                        source_run: Some(run_id.clone()),
+                        base_commit: Some(commit.clone()),
+                        context: Some(format!(
+                            "wayfinder-final-feature-review\nIndependently review the complete feature against the specification at fixed commit {commit}. Include required check results, unresolved findings, and known limitations."
+                        )),
+                    },
+                );
+                state.workers.runs.last_mut().unwrap().rework_round = rework_round;
+                save(dir, state)?;
+            }
+        }
+        DeliveryOutcome::FeatureReady { run_id, commit } => {
+            if let Err(error) =
+                delivery::mark_ready(dir, &repository, &state.map, state, run_id, commit)
+            {
+                delivery::record_ready_error(
+                    dir,
+                    &format!("final feature review is not ready for handoff: {error:#}"),
+                )?;
+            }
+        }
+        DeliveryOutcome::ReviewRenewal { run_id, commit } => {
+            if !state.workers.runs.iter().any(|run| {
+                run.role == "reviewer"
+                    && run.source_run.as_deref() == Some(run_id)
+                    && run.base_commit.as_deref() == Some(commit)
+                    && !matches!(run.status, WorkerStatus::Failed | WorkerStatus::Stopped)
+            }) {
+                let source = state
+                    .workers
+                    .runs
+                    .iter()
+                    .find(|run| run.id == *run_id)
+                    .context("renewed review source run disappeared")?;
+                let source_round = source.rework_round;
+                let source_ticket = source.ticket;
+                new_run(
+                    state,
+                    NewRun {
+                        ticket: source_ticket,
+                        role: "reviewer",
+                        repository: &repository,
+                        map,
+                        source_run: Some(run_id.clone()),
+                        base_commit: Some(commit.clone()),
+                        context: Some(format!(
+                            "The feature branch target changed after review. Independently review the rebased candidate {commit}; the earlier approval applies only to its prior commit."
+                        )),
+                    },
+                );
+                state.workers.runs.last_mut().unwrap().rework_round = source_round;
+                save(dir, state)?;
+            }
+        }
+        DeliveryOutcome::Conflict {
+            run_id,
+            base_commit,
+            detail,
+        } => {
+            let source = state
+                .workers
+                .runs
+                .iter()
+                .find(|run| run.id == *run_id)
+                .context("conflicted integration source run disappeared")?
+                .clone();
+            if source.rework_round >= REWORK_ROUNDS {
+                if let Some(worker) = state.workers.runs.iter_mut().find(|run| run.id == *run_id) {
+                    worker.status = WorkerStatus::NeedsHuman;
+                    worker.question = Some(format!(
+                        "The three-round review/rework budget is exhausted. {detail}"
+                    ));
+                }
+            } else if !state.workers.runs.iter().any(|run| {
+                run.role == "implementer"
+                    && run.ticket == source.ticket
+                    && run.source_run.as_deref() == Some(run_id)
+                    && run.base_commit.as_deref() == Some(base_commit)
+                    && !matches!(run.status, WorkerStatus::Failed | WorkerStatus::Stopped)
+            }) {
+                new_run(
+                    state,
+                    NewRun {
+                        ticket: source.ticket,
+                        role: "implementer",
+                        repository: &repository,
+                        map,
+                        source_run: Some(run_id.clone()),
+                        base_commit: Some(base_commit.clone()),
+                        context: Some(format!(
+                            "Rebase conflict while integrating the independently reviewed ticket. Resolve it in this fresh detached worktree against feature commit {base_commit}. Preserve the existing integration conflict worktree and explain the resolution. Details: {detail}"
+                        )),
+                    },
+                );
+                state.workers.runs.last_mut().unwrap().rework_round = source.rework_round + 1;
+                state.workers.runs.last_mut().unwrap().automatic_retries = source.automatic_retries;
+            }
+            save(dir, state)?;
+        }
+        DeliveryOutcome::Held { run_id, detail } => {
+            state.suspension = format!("ticket delivery for {run_id} is held: {detail}");
+        }
+    }
+    if delivery::read(dir)?
+        .tickets
+        .values()
+        .any(|ticket| ticket.integrated_commit.is_some())
+    {
+        if let Err(error) = delivery::ensure_draft_pr(dir, &repository, &state.map, state) {
+            eprintln!(
+                "Wayfinder ticket integration succeeded; feature PR handoff remains pending: {error:#}"
+            );
+            delivery::record_handoff_error(dir, &format!("{error:#}"))?;
+        }
+    }
+    Ok(())
 }
 
 fn queue_frontier(state: &mut State, frontier: &[FrontierTicket], repository: &Path, map: &MapRef) {

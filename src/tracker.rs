@@ -68,6 +68,17 @@ pub struct FrontierTicket {
     pub body: String,
 }
 
+/// Snapshot of a direct map child used by delivery readiness. Includes non-task
+/// children because research and human-decision issues also gate completion.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ChildTicket {
+    pub number: u64,
+    pub title: String,
+    pub url: String,
+    pub state: String,
+    pub labels: Vec<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct Intent {
     format_version: u32,
@@ -697,6 +708,45 @@ impl GitHub {
 
     pub fn reconcile(&self, map: &MapRef) -> Result<Vec<FrontierTicket>> {
         self.frontier(map)
+    }
+
+    /// Direct map children, including non-task work that gates final readiness.
+    pub fn child_tickets(&self, map: &MapRef) -> Result<Vec<ChildTicket>> {
+        self.subissues(map)?
+            .into_iter()
+            .map(|issue| {
+                let number = issue["number"]
+                    .as_u64()
+                    .context("map sub-issue omitted number")?;
+                let labels = issue["labels"]
+                    .as_array()
+                    .context("map sub-issue omitted labels")?
+                    .iter()
+                    .map(|label| {
+                        label["name"]
+                            .as_str()
+                            .map(str::to_owned)
+                            .context("map sub-issue label omitted name")
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                Ok(ChildTicket {
+                    number,
+                    title: issue["title"]
+                        .as_str()
+                        .context("map sub-issue omitted title")?
+                        .to_owned(),
+                    url: issue["html_url"]
+                        .as_str()
+                        .context("map sub-issue omitted URL")?
+                        .to_owned(),
+                    state: issue["state"]
+                        .as_str()
+                        .context("map sub-issue omitted state")?
+                        .to_owned(),
+                    labels,
+                })
+            })
+            .collect()
     }
 
     fn require_execution_override(&self, map: &MapRef) -> Result<()> {

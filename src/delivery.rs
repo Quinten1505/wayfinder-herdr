@@ -1,0 +1,2076 @@
+//! Exact-commit review evidence and serialized ticket integration.
+//!
+//! Delivery state is kept beside the map runtime state so integration retries survive
+//! process restarts without changing the worker identity/recovery records.
+use crate::{
+    store::{self, Lock, State, WorkerStatus},
+    tracker::{ChildTicket, MapRef},
+};
+use anyhow::{Context, Result, bail, ensure};
+use serde::{Deserialize, Serialize};
+use std::{
+    collections::BTreeMap,
+    fs,
+    path::{Path, PathBuf},
+    process::{Command, Stdio},
+};
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+pub struct DeliveryState {
+    #[serde(default)]
+    pub repository: Option<String>,
+    #[serde(default)]
+    pub feature_branch: Option<String>,
+    #[serde(default)]
+    pub tickets: BTreeMap<String, TicketDelivery>,
+    /// Latest open direct children of the map. Delivery-completed tasks remain
+    /// here until the orchestrator closes them, so chat can report that state.
+    #[serde(default)]
+    pub open_children: Vec<ChildTicket>,
+    #[serde(default)]
+    pub draft_pr: Option<PullRequest>,
+    #[serde(default)]
+    pub ready_commit: Option<String>,
+    #[serde(default)]
+    pub merged_commit: Option<String>,
+    #[serde(default)]
+    pub pr_base_commit: Option<String>,
+    #[serde(default)]
+    pub final_review_commit: Option<String>,
+    #[serde(default)]
+    pub handoff_error: Option<String>,
+    #[serde(default)]
+    pub ready_error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+pub struct TicketDelivery {
+    #[serde(default)]
+    pub title: String,
+    #[serde(default)]
+    pub url: String,
+    pub reviewed_commit: Option<String>,
+    pub candidate_commit: Option<String>,
+    #[serde(default)]
+    pub candidate_base: Option<String>,
+    pub integrated_commit: Option<String>,
+    pub integration_worktree: Option<PathBuf>,
+    pub issue: u64,
+    pub last_error: Option<String>,
+    #[serde(default)]
+    pub conflict_base: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PullRequest {
+    pub number: u64,
+    pub url: String,
+    pub head: String,
+    pub base: String,
+    pub draft: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Outcome {
+    Nothing,
+    Integrated {
+        run_id: String,
+        commit: String,
+    },
+    ReviewRenewal {
+        run_id: String,
+        commit: String,
+    },
+    FinalReviewNeeded {
+        run_id: String,
+        commit: String,
+    },
+    FeatureReady {
+        run_id: String,
+        commit: String,
+    },
+    Conflict {
+        run_id: String,
+        base_commit: String,
+        detail: String,
+    },
+    Held {
+        run_id: String,
+        detail: String,
+    },
+}
+
+pub fn read(dir: &Path) -> Result<DeliveryState> {
+    let path = dir.join("delivery.json");
+    if !path.exists() {
+        return Ok(DeliveryState::default());
+    }
+    let bytes = fs::read(&path)?;
+    serde_json::from_slice(&bytes).context("decode delivery state")
+}
+
+/// Human-readable, read-only delivery milestones for the orchestrating chat.
+pub fn chat_milestones(dir: &Path) -> Result<Vec<String>> {
+    let state = read(dir)?;
+    let mut milestones = Vec::new();
+    for ticket in state.tickets.values() {
+        let child = state
+            .open_children
+            .iter()
+            .find(|child| child.number == ticket.issue);
+        let title = if !ticket.title.is_empty() {
+            ticket.title.clone()
+        } else if let Some(child) = child {
+            child.title.clone()
+        } else {
+            "Wayfinder ticket with missing title metadata".to_owned()
+        };
+        let link = if !ticket.url.is_empty() {
+            ticket.url.clone()
+        } else if let Some(child) = child {
+            child.url.clone()
+        } else {
+            format!(
+                "https://github.com/{}/issues/{}",
+                state.repository.as_deref().unwrap_or_default(),
+                ticket.issue
+            )
+        };
+        if let Some(commit) = ticket.integrated_commit.as_deref() {
+            milestones.push(format!(
+                "Integrated [{title}]({link}) at commit {}.",
+                short_commit(commit)
+            ));
+        } else if let Some(commit) = ticket.candidate_commit.as_deref() {
+            milestones.push(format!(
+                "[{title}]({link}) is waiting for renewed review of {}.",
+                short_commit(commit)
+            ));
+        } else if let Some(error) = ticket.last_error.as_deref() {
+            milestones.push(format!("Delivery for [{title}]({link}) is held: {}", error));
+        }
+    }
+    for child in &state.open_children {
+        let link = format!("[{}]({})", child.title, child.url);
+        let is_task = child.labels.iter().any(|label| label == "wayfinder:task");
+        let integrated = is_task
+            && state
+                .tickets
+                .values()
+                .any(|entry| entry.issue == child.number && entry.integrated_commit.is_some());
+        if integrated {
+            milestones.push(format!(
+                "{link} is integrated and awaiting orchestrator closure."
+            ));
+        } else {
+            let kind = if is_task {
+                "implementation"
+            } else {
+                "map decision or research"
+            };
+            milestones.push(format!("Open {kind} work remains: {link}."));
+        }
+    }
+    if dir.join("state.json").exists() {
+        let runtime = store::read_state(dir)?;
+        for run in
+            runtime.workers.runs.iter().filter(|run| {
+                run.status == WorkerStatus::NeedsHuman && run.human_request_id.is_some()
+            })
+        {
+            let title_url = state
+                .open_children
+                .iter()
+                .find(|child| child.number == run.ticket)
+                .map(|child| (child.title.as_str(), child.url.as_str()))
+                .or_else(|| {
+                    state.tickets.values().find_map(|ticket| {
+                        (ticket.issue == run.ticket && !ticket.title.is_empty())
+                            .then_some((ticket.title.as_str(), ticket.url.as_str()))
+                    })
+                });
+            if let Some((title, url)) = title_url {
+                milestones.push(format!("A human decision is pending for [{title}]({url})."));
+            }
+        }
+    }
+    if let Some(pr) = state.draft_pr {
+        milestones.push(format!(
+            "Feature PR #{} is {}: {}",
+            pr.number,
+            if pr.draft {
+                "draft"
+            } else {
+                "ready for human review"
+            },
+            pr.url
+        ));
+    }
+    if let Some(commit) = state.ready_commit {
+        milestones.push(format!(
+            "Feature review approved commit {}; PR may be ready for human review.",
+            commit
+        ));
+    }
+    if let Some(commit) = state.merged_commit {
+        milestones.push(format!("Human feature merge observed at {}; eligible clean preserved worktrees are being removed.", commit));
+    }
+    if let Some(error) = state.handoff_error {
+        milestones.push(format!("Feature PR handoff is pending: {error}"));
+    }
+    if let Some(error) = state.ready_error {
+        milestones.push(format!("Feature PR remains draft: {error}"));
+    }
+    Ok(milestones)
+}
+
+pub fn record_handoff_error(dir: &Path, error: &str) -> Result<()> {
+    let mut state = read(dir)?;
+    state.handoff_error = Some(error.to_owned());
+    save(dir, &state)
+}
+
+pub fn record_ready_error(dir: &Path, error: &str) -> Result<()> {
+    let mut state = read(dir)?;
+    state.ready_error = Some(error.to_owned());
+    save(dir, &state)
+}
+
+pub fn mark_ready(
+    dir: &Path,
+    repository: &Path,
+    map: &str,
+    workers: &State,
+    review_run: &str,
+    commit: &str,
+) -> Result<()> {
+    let gh = std::env::var_os("GH_BIN_PATH")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("gh"));
+    mark_ready_with(
+        dir,
+        repository,
+        map,
+        workers,
+        review_run,
+        commit,
+        required_checks,
+        &gh,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn mark_ready_with(
+    dir: &Path,
+    repository: &Path,
+    map: &str,
+    workers: &State,
+    review_run: &str,
+    commit: &str,
+    checks: impl FnOnce(&Path) -> Result<()>,
+    gh: &Path,
+) -> Result<()> {
+    let mut delivery = read(dir)?;
+    ensure!(
+        delivery
+            .tickets
+            .values()
+            .all(|ticket| ticket.integrated_commit.is_some()),
+        "feature PR cannot be ready while ticket integrations remain"
+    );
+    ensure!(
+        !delivery.tickets.is_empty(),
+        "feature PR cannot be ready without integrated ticket evidence"
+    );
+    let reviewer = workers
+        .workers
+        .runs
+        .iter()
+        .find(|run| run.id == review_run)
+        .context("final reviewer run disappeared")?;
+    ensure!(
+        reviewer.role == "reviewer"
+            && reviewer
+                .context
+                .as_deref()
+                .is_some_and(|text| text.starts_with("wayfinder-final-feature-review")),
+        "PR readiness requires the independent final feature reviewer"
+    );
+    ensure!(
+        reviewer.base_commit.as_deref() == Some(commit)
+            && reviewer.status == WorkerStatus::Completed,
+        "final reviewer did not complete against the current feature commit"
+    );
+    let evidence = reviewer
+        .result_evidence
+        .as_deref()
+        .context("final reviewer has no archived result evidence")?;
+    let result: serde_json::Value = serde_json::from_slice(&fs::read(evidence)?)?;
+    ensure!(
+        result["reviewed_commit"].as_str() == Some(commit)
+            && result["verdict"].as_str() == Some("approved"),
+        "final review evidence does not approve this exact feature commit"
+    );
+    ensure!(
+        git(&reviewer.worktree, &["rev-parse", "HEAD"])?.trim() == commit,
+        "final reviewer checkout moved away from reviewed feature commit"
+    );
+    ensure!(
+        git(&reviewer.worktree, &["status", "--porcelain"])?
+            .trim()
+            .is_empty(),
+        "final reviewer checkout contains edits"
+    );
+    let branch = delivery
+        .feature_branch
+        .as_deref()
+        .context("feature branch is not recorded")?;
+    let reference = format!("refs/heads/{branch}");
+    ensure!(
+        git(repository, &["rev-parse", &reference])?.trim() == commit,
+        "feature branch changed after final review"
+    );
+    checks(&reviewer.worktree)?;
+    run(repository, "git", &["fetch", "origin", "develop"])?;
+    let base = git(repository, &["rev-parse", "refs/remotes/origin/develop"])?
+        .trim()
+        .to_owned();
+    ensure!(
+        is_ancestor(repository, &base, commit)?,
+        "feature branch must include the current develop target before PR readiness"
+    );
+    if let Some(previous) = delivery.pr_base_commit.as_deref() {
+        ensure!(
+            previous == base,
+            "develop changed since the draft PR base was recorded; update the feature branch and obtain a renewed final review before marking ready"
+        );
+    }
+    let pr = delivery
+        .draft_pr
+        .as_ref()
+        .context("draft feature PR has not been created")?;
+    let map_ref = MapRef::parse(map)?;
+    let repo = format!("{}/{}", map_ref.owner, map_ref.repository);
+    let number = pr.number.to_string();
+    gh_text(gh, &["pr", "ready", &number, "--repo", &repo])?;
+    let viewed = gh_json(
+        gh,
+        &[
+            "pr",
+            "view",
+            &number,
+            "--repo",
+            &repo,
+            "--json",
+            "isDraft,headRefOid,baseRefOid,url,number,headRefName,baseRefName",
+        ],
+    )?;
+    ensure!(
+        viewed["isDraft"] == false
+            && viewed["headRefOid"].as_str() == Some(commit)
+            && viewed["baseRefOid"].as_str() == Some(base.as_str()),
+        "GitHub did not confirm ready state for the reviewed head and current develop target"
+    );
+    delivery.draft_pr = Some(parse_pr(&viewed)?);
+    delivery.ready_commit = Some(commit.to_owned());
+    delivery.final_review_commit = Some(commit.to_owned());
+    delivery.pr_base_commit = Some(base);
+    delivery.handoff_error = None;
+    delivery.ready_error = None;
+    save(dir, &delivery)
+}
+
+pub fn reconcile(dir: &Path, state: &State, children: &[ChildTicket]) -> Result<Outcome> {
+    let _lock = Lock::acquire(&dir.join("integration.lock"))?;
+    let mut delivery = read(dir)?;
+    delivery.open_children = children
+        .iter()
+        .filter(|child| child.state == "open")
+        .cloned()
+        .collect();
+    save(dir, &delivery)?;
+    let Some(run) = state
+        .workers
+        .runs
+        .iter()
+        .rev()
+        .find(|run| run.role == "implementer" && run.status == WorkerStatus::Reviewed)
+    else {
+        return Ok(Outcome::Nothing);
+    };
+    let Some(reviewed_commit) = run.result_commit.as_deref() else {
+        return Ok(Outcome::Held {
+            run_id: run.id.clone(),
+            detail: "implementation result has no commit".into(),
+        });
+    };
+    let mut delivery = read(dir)?;
+    if delivery.repository.is_none() {
+        delivery.repository = Some(state.map.split('#').next().unwrap_or_default().to_owned());
+    }
+    let entry = delivery
+        .tickets
+        .entry(run.id.clone())
+        .or_insert_with(|| TicketDelivery {
+            reviewed_commit: Some(reviewed_commit.to_owned()),
+            issue: run.ticket,
+            title: ticket_title(state, run.ticket),
+            url: format!(
+                "https://github.com/{}/issues/{}",
+                state.map.split('#').next().unwrap_or_default(),
+                run.ticket
+            ),
+            ..TicketDelivery::default()
+        });
+    ensure!(
+        entry.reviewed_commit.as_deref() == Some(reviewed_commit),
+        "reviewed commit changed after delivery was recorded"
+    );
+    if entry.integrated_commit.is_some() {
+        return feature_review_outcome(state, &delivery, run, children);
+    }
+    let expected_review = entry.candidate_commit.as_deref().unwrap_or(reviewed_commit);
+    let reviewer = state.workers.runs.iter().rev().find(|candidate| {
+        candidate.role == "reviewer"
+            && candidate.source_run.as_deref() == Some(&run.id)
+            && candidate.status == WorkerStatus::Completed
+            && candidate.base_commit.as_deref() == Some(expected_review)
+    });
+    let Some(reviewer) = reviewer else {
+        return Ok(Outcome::Held {
+            run_id: run.id.clone(),
+            detail: format!("independent approval for {expected_review} is missing"),
+        });
+    };
+    let evidence = reviewer
+        .result_evidence
+        .as_deref()
+        .context("review has no retained evidence")?;
+    let evidence_bytes = fs::read(evidence).context("read retained reviewer evidence")?;
+    let value: serde_json::Value =
+        serde_json::from_slice(&evidence_bytes).context("decode retained reviewer evidence")?;
+    ensure!(
+        value["reviewed_commit"].as_str() == Some(expected_review),
+        "review evidence is stale for the candidate commit"
+    );
+    ensure!(
+        value["verdict"].as_str() == Some("approved"),
+        "ticket integration requires an approved independent review"
+    );
+    let repository =
+        fs::canonicalize(&state.binding.repository).context("resolve bound repository")?;
+    let branch = match &delivery.feature_branch {
+        Some(branch) => branch.clone(),
+        None => {
+            let current = git(&repository, &["branch", "--show-current"])?;
+            let branch = current.trim().to_owned();
+            ensure!(
+                !branch.is_empty() && branch.starts_with("feature/"),
+                "bound checkout must be on the map feature branch before ticket integration"
+            );
+            delivery.feature_branch = Some(branch.clone());
+            branch
+        }
+    };
+    validate_branch(&branch)?;
+    let reference = format!("refs/heads/{branch}");
+    let target = git(&repository, &["rev-parse", &reference])?
+        .trim()
+        .to_owned();
+    if entry.conflict_base.as_deref() == Some(&target) {
+        return Ok(Outcome::Conflict {
+            run_id: run.id.clone(),
+            base_commit: target,
+            detail: entry
+                .last_error
+                .clone()
+                .unwrap_or_else(|| "previous rebase conflict remains unresolved".into()),
+        });
+    }
+    let base = run
+        .base_commit
+        .as_deref()
+        .context("implementation run has no recorded base commit")?;
+    let mut candidate = entry.candidate_commit.clone();
+    let mut check_path = run.worktree.clone();
+    let needs_rebase = match candidate.as_deref() {
+        Some(commit) => !is_ancestor(&repository, &target, commit)?,
+        None => !is_ancestor(&repository, &target, reviewed_commit)?,
+    };
+    if needs_rebase {
+        let path = dir.join("integration-worktrees").join(run.id.as_str());
+        if path.exists() {
+            ensure!(
+                validate_worktree(&repository, &path).is_ok(),
+                "integration worktree path exists but is not the recorded owned checkout; preserving it"
+            );
+        } else {
+            fs::create_dir_all(
+                path.parent()
+                    .context("integration worktree has no parent")?,
+            )?;
+            git(
+                &repository,
+                &[
+                    "worktree",
+                    "add",
+                    "--detach",
+                    path.to_str()
+                        .context("non-UTF8 integration worktree path")?,
+                    reviewed_commit,
+                ],
+            )?;
+        }
+        entry.integration_worktree = Some(path.clone());
+        let old_base = entry.candidate_base.as_deref().unwrap_or(base);
+        let old_commit = entry.candidate_commit.as_deref().unwrap_or(reviewed_commit);
+        let checkout = if git(&path, &["rev-parse", "HEAD"]).is_ok() {
+            git_result(&path, &["checkout", "--detach", old_commit])
+        } else {
+            bail!("integration worktree is unavailable")
+        };
+        if let Err(error) = checkout {
+            entry.last_error = Some(format!("could not select owned candidate: {error:#}"));
+            save(dir, &delivery)?;
+            return Ok(Outcome::Held {
+                run_id: run.id.clone(),
+                detail: format!("integration checkout could not be reconciled: {error:#}"),
+            });
+        }
+        let rebase = git_result(&path, &["rebase", "--onto", &target, old_base]);
+        match rebase {
+            Ok(_) => {
+                let rebased = git(&path, &["rev-parse", "HEAD"])?.trim().to_owned();
+                ensure!(
+                    is_ancestor(&repository, &target, &rebased)?,
+                    "rebased candidate is not a descendant of the current feature head"
+                );
+                entry.candidate_commit = Some(rebased.clone());
+                entry.candidate_base = Some(target.clone());
+                entry.last_error = None;
+                save(dir, &delivery)?;
+                return Ok(Outcome::ReviewRenewal {
+                    run_id: run.id.clone(),
+                    commit: rebased,
+                });
+            }
+            Err(error) => {
+                entry.last_error = Some(format!("{error:#}"));
+                entry.conflict_base = Some(target.clone());
+                save(dir, &delivery)?;
+                return Ok(Outcome::Conflict {
+                    run_id: run.id.clone(),
+                    base_commit: target,
+                    detail: format!("rebase conflict retained at {}: {error:#}", path.display()),
+                });
+            }
+        }
+    }
+    if let Some(candidate_commit) = candidate.as_ref() {
+        let latest_review = state.workers.runs.iter().rev().find(|candidate_run| {
+            candidate_run.role == "reviewer"
+                && candidate_run.source_run.as_deref() == Some(&run.id)
+                && candidate_run.status == WorkerStatus::Completed
+                && candidate_run.base_commit.as_deref() == Some(candidate_commit)
+        });
+        if latest_review.is_none() {
+            return Ok(Outcome::Held {
+                run_id: run.id.clone(),
+                detail: format!(
+                    "rebased commit {candidate_commit} requires a renewed independent review"
+                ),
+            });
+        }
+        let path = entry
+            .integration_worktree
+            .as_ref()
+            .context("rebased integration worktree was not retained")?;
+        check_path = path.clone();
+        if target != git(&repository, &["rev-parse", &reference])?.trim() {
+            return Ok(Outcome::Held {
+                run_id: run.id.clone(),
+                detail: "feature target moved while renewed review was pending; reconcile again"
+                    .into(),
+            });
+        }
+    } else {
+        candidate = Some(reviewed_commit.to_owned());
+    }
+    let candidate = candidate.context("integration candidate missing")?;
+    ensure!(
+        git(&check_path, &["rev-parse", "HEAD"])?.trim() == candidate,
+        "integration checkout no longer matches reviewed candidate"
+    );
+    if let Err(error) = required_checks(&check_path) {
+        entry.last_error = Some(format!("required checks failed: {error:#}"));
+        save(dir, &delivery)?;
+        return Ok(Outcome::Held {
+            run_id: run.id.clone(),
+            detail: format!("required checks failed; worktree and evidence retained: {error:#}"),
+        });
+    }
+    ensure!(
+        git(&check_path, &["status", "--porcelain"])?
+            .trim()
+            .is_empty(),
+        "integration checkout became dirty during required checks; preserving it"
+    );
+    let latest = git(&repository, &["rev-parse", &reference])?
+        .trim()
+        .to_owned();
+    ensure!(
+        latest == target,
+        "feature branch target changed during integration; retry against the new target"
+    );
+    ensure!(
+        is_ancestor(&repository, &target, &candidate)?,
+        "candidate cannot fast-forward the feature branch"
+    );
+    update_ref(&repository, &reference, &candidate, &target)?;
+    entry.integrated_commit = Some(candidate.clone());
+    entry.candidate_commit = Some(candidate.clone());
+    entry.last_error = None;
+    save(dir, &delivery)?;
+    Ok(Outcome::Integrated {
+        run_id: run.id.clone(),
+        commit: candidate,
+    })
+}
+
+fn feature_review_outcome(
+    state: &State,
+    delivery: &DeliveryState,
+    source: &crate::store::WorkerRun,
+    children: &[ChildTicket],
+) -> Result<Outcome> {
+    let final_review_in_flight = state.workers.runs.iter().any(|run| {
+        run.role == "reviewer"
+            && run
+                .context
+                .as_deref()
+                .is_some_and(|text| text.starts_with("wayfinder-final-feature-review"))
+            && run.reserves_capacity()
+    });
+    let pending_implementation_or_human_work = state.workers.runs.iter().any(|run| {
+        run.reserves_capacity()
+            && !(run.role == "reviewer"
+                && run
+                    .context
+                    .as_deref()
+                    .is_some_and(|text| text.starts_with("wayfinder-final-feature-review")))
+    });
+    let unresolved_children = children
+        .iter()
+        .filter(|child| child.state == "open")
+        .any(|child| {
+            !child.labels.iter().any(|label| label == "wayfinder:task")
+                || !delivery
+                    .tickets
+                    .values()
+                    .any(|entry| entry.issue == child.number && entry.integrated_commit.is_some())
+        });
+    if unresolved_children
+        || delivery.tickets.is_empty()
+        || delivery
+            .tickets
+            .values()
+            .any(|ticket| ticket.integrated_commit.is_none())
+        || pending_implementation_or_human_work
+    {
+        return Ok(Outcome::Nothing);
+    }
+    // The final reviewer is not an implementation loop. Its own queued/running
+    // request blocks duplicate scheduling until that exact review completes.
+    if final_review_in_flight {
+        return Ok(Outcome::Nothing);
+    }
+    let Some(branch) = delivery.feature_branch.as_deref() else {
+        return Ok(Outcome::Nothing);
+    };
+    let repository = fs::canonicalize(&state.binding.repository)?;
+    let head = git(&repository, &["rev-parse", &format!("refs/heads/{branch}")])?
+        .trim()
+        .to_owned();
+    let final_review = state.workers.runs.iter().rev().find(|candidate| {
+        candidate.role == "reviewer"
+            && candidate.source_run.as_deref() == Some(&source.id)
+            && candidate
+                .context
+                .as_deref()
+                .is_some_and(|text| text.starts_with("wayfinder-final-feature-review"))
+            && candidate.base_commit.as_deref() == Some(&head)
+            && candidate.status == WorkerStatus::Completed
+    });
+    let Some(final_review) = final_review else {
+        return Ok(Outcome::FinalReviewNeeded {
+            run_id: source.id.clone(),
+            commit: head,
+        });
+    };
+    let Some(evidence) = final_review.result_evidence.as_deref() else {
+        return Ok(Outcome::Held {
+            run_id: final_review.id.clone(),
+            detail: "final feature review has no archived evidence".into(),
+        });
+    };
+    let result: serde_json::Value = serde_json::from_slice(&fs::read(evidence)?)?;
+    ensure!(
+        result["reviewed_commit"].as_str() == Some(&head),
+        "final feature review is stale for the current feature head"
+    );
+    ensure!(
+        result["verdict"].as_str() == Some("approved"),
+        "final feature review did not approve the current feature head"
+    );
+    ensure!(
+        git(&final_review.worktree, &["rev-parse", "HEAD"])?.trim() == head,
+        "final reviewer worktree moved away from the reviewed feature head"
+    );
+    ensure!(
+        git(&final_review.worktree, &["status", "--porcelain"])?
+            .trim()
+            .is_empty(),
+        "final reviewer worktree contains edits"
+    );
+    required_checks(&final_review.worktree)?;
+    Ok(Outcome::FeatureReady {
+        run_id: final_review.id.clone(),
+        commit: head,
+    })
+}
+
+fn ticket_title(state: &State, ticket: u64) -> String {
+    state
+        .workers
+        .runs
+        .iter()
+        .find_map(|run| {
+            if run.ticket != ticket {
+                return None;
+            }
+            run.context.as_deref()?.lines().find_map(|line| {
+                line.strip_prefix("GitHub ticket title: ")
+                    .map(str::to_owned)
+            })
+        })
+        .unwrap_or_else(|| format!("Wayfinder issue #{ticket}"))
+}
+
+/// Create or refresh the map's draft feature PR once at least one reviewed ticket
+/// has been integrated. Repeated reconciliation reads before writing and uses the
+/// stable head/base pair to recover an ambiguous create response.
+pub fn ensure_draft_pr(
+    dir: &Path,
+    repository: &Path,
+    map: &str,
+    workers: &State,
+) -> Result<Option<PullRequest>> {
+    let gh = std::env::var_os("GH_BIN_PATH")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("gh"));
+    ensure_draft_pr_with_gh(dir, repository, map, workers, &gh)
+}
+
+fn ensure_draft_pr_with_gh(
+    dir: &Path,
+    repository: &Path,
+    map: &str,
+    workers: &State,
+    gh: &Path,
+) -> Result<Option<PullRequest>> {
+    let mut delivery = read(dir)?;
+    if !delivery
+        .tickets
+        .values()
+        .any(|ticket| ticket.integrated_commit.is_some())
+    {
+        return Ok(None);
+    }
+    let branch = delivery
+        .feature_branch
+        .clone()
+        .context("integrated ticket has no recorded feature branch")?;
+    validate_branch(&branch)?;
+    let map_ref = MapRef::parse(map)?;
+    let repo = format!("{}/{}", map_ref.owner, map_ref.repository);
+    let listed = gh_json(
+        gh,
+        &[
+            "pr",
+            "list",
+            "--repo",
+            &repo,
+            "--head",
+            &branch,
+            "--base",
+            "develop",
+            "--state",
+            "all",
+            "--json",
+            "number,url,isDraft,headRefName,baseRefName,mergedAt",
+        ],
+    )?;
+    let prs = listed
+        .as_array()
+        .context("gh pr list response was not an array")?;
+    ensure!(
+        prs.len() <= 1,
+        "multiple feature PRs use the same map branch and base"
+    );
+    let mut forced_draft = false;
+    if let Some(existing) = prs.first() {
+        let existing_pr = parse_pr(existing)?;
+        if existing["mergedAt"].as_str().is_some() {
+            run(repository, "git", &["fetch", "origin", "develop"])?;
+            delivery.merged_commit = Some(
+                git(repository, &["rev-parse", "refs/remotes/origin/develop"])?
+                    .trim()
+                    .to_owned(),
+            );
+            delivery.draft_pr = Some(existing_pr.clone());
+            save(dir, &delivery)?;
+            cleanup_merged_worktrees(repository, workers, &delivery)?;
+            return Ok(Some(existing_pr));
+        }
+        run(repository, "git", &["fetch", "origin", "develop"])?;
+        let observed_base = git(repository, &["rev-parse", "refs/remotes/origin/develop"])?
+            .trim()
+            .to_owned();
+        let observed_head = git(repository, &["rev-parse", &format!("refs/heads/{branch}")])?
+            .trim()
+            .to_owned();
+        let ready_invalid = delivery.ready_commit.as_deref().is_some_and(|ready| {
+            ready != observed_head
+                || delivery.pr_base_commit.as_deref() != Some(observed_base.as_str())
+        });
+        if ready_invalid && !existing_pr.draft {
+            let number = existing_pr.number.to_string();
+            gh_text(
+                gh,
+                &[
+                    "api",
+                    "--method",
+                    "PATCH",
+                    &format!("repos/{repo}/pulls/{number}"),
+                    "-F",
+                    "draft=true",
+                ],
+            )?;
+            forced_draft = true;
+            delivery.ready_commit = None;
+            delivery.final_review_commit = None;
+            delivery.ready_error = Some("feature head or develop target changed after final review; the PR returned to draft and needs a renewed final review".into());
+        }
+        let (base, target_updated) = sync_develop_target(dir, repository, &branch, &mut delivery)?;
+        if target_updated && !existing_pr.draft && !forced_draft {
+            let number = existing_pr.number.to_string();
+            gh_text(
+                gh,
+                &[
+                    "api",
+                    "--method",
+                    "PATCH",
+                    &format!("repos/{repo}/pulls/{number}"),
+                    "-F",
+                    "draft=true",
+                ],
+            )?;
+            forced_draft = true;
+            delivery.ready_commit = None;
+            delivery.final_review_commit = None;
+            delivery.ready_error = Some("develop advanced; the feature branch was updated and requires a renewed final review before this PR can be ready".into());
+        }
+        delivery.pr_base_commit = Some(base);
+        save(dir, &delivery)?;
+    } else {
+        let (base, _) = sync_develop_target(dir, repository, &branch, &mut delivery)?;
+        delivery.pr_base_commit = Some(base);
+        save(dir, &delivery)?;
+    }
+    run(
+        repository,
+        "git",
+        &["push", "--set-upstream", "origin", &branch],
+    )?;
+    let mut pr = if let Some(pr) = prs.first() {
+        let mut parsed = parse_pr(pr)?;
+        if forced_draft {
+            parsed.draft = true;
+        }
+        ensure!(
+            parsed.head == branch && parsed.base == "develop",
+            "existing feature PR target does not match the delivery contract"
+        );
+        parsed
+    } else {
+        let body = pr_body(&delivery);
+        let output = gh_text(
+            gh,
+            &[
+                "pr",
+                "create",
+                "--repo",
+                &repo,
+                "--draft",
+                "--base",
+                "develop",
+                "--head",
+                &branch,
+                "--title",
+                &format!("Wayfinder delivery: {}", map_ref.number),
+                "--body",
+                &body,
+            ],
+        );
+        match output {
+            Ok(url) => {
+                let number = url
+                    .trim()
+                    .trim_end_matches('/')
+                    .rsplit('/')
+                    .next()
+                    .and_then(|n| n.parse::<u64>().ok())
+                    .context("gh pr create returned no pull request URL")?;
+                PullRequest {
+                    number,
+                    url: url.trim().to_owned(),
+                    head: branch.to_owned(),
+                    base: "develop".into(),
+                    draft: true,
+                }
+            }
+            Err(error) => {
+                let after = gh_json(
+                    gh,
+                    &[
+                        "pr",
+                        "list",
+                        "--repo",
+                        &repo,
+                        "--head",
+                        &branch,
+                        "--base",
+                        "develop",
+                        "--state",
+                        "all",
+                        "--json",
+                        "number,url,isDraft,headRefName,baseRefName",
+                    ],
+                );
+                if let Ok(after) = after {
+                    let rows = after
+                        .as_array()
+                        .context("gh pr list response was not an array")?;
+                    if rows.len() == 1 {
+                        parse_pr(&rows[0])?
+                    } else {
+                        return Err(error).context("draft PR creation was ambiguous; retry after listing the feature head/base pair");
+                    }
+                } else {
+                    return Err(error).context(
+                        "draft PR creation was ambiguous and the follow-up listing failed",
+                    );
+                }
+            }
+        }
+    };
+    if !pr.draft && delivery.ready_commit.is_some() {
+        run(repository, "git", &["fetch", "origin", "develop"])?;
+        let current_base = git(repository, &["rev-parse", "refs/remotes/origin/develop"])?
+            .trim()
+            .to_owned();
+        let current_head = remote_ref(repository, "refs/heads", &branch)?;
+        let ready_head = delivery.ready_commit.as_deref().unwrap();
+        let target_changed = delivery.pr_base_commit.as_deref() != Some(current_base.as_str());
+        if target_changed || current_head.as_deref() != Some(ready_head) {
+            let number = pr.number.to_string();
+            gh_text(
+                gh,
+                &[
+                    "api",
+                    "--method",
+                    "PATCH",
+                    &format!("repos/{repo}/pulls/{number}"),
+                    "-F",
+                    "draft=true",
+                ],
+            )?;
+            pr.draft = true;
+            delivery.ready_commit = None;
+            delivery.final_review_commit = None;
+            delivery.pr_base_commit = Some(current_base);
+            delivery.ready_error = Some(if target_changed {
+                "develop moved after final review; update the feature branch, rerun checks, and obtain a renewed final review".into()
+            } else {
+                "feature branch changed after final review; obtain a renewed final review for its current commit".into()
+            });
+        }
+    }
+    let body = pr_body(&delivery);
+    let _ = gh_text(
+        gh,
+        &[
+            "pr",
+            "edit",
+            &pr.number.to_string(),
+            "--repo",
+            &repo,
+            "--body",
+            &body,
+        ],
+    )?;
+    delivery.draft_pr = Some(pr.clone());
+    delivery.handoff_error = None;
+    if delivery.pr_base_commit.is_none() {
+        delivery.pr_base_commit = remote_ref(repository, "refs/heads", "develop")?;
+    }
+    save(dir, &delivery)?;
+    Ok(Some(pr))
+}
+
+fn remote_ref(repository: &Path, namespace: &str, branch: &str) -> Result<Option<String>> {
+    let reference = format!("{namespace}/{branch}");
+    let output = Command::new("git")
+        .args(["-C"])
+        .arg(repository)
+        .args(["ls-remote", "origin", &reference])
+        .output()
+        .context("read remote feature head")?;
+    ensure!(
+        output.status.success(),
+        "git ls-remote failed: {}",
+        String::from_utf8_lossy(&output.stderr).trim()
+    );
+    Ok(String::from_utf8(output.stdout)?
+        .lines()
+        .next()
+        .and_then(|line| line.split_whitespace().next())
+        .map(str::to_owned))
+}
+
+fn sync_develop_target(
+    dir: &Path,
+    repository: &Path,
+    feature_branch: &str,
+    delivery: &mut DeliveryState,
+) -> Result<(String, bool)> {
+    sync_develop_target_with_checks(dir, repository, feature_branch, delivery, required_checks)
+}
+
+fn sync_develop_target_with_checks(
+    dir: &Path,
+    repository: &Path,
+    feature_branch: &str,
+    delivery: &mut DeliveryState,
+    checks: impl Fn(&Path) -> Result<()>,
+) -> Result<(String, bool)> {
+    run(repository, "git", &["fetch", "origin", "develop"])?;
+    let base = git(repository, &["rev-parse", "refs/remotes/origin/develop"])?
+        .trim()
+        .to_owned();
+    let reference = format!("refs/heads/{feature_branch}");
+    let old_head = git(repository, &["rev-parse", &reference])?
+        .trim()
+        .to_owned();
+    let target_updated = delivery
+        .pr_base_commit
+        .as_deref()
+        .is_some_and(|previous| previous != base)
+        || !is_ancestor(repository, &base, &old_head)?;
+    if !is_ancestor(repository, &base, &old_head)? {
+        let suffix = short_commit(&base);
+        let path = dir
+            .join("integration-worktrees")
+            .join(format!("develop-update-{suffix}"));
+        if path.exists() {
+            bail!(
+                "a retained develop update worktree already exists at {}; inspect it before retrying",
+                path.display()
+            );
+        }
+        fs::create_dir_all(
+            path.parent()
+                .context("develop update worktree has no parent")?,
+        )?;
+        git(
+            repository,
+            &[
+                "worktree",
+                "add",
+                "--detach",
+                path.to_str().context("non-UTF8 develop update path")?,
+                &old_head,
+            ],
+        )?;
+        let merge = git_result(&path, &["merge", "--no-edit", &base]);
+        if let Err(error) = merge {
+            delivery.handoff_error = Some(format!(
+                "feature target update conflicted; worktree retained at {}: {error:#}",
+                path.display()
+            ));
+            save(dir, delivery)?;
+            bail!(
+                "{}",
+                delivery
+                    .handoff_error
+                    .as_deref()
+                    .unwrap_or("feature target update conflict")
+            );
+        }
+        let updated = git(&path, &["rev-parse", "HEAD"])?.trim().to_owned();
+        ensure!(
+            is_ancestor(repository, &base, &updated)?,
+            "updated feature head does not contain current develop"
+        );
+        if let Err(error) = checks(&path) {
+            delivery.handoff_error = Some(format!(
+                "required checks failed after updating feature against develop; checkout retained at {}: {error:#}",
+                path.display()
+            ));
+            save(dir, delivery)?;
+            bail!(
+                "{}",
+                delivery
+                    .handoff_error
+                    .as_deref()
+                    .unwrap_or("target update checks failed")
+            );
+        }
+        ensure!(
+            git(&path, &["status", "--porcelain"])?.trim().is_empty(),
+            "develop update worktree became dirty; preserving it"
+        );
+        update_ref(repository, &reference, &updated, &old_head)?;
+        git(
+            repository,
+            &[
+                "worktree",
+                "remove",
+                path.to_str().context("non-UTF8 develop update path")?,
+            ],
+        )?;
+        delivery.ready_commit = None;
+        delivery.final_review_commit = None;
+        delivery.ready_error = Some("develop advanced; feature branch updated and final independent review is required again".into());
+    }
+    delivery.pr_base_commit = Some(base.clone());
+    Ok((base, target_updated))
+}
+
+fn pr_body(delivery: &DeliveryState) -> String {
+    let mut body = String::from("Wayfinder ticket integration evidence\n\n");
+    for ticket in delivery.tickets.values() {
+        if let Some(commit) = &ticket.integrated_commit {
+            let title = if ticket.title.is_empty() {
+                format!("Issue #{}", ticket.issue)
+            } else {
+                ticket.title.clone()
+            };
+            let url = if ticket.url.is_empty() {
+                format!(
+                    "https://github.com/{}/issues/{}",
+                    delivery.repository.as_deref().unwrap_or_default(),
+                    ticket.issue
+                )
+            } else {
+                ticket.url.clone()
+            };
+            body.push_str(&format!("- [{title}]({url}): reviewed commit `{}`; integrated as `{}`. Required checks: fmt, clippy, and all-target tests passed.\n", ticket.reviewed_commit.as_deref().unwrap_or("unknown"), commit));
+        }
+    }
+    body.push_str("\nKnown limitations and unresolved findings: see each linked ticket's retained review and implementation evidence. The human decides whether this feature PR is merged into `develop`.\n");
+    body
+}
+
+fn short_commit(commit: &str) -> &str {
+    commit.get(..commit.len().min(12)).unwrap_or(commit)
+}
+
+fn parse_pr(value: &serde_json::Value) -> Result<PullRequest> {
+    Ok(PullRequest {
+        number: value["number"].as_u64().context("PR omitted number")?,
+        url: value["url"].as_str().context("PR omitted URL")?.to_owned(),
+        head: value["headRefName"]
+            .as_str()
+            .context("PR omitted head branch")?
+            .to_owned(),
+        base: value["baseRefName"]
+            .as_str()
+            .context("PR omitted base branch")?
+            .to_owned(),
+        draft: value["isDraft"]
+            .as_bool()
+            .context("PR omitted draft state")?,
+    })
+}
+
+fn gh_json(executable: &Path, args: &[&str]) -> Result<serde_json::Value> {
+    let output = Command::new(executable)
+        .args(args)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .context("launch GitHub CLI")?;
+    ensure!(
+        output.status.success(),
+        "gh {} failed: {}",
+        args.join(" "),
+        String::from_utf8_lossy(&output.stderr).trim()
+    );
+    serde_json::from_slice(&output.stdout).context("decode gh JSON response")
+}
+fn gh_text(executable: &Path, args: &[&str]) -> Result<String> {
+    let output = Command::new(executable)
+        .args(args)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .context("launch GitHub CLI")?;
+    ensure!(
+        output.status.success(),
+        "gh {} failed: {}",
+        args.join(" "),
+        String::from_utf8_lossy(&output.stderr).trim()
+    );
+    String::from_utf8(output.stdout).context("gh returned non-UTF8 output")
+}
+
+fn cleanup_merged_worktrees(
+    repository: &Path,
+    workers: &State,
+    delivery: &DeliveryState,
+) -> Result<()> {
+    let merged = delivery
+        .merged_commit
+        .as_deref()
+        .context("merge cleanup requires a confirmed merge commit")?;
+    for (run_id, ticket) in &delivery.tickets {
+        let Some(path) = ticket.integration_worktree.as_ref() else {
+            continue;
+        };
+        if !path.exists() || !validate_worktree(repository, path).is_ok() {
+            continue;
+        }
+        let clean =
+            git(path, &["status", "--porcelain"]).is_ok_and(|status| status.trim().is_empty());
+        let Some(commit) = ticket.integrated_commit.as_deref() else {
+            continue;
+        };
+        if clean && is_ancestor(repository, commit, merged)? {
+            git(
+                repository,
+                &[
+                    "worktree",
+                    "remove",
+                    path.to_str()
+                        .context("non-UTF8 integration worktree path")?,
+                ],
+            )?;
+        }
+        let _ = run_id;
+    }
+    for worker in &workers.workers.runs {
+        if !matches!(
+            worker.status,
+            WorkerStatus::Completed | WorkerStatus::Reviewed
+        ) {
+            continue;
+        }
+        let preserved = if worker.role == "implementer" {
+            delivery
+                .tickets
+                .get(&worker.id)
+                .and_then(|ticket| ticket.integrated_commit.as_deref())
+        } else if worker.role == "reviewer" {
+            worker.base_commit.as_deref()
+        } else {
+            None
+        };
+        let Some(preserved) = preserved else { continue };
+        let path = &worker.worktree;
+        if !path.exists() || validate_worktree(repository, path).is_err() {
+            continue;
+        }
+        let clean =
+            git(path, &["status", "--porcelain"]).is_ok_and(|status| status.trim().is_empty());
+        if clean && is_ancestor(repository, preserved, merged)? {
+            git(
+                repository,
+                &[
+                    "worktree",
+                    "remove",
+                    path.to_str().context("non-UTF8 worker worktree path")?,
+                ],
+            )?;
+        }
+    }
+    Ok(())
+}
+
+fn required_checks(path: &Path) -> Result<()> {
+    run(path, "cargo", &["fmt", "--all", "--", "--check"])?;
+    run(
+        path,
+        "cargo",
+        &[
+            "clippy",
+            "--locked",
+            "--all-targets",
+            "--",
+            "-D",
+            "warnings",
+        ],
+    )?;
+    run(path, "cargo", &["test", "--locked", "--all-targets"])?;
+    Ok(())
+}
+
+fn run(path: &Path, program: &str, args: &[&str]) -> Result<()> {
+    let output = Command::new(program)
+        .args(args)
+        .current_dir(path)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .with_context(|| format!("launch {program}"))?;
+    ensure!(
+        output.status.success(),
+        "{program} {} failed: {}",
+        args.join(" "),
+        String::from_utf8_lossy(&output.stderr).trim()
+    );
+    Ok(())
+}
+fn git(path: &Path, args: &[&str]) -> Result<String> {
+    let output = git_result(path, args)?;
+    String::from_utf8(output).context("git returned non-UTF8 output")
+}
+fn git_result(path: &Path, args: &[&str]) -> Result<Vec<u8>> {
+    let output = Command::new("git")
+        .args(["-C"])
+        .arg(path)
+        .args(args)
+        .output()
+        .context("run git delivery operation")?;
+    ensure!(
+        output.status.success(),
+        "git {} failed: {}",
+        args.join(" "),
+        String::from_utf8_lossy(&output.stderr).trim()
+    );
+    Ok(output.stdout)
+}
+fn validate_branch(branch: &str) -> Result<()> {
+    ensure!(
+        !branch.is_empty()
+            && !branch.starts_with('-')
+            && !branch.contains("..")
+            && !branch.contains(' '),
+        "invalid feature branch name"
+    );
+    Ok(())
+}
+fn is_ancestor(repository: &Path, ancestor: &str, descendant: &str) -> Result<bool> {
+    let output = Command::new("git")
+        .args(["-C"])
+        .arg(repository)
+        .args(["merge-base", "--is-ancestor", ancestor, descendant])
+        .output()?;
+    match output.status.code() {
+        Some(0) => Ok(true),
+        Some(1) => Ok(false),
+        _ => bail!(
+            "git merge-base failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ),
+    }
+}
+fn update_ref(repository: &Path, reference: &str, new: &str, expected_old: &str) -> Result<()> {
+    git(repository, &["update-ref", reference, new, expected_old])
+        .context("feature branch changed before serialized fast-forward")?;
+    Ok(())
+}
+fn validate_worktree(repository: &Path, path: &Path) -> Result<()> {
+    let expected = fs::canonicalize(path)?;
+    let root = git(path, &["rev-parse", "--show-toplevel"])?;
+    ensure!(
+        Path::new(root.trim()) == expected,
+        "integration worktree root mismatch"
+    );
+    let list = git(repository, &["worktree", "list", "--porcelain"])?;
+    ensure!(
+        list.lines().any(|line| line
+            .strip_prefix("worktree ")
+            .is_some_and(|value| Path::new(value) == expected)),
+        "integration path is not a registered worktree"
+    );
+    Ok(())
+}
+fn save(dir: &Path, state: &DeliveryState) -> Result<()> {
+    store::atomic_json(&dir.join("delivery.json"), state)
+}
+
+pub fn map_identity(state: &State) -> Result<MapRef> {
+    MapRef::parse(&state.map)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+    use std::{fs, os::unix::fs::PermissionsExt, process::Command};
+    use tempfile::TempDir;
+
+    fn command(path: &Path, args: &[&str]) -> String {
+        let output = Command::new("git")
+            .args(["-C"])
+            .arg(path)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git {}: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8(output.stdout).unwrap().trim().to_owned()
+    }
+
+    struct Fixture {
+        _temp: TempDir,
+        dir: PathBuf,
+        repo: PathBuf,
+        implementation: String,
+        state: State,
+    }
+
+    impl Fixture {
+        fn new(conflicting_target: bool, stale_evidence: bool) -> Self {
+            let temp = tempfile::tempdir().unwrap();
+            let repo = temp.path().join("repo");
+            fs::create_dir(&repo).unwrap();
+            command(&repo, &["init", "--quiet"]);
+            command(&repo, &["config", "user.name", "Delivery Fixture"]);
+            command(&repo, &["config", "user.email", "delivery@example.invalid"]);
+            fs::write(repo.join("shared.txt"), "base\n").unwrap();
+            command(&repo, &["add", "shared.txt"]);
+            command(&repo, &["commit", "--quiet", "-m", "base"]);
+            command(&repo, &["branch", "develop"]);
+            command(&repo, &["branch", "-M", "feature/delivery-test"]);
+            let base = command(&repo, &["rev-parse", "HEAD"]);
+
+            let implementation_path = temp.path().join("implementer");
+            command(
+                &repo,
+                &[
+                    "worktree",
+                    "add",
+                    "--detach",
+                    implementation_path.to_str().unwrap(),
+                    &base,
+                ],
+            );
+            fs::write(implementation_path.join("shared.txt"), "implementation\n").unwrap();
+            command(&implementation_path, &["add", "shared.txt"]);
+            command(
+                &implementation_path,
+                &["commit", "--quiet", "-m", "implementation"],
+            );
+            let implementation = command(&implementation_path, &["rev-parse", "HEAD"]);
+
+            let reviewer_path = temp.path().join("reviewer");
+            command(
+                &repo,
+                &[
+                    "worktree",
+                    "add",
+                    "--detach",
+                    reviewer_path.to_str().unwrap(),
+                    &implementation,
+                ],
+            );
+            let evidence = temp.path().join("review.json");
+            fs::write(&evidence, serde_json::to_vec(&json!({
+                "format_version":1,"run_id":"review-1","ticket":15,"role":"reviewer",
+                "status":"completed","summary":"review approved","reviewed_commit":(if stale_evidence { &base } else { &implementation }),
+                "verdict":"approved"
+            })).unwrap()).unwrap();
+
+            let target_path = temp.path().join("target");
+            command(
+                &repo,
+                &[
+                    "worktree",
+                    "add",
+                    "--detach",
+                    target_path.to_str().unwrap(),
+                    &base,
+                ],
+            );
+            if conflicting_target {
+                fs::write(target_path.join("shared.txt"), "target\n").unwrap();
+            } else {
+                fs::write(target_path.join("target.txt"), "target\n").unwrap();
+                command(&target_path, &["add", "target.txt"]);
+            }
+            command(&target_path, &["add", "shared.txt"]);
+            command(
+                &target_path,
+                &["commit", "--quiet", "-m", "advance feature target"],
+            );
+            command(
+                &repo,
+                &[
+                    "update-ref",
+                    "refs/heads/feature/delivery-test",
+                    &command(&target_path, &["rev-parse", "HEAD"]),
+                    &base,
+                ],
+            );
+
+            let implementer = json!({"id":"run-00000000000000000001","ticket":15,"role":"implementer","attempt":1,"rework_round":0,"status":"reviewed","worktree":implementation_path,"workspace_id":null,"tab_id":null,"pane_id":null,"base_commit":base,"result_commit":implementation,"summary":"implemented","question":null,"source_run":null,"claim_login":"fixture","context":null,"last_activity_ms":null,"terminal_id":null,"agent_provider":null,"agent_session":null,"foreground_process":null,"result_evidence":null});
+            let reviewer = json!({"id":"run-00000000000000000002","ticket":15,"role":"reviewer","attempt":1,"rework_round":0,"status":"completed","worktree":reviewer_path,"workspace_id":null,"tab_id":null,"pane_id":null,"base_commit":implementation,"result_commit":null,"summary":"approved","question":null,"source_run":"run-00000000000000000001","claim_login":"fixture","context":null,"last_activity_ms":null,"terminal_id":null,"agent_provider":null,"agent_session":null,"foreground_process":null,"result_evidence":evidence});
+            let state: serde_json::Value = json!({
+                "format_version":1,
+                "map":"example/project#42",
+                "binding":{"repository":repo,"herdr_binary":"/bin/true","socket":"/tmp/test.sock","herdr_config":null},
+                "authorization":"started","poll_seconds":30,"concurrency":3,"reconciled":true,
+                "suspension":"","history":[],"workers":{"next_run":2,"runs":[implementer,reviewer],"providers":{}}
+            });
+            let state: State = serde_json::from_value(state).unwrap();
+            let dir = temp.path().join("state");
+            fs::create_dir_all(&dir).unwrap();
+            Self {
+                _temp: temp,
+                dir,
+                repo,
+                implementation,
+                state,
+            }
+        }
+    }
+
+    #[test]
+    fn stale_review_evidence_cannot_authorize_integration() {
+        let f = Fixture::new(false, true);
+        assert!(
+            reconcile(&f.dir, &f.state, &[])
+                .unwrap_err()
+                .to_string()
+                .contains("stale for the candidate")
+        );
+        assert!(read(&f.dir).unwrap().tickets.is_empty());
+    }
+
+    #[test]
+    fn changed_feature_target_rebases_and_requires_review_of_new_commit() {
+        let f = Fixture::new(false, false);
+        let outcome = reconcile(&f.dir, &f.state, &[]).unwrap();
+        let Outcome::ReviewRenewal { run_id, commit } = outcome else {
+            panic!("expected renewed review, got {outcome:?}")
+        };
+        assert_eq!(run_id, "run-00000000000000000001");
+        assert_ne!(commit, f.implementation);
+        assert!(
+            is_ancestor(
+                &f.repo,
+                &command(&f.repo, &["rev-parse", "refs/heads/feature/delivery-test"]),
+                &commit
+            )
+            .unwrap()
+        );
+        let second = reconcile(&f.dir, &f.state, &[]).unwrap();
+        assert!(
+            matches!(second, Outcome::Held { .. }),
+            "a repeated hook must wait for renewed review"
+        );
+        let delivery = read(&f.dir).unwrap();
+        assert_eq!(
+            delivery
+                .tickets
+                .values()
+                .next()
+                .unwrap()
+                .candidate_commit
+                .as_deref(),
+            Some(commit.as_str())
+        );
+    }
+
+    #[test]
+    fn rebase_conflict_is_retained_and_repeated_hook_does_not_retry_it() {
+        let f = Fixture::new(true, false);
+        let first = reconcile(&f.dir, &f.state, &[]).unwrap();
+        let Outcome::Conflict { base_commit, .. } = first else {
+            panic!("expected conflict, got {first:?}")
+        };
+        let delivery = read(&f.dir).unwrap();
+        let entry = delivery.tickets.values().next().unwrap();
+        let retained = entry.integration_worktree.as_ref().unwrap();
+        assert!(retained.exists());
+        assert_eq!(entry.conflict_base.as_deref(), Some(base_commit.as_str()));
+        let again = reconcile(&f.dir, &f.state, &[]).unwrap();
+        assert!(matches!(again, Outcome::Conflict { .. }));
+        assert!(retained.exists());
+    }
+
+    #[test]
+    fn every_open_task_must_be_integrated_before_final_review_is_dispatched() {
+        let f = Fixture::new(false, false);
+        let mut delivery = DeliveryState {
+            feature_branch: Some("feature/delivery-test".into()),
+            ..DeliveryState::default()
+        };
+        delivery.tickets.insert(
+            "run-00000000000000000001".into(),
+            TicketDelivery {
+                reviewed_commit: Some(f.implementation.clone()),
+                integrated_commit: Some(f.implementation.clone()),
+                issue: 15,
+                title: "Implement exact-commit review".into(),
+                url: "https://github.com/example/project/issues/15".into(),
+                ..TicketDelivery::default()
+            },
+        );
+        let source = f
+            .state
+            .workers
+            .runs
+            .iter()
+            .find(|run| run.role == "implementer")
+            .unwrap();
+        let mut children = vec![open_child(15, "Implement exact-commit review", true)];
+        children.push(open_child(16, "Second implementation ticket", true));
+        let blocked = feature_review_outcome(&f.state, &delivery, source, &children).unwrap();
+        assert_eq!(blocked, Outcome::Nothing);
+        children.pop();
+        let ready = feature_review_outcome(&f.state, &delivery, source, &children).unwrap();
+        assert!(matches!(ready, Outcome::FinalReviewNeeded { .. }));
+    }
+
+    #[test]
+    fn unresolved_non_task_map_child_gates_final_review_and_is_named_in_chat() {
+        let f = Fixture::new(false, false);
+        let mut delivery = DeliveryState {
+            feature_branch: Some("feature/delivery-test".into()),
+            ..DeliveryState::default()
+        };
+        delivery.tickets.insert(
+            "run-00000000000000000001".into(),
+            TicketDelivery {
+                reviewed_commit: Some(f.implementation.clone()),
+                integrated_commit: Some(f.implementation.clone()),
+                issue: 15,
+                title: "Implement exact-commit review".into(),
+                url: "https://github.com/example/project/issues/15".into(),
+                ..TicketDelivery::default()
+            },
+        );
+        let source = f
+            .state
+            .workers
+            .runs
+            .iter()
+            .find(|run| run.role == "implementer")
+            .unwrap();
+        let research = open_child(17, "Resolve accepted research question", false);
+        assert_eq!(
+            feature_review_outcome(&f.state, &delivery, source, std::slice::from_ref(&research))
+                .unwrap(),
+            Outcome::Nothing,
+            "an open non-task child must keep feature readiness blocked"
+        );
+        delivery.open_children.push(research);
+        save(&f.dir, &delivery).unwrap();
+        let milestones = chat_milestones(&f.dir).unwrap();
+        assert!(milestones.iter().any(|line| {
+            line.contains("Open map decision or research work remains")
+                && line.contains(
+                    "[Resolve accepted research question](https://github.com/example/project/issues/17)"
+                )
+        }));
+    }
+
+    #[test]
+    fn pending_human_answer_blocks_readiness_but_final_review_does_not_count_as_ticket_work() {
+        let f = Fixture::new(false, false);
+        let mut delivery = DeliveryState {
+            feature_branch: Some("feature/delivery-test".into()),
+            ..DeliveryState::default()
+        };
+        delivery.tickets.insert(
+            "run-00000000000000000001".into(),
+            TicketDelivery {
+                issue: 15,
+                title: "Implement exact-commit review".into(),
+                url: "https://github.com/example/project/issues/15".into(),
+                integrated_commit: Some(f.implementation.clone()),
+                ..TicketDelivery::default()
+            },
+        );
+        let source = f
+            .state
+            .workers
+            .runs
+            .iter()
+            .find(|run| run.role == "implementer")
+            .unwrap();
+        let mut state = f.state.clone();
+        let mut human_request = state.workers.runs[0].clone();
+        human_request.id = "run-human-question".into();
+        human_request.role = "implementer".into();
+        human_request.status = WorkerStatus::NeedsHuman;
+        human_request.human_request_id = Some("request-genuine-human-answer".into());
+        state.workers.runs.push(human_request);
+        assert_eq!(
+            feature_review_outcome(&state, &delivery, source, &[]).unwrap(),
+            Outcome::Nothing,
+            "a pending worker question must gate the final feature review"
+        );
+        let chat_root = f._temp.path().join("chat-state");
+        let (_, key) = store::map_identity(&state.map).unwrap();
+        let chat_dir = store::map_dir(&chat_root, &key).unwrap();
+        fs::create_dir_all(&chat_dir).unwrap();
+        store::atomic_json(&chat_dir.join("state.json"), &state).unwrap();
+        save(&chat_dir, &delivery).unwrap();
+        assert!(chat_milestones(&chat_dir).unwrap().iter().any(|line| {
+            line.contains("A human decision is pending for")
+                && line.contains(
+                    "[Implement exact-commit review](https://github.com/example/project/issues/15)",
+                )
+        }));
+
+        state.workers.runs.pop();
+        let branch_head = git(&f.repo, &["rev-parse", "refs/heads/feature/delivery-test"])
+            .unwrap()
+            .trim()
+            .to_owned();
+        let mut final_review = state.workers.runs[1].clone();
+        final_review.id = "run-final-review".into();
+        final_review.role = "reviewer".into();
+        final_review.context = Some("wayfinder-final-feature-review".into());
+        final_review.base_commit = Some(branch_head);
+        final_review.status = WorkerStatus::Running;
+        state.workers.runs.push(final_review);
+        assert_eq!(
+            feature_review_outcome(&state, &delivery, source, &[]).unwrap(),
+            Outcome::Nothing,
+            "an in-flight final reviewer must not be surfaced as an implementation loop or duplicated"
+        );
+    }
+
+    #[test]
+    fn integrated_open_task_is_reported_as_awaiting_orchestrator_closure() {
+        let temp = tempfile::tempdir().unwrap();
+        let delivery = DeliveryState {
+            tickets: BTreeMap::from([(
+                "run-internal".into(),
+                TicketDelivery {
+                    issue: 15,
+                    title: "Implement exact-commit review".into(),
+                    url: "https://github.com/example/project/issues/15".into(),
+                    integrated_commit: Some("0123456789abcdef".into()),
+                    ..TicketDelivery::default()
+                },
+            )]),
+            open_children: vec![open_child(15, "Implement exact-commit review", true)],
+            ..DeliveryState::default()
+        };
+        save(temp.path(), &delivery).unwrap();
+        let milestones = chat_milestones(temp.path()).unwrap();
+        assert!(milestones.iter().any(|line| {
+            line.contains(
+                "[Implement exact-commit review](https://github.com/example/project/issues/15)",
+            ) && line.contains("awaiting orchestrator closure")
+        }));
+    }
+
+    fn open_child(number: u64, title: &str, task: bool) -> ChildTicket {
+        ChildTicket {
+            number,
+            title: title.into(),
+            url: format!("https://github.com/example/project/issues/{number}"),
+            state: "open".into(),
+            labels: if task {
+                vec!["wayfinder:task".into()]
+            } else {
+                vec!["wayfinder:decision".into()]
+            },
+        }
+    }
+
+    #[test]
+    fn integration_lock_serializes_simultaneous_requests() {
+        use std::{
+            sync::{Arc, Barrier},
+            thread,
+            time::Duration,
+        };
+        let f = tempfile::tempdir().unwrap();
+        let barrier = Arc::new(Barrier::new(2));
+        let path = f.path().join("integration.lock");
+        let first_barrier = barrier.clone();
+        let first_path = path.clone();
+        let first = thread::spawn(move || {
+            let _lock = Lock::acquire(&first_path).unwrap();
+            first_barrier.wait();
+            thread::sleep(Duration::from_millis(30));
+        });
+        barrier.wait();
+        let second = Lock::acquire(&path);
+        assert!(second.is_err());
+        assert!(second.err().unwrap().to_string().contains("lock busy"));
+        first.join().unwrap();
+    }
+
+    #[test]
+    fn chat_milestones_use_ticket_title_and_link_without_internal_run_ids() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut delivery = DeliveryState {
+            repository: Some("example/project".into()),
+            ..DeliveryState::default()
+        };
+        delivery.tickets.insert(
+            "run-00000000000000000001".into(),
+            TicketDelivery {
+                issue: 15,
+                title: "Integrate exact-commit reviews".into(),
+                url: "https://github.com/example/project/issues/15".into(),
+                integrated_commit: Some("0123456789abcdef".into()),
+                ..TicketDelivery::default()
+            },
+        );
+        save(temp.path(), &delivery).unwrap();
+        let messages = chat_milestones(temp.path()).unwrap();
+        assert_eq!(messages.len(), 1);
+        assert!(messages[0].contains(
+            "[Integrate exact-commit reviews](https://github.com/example/project/issues/15)"
+        ));
+        assert!(!messages[0].contains("run-"));
+        assert!(!messages[0].starts_with("Ticket #15"));
+    }
+
+    #[test]
+    fn draft_pr_creation_is_reconciled_by_head_and_base_and_repeated_hooks_are_safe() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = temp.path().join("repo");
+        fs::create_dir(&repo).unwrap();
+        command(&repo, &["init", "--quiet"]);
+        command(&repo, &["config", "user.name", "PR Fixture"]);
+        command(&repo, &["config", "user.email", "pr@example.invalid"]);
+        fs::write(repo.join("README.md"), "fixture\n").unwrap();
+        command(&repo, &["add", "README.md"]);
+        command(&repo, &["commit", "--quiet", "-m", "integrated"]);
+        command(&repo, &["branch", "develop"]);
+        command(&repo, &["branch", "-M", "feature/delivery-test"]);
+        let remote = temp.path().join("remote.git");
+        Command::new("git")
+            .args(["init", "--bare", "--quiet"])
+            .arg(&remote)
+            .status()
+            .unwrap();
+        command(
+            &repo,
+            &["remote", "add", "origin", remote.to_str().unwrap()],
+        );
+        command(
+            &repo,
+            &["push", "--set-upstream", "origin", "feature/delivery-test"],
+        );
+        command(&repo, &["push", "origin", "develop"]);
+        let head = command(&repo, &["rev-parse", "HEAD"]);
+
+        let state_dir = temp.path().join("state");
+        fs::create_dir_all(&state_dir).unwrap();
+        let mut delivery = DeliveryState {
+            feature_branch: Some("feature/delivery-test".into()),
+            ..DeliveryState::default()
+        };
+        delivery.tickets.insert(
+            "run-1".into(),
+            TicketDelivery {
+                reviewed_commit: Some(head.clone()),
+                candidate_commit: Some(head.clone()),
+                integrated_commit: Some(head.clone()),
+                issue: 15,
+                ..TicketDelivery::default()
+            },
+        );
+        save(&state_dir, &delivery).unwrap();
+        let gh = temp.path().join("gh");
+        fs::write(&gh, r##"#!/usr/bin/env python3
+import json, os, sys
+path=os.path.join(os.path.dirname(__file__), 'pr.json')
+args=sys.argv[1:]
+state=json.load(open(path)) if os.path.exists(path) else {'creates':0,'edits':0,'pr':None}
+if args[:2] == ['pr','list']:
+    print(json.dumps([state['pr']] if state['pr'] else []))
+elif args[:2] == ['pr','create']:
+    state['creates'] += 1
+    meta=json.load(open(os.path.join(os.path.dirname(__file__), 'meta.json')))
+    state['pr']={'number':17,'url':'https://github.com/example/project/pull/17','isDraft':True,'headRefName':'feature/delivery-test','baseRefName':'develop','mergedAt':None,'headRefOid':meta['head'],'baseRefOid':meta['base']}
+    json.dump(state,open(path,'w'))
+    print(state['pr']['url'])
+elif args[:2] == ['pr','edit']:
+    state['edits'] += 1
+    json.dump(state,open(path,'w'))
+elif args[:2] == ['pr','ready']:
+    state['pr']['isDraft']=False
+    json.dump(state,open(path,'w'))
+elif args[:2] == ['pr','view']:
+    print(json.dumps(state['pr']))
+else:
+    sys.exit(2)
+"##).unwrap();
+        fs::set_permissions(&gh, fs::Permissions::from_mode(0o755)).unwrap();
+        let mut state_json = json!({
+            "format_version":1,"map":"example/project#42",
+            "binding":{"repository":repo,"herdr_binary":"/bin/true","socket":"/tmp/test.sock","herdr_config":null},
+            "authorization":"started","poll_seconds":30,"concurrency":3,"reconciled":true,
+            "suspension":"","history":[],"workers":{"next_run":0,"runs":[],"providers":{}}
+        });
+        let workers: State = serde_json::from_value(state_json.take()).unwrap();
+        fs::write(gh.with_file_name("meta.json"), serde_json::to_vec(&json!({"head":head,"base":command(&repo, &["rev-parse", "refs/remotes/origin/develop"])})).unwrap()).unwrap();
+        let first = ensure_draft_pr_with_gh(&state_dir, &repo, "example/project#42", &workers, &gh)
+            .unwrap()
+            .unwrap();
+        let second =
+            ensure_draft_pr_with_gh(&state_dir, &repo, "example/project#42", &workers, &gh)
+                .unwrap()
+                .unwrap();
+        assert_eq!(first.number, 17);
+        assert_eq!(second.number, 17);
+        let calls: serde_json::Value =
+            serde_json::from_slice(&fs::read(temp.path().join("pr.json")).unwrap()).unwrap();
+        assert_eq!(calls["creates"], 1);
+        assert_eq!(calls["edits"], 2);
+        assert!(read(&state_dir).unwrap().draft_pr.unwrap().draft);
+
+        let reviewer_path = temp.path().join("final-reviewer");
+        command(
+            &repo,
+            &[
+                "worktree",
+                "add",
+                "--detach",
+                reviewer_path.to_str().unwrap(),
+                &head,
+            ],
+        );
+        let evidence = temp.path().join("final-review.json");
+        fs::write(
+            &evidence,
+            serde_json::to_vec(&json!({"reviewed_commit":head,"verdict":"approved"})).unwrap(),
+        )
+        .unwrap();
+        let reviewer = json!({"id":"run-final-review","ticket":15,"role":"reviewer","attempt":1,"rework_round":0,"status":"completed","worktree":reviewer_path,"workspace_id":null,"tab_id":null,"pane_id":null,"base_commit":head,"result_commit":null,"summary":"feature approved","question":null,"source_run":"run-1","claim_login":"fixture","context":"wayfinder-final-feature-review","last_activity_ms":null,"terminal_id":null,"agent_provider":null,"agent_session":null,"foreground_process":null,"result_evidence":evidence});
+        let ready_workers: State = serde_json::from_value(json!({"format_version":1,"map":"example/project#42","binding":{"repository":repo,"herdr_binary":"/bin/true","socket":"/tmp/test.sock","herdr_config":null},"authorization":"started","poll_seconds":30,"concurrency":3,"reconciled":true,"suspension":"","history":[],"workers":{"next_run":3,"runs":[reviewer],"providers":{}}})).unwrap();
+        mark_ready_with(
+            &state_dir,
+            &repo,
+            "example/project#42",
+            &ready_workers,
+            "run-final-review",
+            &head,
+            |_| Ok(()),
+            &gh,
+        )
+        .unwrap();
+        let ready = read(&state_dir).unwrap();
+        assert_eq!(ready.ready_commit.as_deref(), Some(head.as_str()));
+        assert!(!ready.draft_pr.unwrap().draft);
+    }
+
+    #[test]
+    fn moved_develop_target_updates_feature_and_invalidates_final_review() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = temp.path().join("repo");
+        fs::create_dir(&repo).unwrap();
+        command(&repo, &["init", "--quiet"]);
+        command(&repo, &["config", "user.name", "Target Fixture"]);
+        command(&repo, &["config", "user.email", "target@example.invalid"]);
+        fs::write(repo.join("README.md"), "base\n").unwrap();
+        command(&repo, &["add", "README.md"]);
+        command(&repo, &["commit", "--quiet", "-m", "base"]);
+        let base = command(&repo, &["rev-parse", "HEAD"]);
+        command(&repo, &["branch", "develop"]);
+        command(&repo, &["branch", "-M", "feature/target-update"]);
+        let feature_head = command(&repo, &["rev-parse", "HEAD"]);
+
+        let remote = temp.path().join("remote.git");
+        Command::new("git")
+            .args(["init", "--bare", "--quiet"])
+            .arg(&remote)
+            .status()
+            .unwrap();
+        command(
+            &repo,
+            &["remote", "add", "origin", remote.to_str().unwrap()],
+        );
+        command(
+            &repo,
+            &["push", "--set-upstream", "origin", "feature/target-update"],
+        );
+        command(&repo, &["push", "origin", "develop"]);
+
+        let update_path = temp.path().join("develop");
+        command(
+            &repo,
+            &[
+                "worktree",
+                "add",
+                "--detach",
+                update_path.to_str().unwrap(),
+                &base,
+            ],
+        );
+        fs::write(update_path.join("target.txt"), "new target commit\n").unwrap();
+        command(&update_path, &["add", "target.txt"]);
+        command(
+            &update_path,
+            &["commit", "--quiet", "-m", "advance develop"],
+        );
+        let new_base = command(&update_path, &["rev-parse", "HEAD"]);
+        command(
+            &repo,
+            &["push", "origin", &format!("{new_base}:refs/heads/develop")],
+        );
+
+        let state_dir = temp.path().join("state");
+        fs::create_dir_all(&state_dir).unwrap();
+        let mut delivery = DeliveryState {
+            feature_branch: Some("feature/target-update".into()),
+            pr_base_commit: Some(base),
+            ready_commit: Some(feature_head),
+            ..DeliveryState::default()
+        };
+        let (synced_base, changed) = sync_develop_target_with_checks(
+            &state_dir,
+            &repo,
+            "feature/target-update",
+            &mut delivery,
+            |_| Ok(()),
+        )
+        .unwrap();
+        let updated_head = command(&repo, &["rev-parse", "refs/heads/feature/target-update"]);
+        assert!(changed);
+        assert_eq!(synced_base, new_base);
+        assert!(is_ancestor(&repo, &synced_base, &updated_head).unwrap());
+        assert_eq!(
+            delivery.pr_base_commit.as_deref(),
+            Some(synced_base.as_str())
+        );
+        assert!(delivery.ready_commit.is_none());
+        assert!(delivery.final_review_commit.is_none());
+        assert!(
+            !state_dir
+                .join("integration-worktrees")
+                .join(format!("develop-update-{}", short_commit(&synced_base)))
+                .exists()
+        );
+    }
+}
