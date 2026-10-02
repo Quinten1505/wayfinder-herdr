@@ -26,9 +26,8 @@ def atomic_copy(source, destination):
 
 def link_public_command(private_command, public_command):
     public_command.parent.mkdir(parents=True, exist_ok=True)
-    if public_command.exists() or public_command.is_symlink():
-        if not public_command.is_symlink() or public_command.resolve() != private_command:
-            raise RuntimeError(f'{public_command} already exists and is not this Wayfinder installation.')
+    check_public_command(private_command, public_command)
+    if public_command.is_symlink():
         return
     staged = public_command.with_name(public_command.name + '.new')
     if staged.exists() or staged.is_symlink():
@@ -62,8 +61,7 @@ def main():
     config = Path(os.environ.get('XDG_CONFIG_HOME', Path.home() / '.config')).resolve()
     state = Path(os.environ.get('XDG_STATE_HOME', Path.home() / '.local/state')).resolve() / 'wayfinder-herdr'
     install = Path(os.environ.get('WAYFINDER_INSTALL_DIR', Path.home() / '.local/lib/wayfinder-herdr')).resolve()
-    public_bin = Path(os.environ.get('WAYFINDER_BIN_DIR',
-                        install / 'bin' if 'WAYFINDER_INSTALL_DIR' in os.environ else Path.home() / '.local/bin')).resolve()
+    public_bin = Path(os.environ.get('WAYFINDER_BIN_DIR', Path.home() / '.local/bin')).resolve()
     if public_bin != install / 'bin':
         check_public_command(install / 'bin/wayfinder', public_bin / 'wayfinder')
     # Refuse a downgrade before replacing any installed artifact.

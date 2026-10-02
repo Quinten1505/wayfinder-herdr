@@ -6,12 +6,15 @@ before Herdr is asked to open it; ambient popup focus never supplies identity.
 """
 
 import argparse
+import atexit
 import curses
 import json
 import os
 import re
 import select
 import secrets
+import signal
+import socket
 import subprocess
 import sys
 import tempfile
@@ -69,6 +72,24 @@ def herdr(*args):
         return json.loads(result.stdout)
     except json.JSONDecodeError as error:
         raise RuntimeError("Herdr returned an unexpected response") from error
+
+
+def focus_source(socket_path, pane_id):
+    request_id = "wayfinder-focus-" + secrets.token_hex(8)
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as connection:
+        connection.settimeout(10)
+        connection.connect(socket_path)
+        connection.sendall((json.dumps({"id": request_id, "method": "pane.focus",
+                                        "params": {"pane_id": pane_id}}) + "\n").encode())
+        response = bytearray()
+        while not response.endswith(b"\n"):
+            chunk = connection.recv(4096)
+            if not chunk or len(response) + len(chunk) > 1_048_576:
+                raise RuntimeError("Herdr source focus returned an incomplete response")
+            response.extend(chunk)
+    result = json.loads(response)
+    if result.get("id") != request_id or result.get("error"):
+        raise RuntimeError("Herdr could not focus the verified source pane")
 
 
 def checkout():
@@ -162,6 +183,7 @@ def coordinate(launch_id):
         save_record(path, record)
     else:
         save_record(path, record)
+    focus_source(socket, record["source_pane"])
     # The popup's environment contains only the opaque identity. Its Herdr
     # context may reflect a different active pane and is never used as binding.
     herdr("plugin", "pane", "open", "--plugin", "wayfinder.herdr",
@@ -411,6 +433,19 @@ def main():
     path, record = read_record(launch_id)
     if record["status"] != "awaiting_input":
         raise RuntimeError("This Wayfinder input was already handled")
+
+    def cancel_if_open():
+        try:
+            current_path, current = read_record(launch_id)
+            if current["status"] == "awaiting_input":
+                current["status"] = "cancelled"
+                save_record(current_path, current)
+        except (OSError, ValueError, KeyError, json.JSONDecodeError):
+            pass
+
+    atexit.register(cancel_if_open)
+    signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
+    signal.signal(signal.SIGHUP, lambda *_: sys.exit(0))
 
     def submit(value):
         record["description"] = value

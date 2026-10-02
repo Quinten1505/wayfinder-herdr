@@ -5,11 +5,14 @@ import os
 import pathlib
 import pty
 import select
+import signal
+import socket
 import struct
 import subprocess
 import sys
 import tempfile
 import termios
+import threading
 import time
 import unittest
 
@@ -30,6 +33,26 @@ class LaunchTest(unittest.TestCase):
                  "commit", "--allow-empty", "-m", "initial", cwd=self.repo)
         self.bin = self.root / "bin"
         self.bin.mkdir()
+        self.socket_path = self.root / "herdr.sock"
+        server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        server.bind(str(self.socket_path))
+        server.listen()
+        server.settimeout(0.2)
+        self.addCleanup(server.close)
+
+        def serve_focus():
+            while server.fileno() >= 0:
+                try:
+                    connection, _ = server.accept()
+                except socket.timeout:
+                    continue
+                except OSError:
+                    break
+                with connection:
+                    request = json.loads(connection.recv(4096).decode())
+                    connection.sendall((json.dumps({"id": request["id"], "result": {"ok": True}}) + "\n").encode())
+
+        threading.Thread(target=serve_focus, daemon=True).start()
         fake = self.bin / "herdr"
         fake.write_text("""#!/usr/bin/env python3
 import json, os, sys
@@ -39,7 +62,7 @@ if sys.argv[1:4] == ['pane','current','--current']:
     print(json.dumps({'result': {'pane': {'pane_id': 'w1:p1', 'workspace_id': 'w1', 'terminal_id': 'term-1'}}}))
 elif sys.argv[1:4] == ['status','server','--json']:
     print(json.dumps({'running': True, 'compatible': True, 'endpoint_compatible': True,
-                      'version': '0.9.3', 'protocol': 22, 'socket': os.environ.get('HERDR_SOCKET_PATH', '/tmp/test-herdr.sock')}))
+                      'version': '0.9.3', 'protocol': 22, 'socket': os.environ['FAKE_HERDR_SOCKET']}))
 elif sys.argv[1:3] == ['workspace','create']:
     print(json.dumps({'result': {'workspace': {'workspace_id': 'w2'},
                                  'root_pane': {'pane_id': 'w2:p1', 'terminal_id': 'term-2'}}}))
@@ -51,8 +74,9 @@ else:
         self.env.update(PATH=str(self.bin) + os.pathsep + self.env["PATH"],
                         XDG_STATE_HOME=str(self.root / "state"),
                         HERDR_CALL_LOG=str(self.root / "herdr.log"),
+                        FAKE_HERDR_SOCKET=str(self.socket_path),
                         HERDR_ENV="1", HERDR_PANE_ID="w1:p1",
-                        HERDR_WORKSPACE_ID="w1", HERDR_SOCKET_PATH=str(self.root / "herdr.sock"))
+                        HERDR_WORKSPACE_ID="w1", HERDR_SOCKET_PATH=str(self.socket_path))
 
     def git(self, *args, cwd):
         result = subprocess.run(["git", *args], cwd=cwd, text=True, capture_output=True)
@@ -144,6 +168,32 @@ else:
         empty_cancelled = self.run_popup([b"\r", b"\x1b"])
         self.assertEqual(empty_cancelled["status"], "cancelled")
         self.assertNotIn("description", empty_cancelled)
+
+    def test_host_close_before_enter_cancels_without_submission(self):
+        launch_id = os.urandom(16).hex()
+        path = self.root / "state/wayfinder-herdr/launches" / (launch_id + ".json")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps({"launch_id": launch_id, "checkout": str(self.repo),
+                                    "status": "awaiting_input"}))
+        master, slave = pty.openpty()
+        fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 24, 80, 0, 0))
+        env = self.env.copy()
+        env["TERM"] = "xterm"
+        proc = subprocess.Popen([sys.executable, str(COMMAND), "popup", launch_id],
+                                env=env, stdin=slave, stdout=slave, stderr=slave)
+        os.close(slave)
+        try:
+            time.sleep(0.3)
+            proc.send_signal(signal.SIGTERM)
+            self.assertEqual(proc.wait(timeout=2), 0)
+            record = json.loads(path.read_text())
+            self.assertEqual(record["status"], "cancelled")
+            self.assertNotIn("description", record)
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+                proc.wait()
+            os.close(master)
 
 
 if __name__ == "__main__":
