@@ -331,7 +331,7 @@ fn launch_chat(mut state: State, launch: ChatLaunch<'_>) -> Result<()> {
     }
     store::atomic_json(&dir.join("state.json"), &state)?;
     let started = match client.start_agent(
-        &orchestrator_agent_name(key),
+        &orchestrator_agent_name(key, pane_id),
         &provider.kind,
         pane_id,
         &args,
@@ -427,8 +427,16 @@ fn launch_chat(mut state: State, launch: ChatLaunch<'_>) -> Result<()> {
     Ok(())
 }
 
-fn orchestrator_agent_name(map_key: &str) -> String {
-    format!("wf-orch-{}", &map_key[..24])
+fn orchestrator_agent_name(map_key: &str, pane_id: &str) -> String {
+    let digest = Sha256::digest(pane_id.as_bytes());
+    format!(
+        "wf-orch-{}-{}",
+        &map_key[..12],
+        digest[..5]
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>()
+    )
 }
 
 fn wait_for_orchestrator_identity(
@@ -1498,8 +1506,16 @@ mod tests {
     fn orchestrator_agent_name_fits_herdr_limit() {
         let name = orchestrator_agent_name(
             "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+            "w1:p3",
         );
-        assert_eq!(name, "wf-orch-0123456789abcdef01234567");
+        assert!(name.starts_with("wf-orch-0123456789ab-"));
+        assert_ne!(
+            name,
+            orchestrator_agent_name(
+                "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+                "w1:p4"
+            )
+        );
         assert!(name.len() <= 32);
         assert!(
             name.bytes()
