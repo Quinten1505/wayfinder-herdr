@@ -338,13 +338,10 @@ impl GitHub {
             receipt.comment_verified = true;
             store::atomic_json(&path, &receipt)?;
         }
-        if state.authorization == store::Authorization::Paused {
-            return Ok("Authorization comment verified; dispatch remains paused".into());
-        }
         if store::start_recorded_or_pending(&dir, &state)? {
             return Ok("Authorization comment verified; existing durable Start retained".into());
         }
-        let request = store::enqueue(&dir, store::RequestKind::Start)?;
+        let request = store::enqueue(&dir, store::RequestKind::AuthorizedStart)?;
         Ok(format!(
             "Authorization comment verified; one durable Start queued as {request}"
         ))

@@ -147,6 +147,14 @@ fn reconcile(dir: &Path, state: &mut State) -> Result<String> {
             "Host and GitHub reconciled; dispatch held: attach this map with its owning Herdr workspace ID".into(),
         );
     }
+    if let Some(warning) = chat_warning
+        .as_ref()
+        .filter(|warning| warning.contains("identity"))
+    {
+        return Ok(format!(
+            "Host and GitHub reconciled; dispatch held while {warning}"
+        ));
+    }
     let ready = match github.dispatch_frontier(&map, dir) {
         Ok(ready) => ready,
         Err(error) if format!("{error:#}").contains("execution override") => {

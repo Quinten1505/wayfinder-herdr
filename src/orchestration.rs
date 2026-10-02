@@ -1429,25 +1429,11 @@ pub fn verified_caller_session(state: &State) -> Result<store::AgentSessionIdent
                 == Some(state.binding.socket.as_os_str()),
         "authorization must be relayed from this map's verified orchestrator pane"
     );
-    // The provider may report a new conversation ID in the same live process.
-    // The process, pane, terminal and provider remain pinned; this receipt uses
-    // the current observed session without changing the chat-delivery binding.
-    let mut process_binding = binding.clone();
-    process_binding.session = None;
-    let client = Client::new(&state.binding.socket);
-    let observed = client.agent(&binding.pane_id)?;
-    verify_orchestrator_observation(&client, &process_binding, &observed)?;
-    let session = &observed["agent"]["agent_session"];
-    ensure!(
-        session.is_object(),
-        "Herdr omitted current orchestrator session identity"
-    );
-    Ok(store::AgentSessionIdentity {
-        source: required(session, "source")?.to_owned(),
-        agent: required(session, "agent")?.to_owned(),
-        kind: required(session, "kind")?.to_owned(),
-        value: required(session, "value")?.to_owned(),
-    })
+    verify_orchestrator(&Client::new(&state.binding.socket), binding)?;
+    binding
+        .session
+        .clone()
+        .context("the orchestrator has no pinned agent session identity")
 }
 
 fn verify_orchestrator_observation(

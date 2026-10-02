@@ -425,6 +425,15 @@ fn existing_map_authorization_requires_the_pinned_chat_and_reuses_comment_and_st
     assert!(!unverified.status.success());
     assert!(!f.dir.join("authorization/existing-map.json").exists());
 
+    let changed_session = authorize();
+    assert!(!changed_session.status.success());
+    assert!(String::from_utf8_lossy(&changed_session.stderr).contains("session identity changed"));
+    assert!(!f.dir.join("authorization/existing-map.json").exists());
+    f.herdr_state.lock().unwrap().sessions.insert(
+        binding.pane_id.clone(),
+        serde_json::to_value(binding.session.clone().unwrap()).unwrap(),
+    );
+
     success(authorize());
     success(authorize());
     let github = serde_json::from_slice::<Value>(&fs::read(&f.gh_state).unwrap()).unwrap();
@@ -444,14 +453,15 @@ fn existing_map_authorization_requires_the_pinned_chat_and_reuses_comment_and_st
     assert_eq!(receipt["instruction"], instruction);
     assert_eq!(
         receipt["source_session"]["value"],
-        "conversation-after-compaction"
+        "conversation-orchestrator-pane"
     );
     assert_eq!(receipt["comment_verified"], true);
     let starts = fs::read_dir(f.dir.join("inbox"))
         .unwrap()
         .map(|entry| entry.unwrap().path())
         .filter(|path| {
-            serde_json::from_slice::<Value>(&fs::read(path).unwrap()).unwrap()["command"] == "start"
+            serde_json::from_slice::<Value>(&fs::read(path).unwrap()).unwrap()["command"]
+                == "authorized_start"
         })
         .count();
     assert_eq!(starts, 1);
@@ -486,7 +496,47 @@ fn existing_map_authorization_preserves_an_explicit_pause() {
             .unwrap(),
     );
     assert_eq!(f.state().authorization, Authorization::Paused);
-    assert!(!store::start_recorded_or_pending(&f.dir, &f.state()).unwrap());
+    assert!(store::start_recorded_or_pending(&f.dir, &f.state()).unwrap());
+    success(f.once());
+    assert_eq!(f.state().authorization, Authorization::Paused);
+    f.apply(RequestKind::Resume);
+    assert_eq!(f.state().authorization, Authorization::Started);
+}
+
+#[test]
+fn pending_pause_precedes_authorization_start_without_reopening_dispatch() {
+    let f = Fixture::new();
+    let mut github = serde_json::from_slice::<Value>(&fs::read(&f.gh_state).unwrap()).unwrap();
+    github["map_body"] = json!("## Notes\n\nPlanning only.");
+    fs::write(&f.gh_state, serde_json::to_vec(&github).unwrap()).unwrap();
+    success(f.chat());
+    store::enqueue(&f.dir, RequestKind::Pause).unwrap();
+    let binding = f.state().orchestrator.unwrap();
+    success(
+        f.cli()
+            .args([
+                "authorize-existing",
+                "--map",
+                MAP,
+                "--instruction",
+                "Deliver this named map.",
+            ])
+            .env("HERDR_ENV", "1")
+            .env("HERDR_PANE_ID", &binding.pane_id)
+            .env("HERDR_SOCKET_PATH", &f.state().binding.socket)
+            .output()
+            .unwrap(),
+    );
+    success(f.once());
+    assert_eq!(f.state().authorization, Authorization::Paused);
+    assert_eq!(
+        f.state()
+            .history
+            .iter()
+            .filter(|request| request.command == RequestKind::AuthorizedStart)
+            .count(),
+        1
+    );
 }
 
 #[test]
@@ -679,6 +729,20 @@ fn changed_pinned_orchestrator_session_is_held_without_overwriting_identity() {
         prompts_before_session_change,
         "a new session on the saved pane must not receive pending chat"
     );
+}
+
+#[test]
+fn changed_chat_session_holds_new_worker_dispatch_after_start() {
+    let f = Fixture::new();
+    success(f.chat());
+    f.herdr_state.lock().unwrap().sessions.insert(
+        "orchestrator-pane".into(),
+        json!({"source":"fixture","agent":"codex","kind":"id","value":"different-conversation"}),
+    );
+    f.apply(RequestKind::Start);
+    assert!(f.state().workers.runs.is_empty());
+    assert!(f.state().suspension.contains("dispatch held"));
+    assert!(f.state().suspension.contains("session identity changed"));
 }
 
 fn handle_request(mut stream: std::os::unix::net::UnixStream, state: &Arc<Mutex<HerdrState>>) {

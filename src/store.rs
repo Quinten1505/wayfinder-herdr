@@ -678,6 +678,7 @@ pub struct Applied {
 #[serde(rename_all = "snake_case")]
 pub enum RequestKind {
     Start,
+    AuthorizedStart,
     Pause,
     Resume,
     Reconcile,
@@ -932,11 +933,12 @@ pub fn enqueue(dir: &Path, command: RequestKind) -> Result<String> {
 /// its first Start. A lost acknowledgement is found in either applied history or
 /// the durable inbox, so retrying the same human instruction cannot add another.
 pub fn start_recorded_or_pending(dir: &Path, state: &State) -> Result<bool> {
-    if state
-        .history
-        .iter()
-        .any(|applied| applied.command == RequestKind::Start)
-    {
+    if state.history.iter().any(|applied| {
+        matches!(
+            &applied.command,
+            RequestKind::Start | RequestKind::AuthorizedStart
+        )
+    }) {
         return Ok(true);
     }
     for entry in fs::read_dir(dir.join("inbox"))? {
@@ -946,7 +948,10 @@ pub fn start_recorded_or_pending(dir: &Path, state: &State) -> Result<bool> {
             .is_some_and(|extension| extension == "json")
         {
             let request: Request = read_versioned(&path)?;
-            if request.command == RequestKind::Start {
+            if matches!(
+                &request.command,
+                RequestKind::Start | RequestKind::AuthorizedStart
+            ) {
                 return Ok(true);
             }
         }
@@ -980,16 +985,23 @@ pub fn process_requests(dir: &Path, state: &mut State) -> Result<()> {
                     }
                     "Start recorded; dispatch still requires successful reconciliation"
                 }
+                RequestKind::AuthorizedStart => {
+                    if state.authorization == Authorization::AwaitingStart {
+                        state.authorization = Authorization::Started;
+                    }
+                    "Existing-map Start recorded; an explicit Pause remains in effect"
+                }
                 RequestKind::Pause => {
                     state.authorization = Authorization::Paused;
                     "Dispatch paused"
                 }
                 RequestKind::Resume => {
-                    if state
-                        .history
-                        .iter()
-                        .any(|r| r.command == RequestKind::Start)
-                    {
+                    if state.history.iter().any(|r| {
+                        matches!(
+                            &r.command,
+                            RequestKind::Start | RequestKind::AuthorizedStart
+                        )
+                    }) {
                         state.authorization = Authorization::Started;
                         "Resume recorded; dispatch still requires successful reconciliation"
                     } else {
