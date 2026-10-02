@@ -87,6 +87,49 @@ struct Intent {
     stage: String,
 }
 
+const EXISTING_MAP_SCOPE: &str = "Continuous planning and delivery of this named map through required checks, independent review, integration, and a ready PR; the human retains the final feature merge.";
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ExistingMapReceipt {
+    format_version: u32,
+    map: String,
+    #[serde(default)]
+    map_repository: String,
+    instruction: String,
+    scope: String,
+    source_session: store::AgentSessionIdentity,
+    source_process: store::LinuxProcessIdentity,
+    source_pane: String,
+    source_terminal: String,
+    marker: String,
+    comment_verified: bool,
+}
+
+impl ExistingMapReceipt {
+    fn comment(&self, map: &MapRef) -> String {
+        let instruction = self
+            .instruction
+            .lines()
+            .map(|line| format!("> {line}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        format!(
+            "## Existing-map execution preference — body refresh pending for a human\n\nThe human gave this explicit instruction in the verified orchestrator chat for [this named map](https://github.com/{}/issues/{}):\n\n{}\n\nScope: {}\n\nLocal receipt: `{}`. The receipt pins the map, exact instruction, observed chat session, process, pane, and terminal; the runtime checks this map comment against that retained receipt before dispatch. Opening or attaching a chat does not authorize delivery.\n\n**Body refresh pending for a human.** The map and specification bodies remain unchanged.\n\n<!-- {} -->",
+            if self.map_repository.is_empty() {
+                map.repo()
+            } else {
+                self.map_repository.clone()
+            },
+            map.number,
+            instruction,
+            self.scope,
+            self.marker,
+            self.marker
+        )
+    }
+}
+
 #[derive(Clone)]
 pub struct GitHub {
     executable: String,
@@ -203,6 +246,105 @@ impl GitHub {
                 "comment write outcome is ambiguous; intent retained for marker reconciliation",
             ),
         }
+    }
+
+    /// Record one map-scoped human instruction before touching GitHub, then
+    /// reconcile a named comment and the single durable Start. The caller is
+    /// the verified orchestrator pane, not an arbitrary attached shell.
+    pub fn authorize_existing_map(
+        &self,
+        root: &Path,
+        map: &MapRef,
+        instruction: &str,
+    ) -> Result<String> {
+        ensure!(
+            !instruction.trim().is_empty(),
+            "an exact explicit human instruction is required"
+        );
+        let (identity, key) = store::map_identity(&format!("{}#{}", map.repo(), map.number))?;
+        let dir = store::map_dir(root, &key)?;
+        let _lock = Lock::acquire_wait(&dir.join("state.lock"))?;
+        let state = store::read_state(&dir)?;
+        ensure!(
+            state.map == identity,
+            "attached runtime belongs to another map"
+        );
+        let session = crate::orchestration::verified_caller_session(&state)?;
+        let binding = state
+            .orchestrator
+            .as_ref()
+            .context("orchestrator missing")?;
+        let terminal = binding
+            .terminal_id
+            .as_deref()
+            .context("orchestrator terminal identity missing")?;
+        let process = binding
+            .foreground_process
+            .as_ref()
+            .context("orchestrator process identity missing")?;
+        let path = dir.join("authorization/existing-map.json");
+        let mut receipt = if path.exists() {
+            let prior: ExistingMapReceipt = store::read_versioned(&path)?;
+            ensure!(
+                prior.map == identity
+                    && prior.instruction == instruction
+                    && prior.scope == EXISTING_MAP_SCOPE,
+                "a different existing-map authorization is already retained; inspect it before changing scope"
+            );
+            prior
+        } else {
+            let marker = operation_marker(
+                "existing-map-authorization",
+                &json!([identity, instruction, session, EXISTING_MAP_SCOPE]),
+            );
+            let receipt = ExistingMapReceipt {
+                format_version: store::FORMAT,
+                map: identity,
+                map_repository: map.repo(),
+                instruction: instruction.to_owned(),
+                scope: EXISTING_MAP_SCOPE.to_owned(),
+                source_session: session,
+                source_process: process.clone(),
+                source_pane: binding.pane_id.clone(),
+                source_terminal: terminal.to_owned(),
+                marker,
+                comment_verified: false,
+            };
+            store::private_dir(path.parent().context("authorization path has no parent")?)?;
+            store::atomic_json(&path, &receipt)?;
+            receipt
+        };
+        if receipt.map_repository.is_empty() {
+            receipt.map_repository = map.repo();
+            store::atomic_json(&path, &receipt)?;
+        }
+        let expected = receipt.comment(map);
+        self.post_comment_once(map, map.number, &expected, &receipt.marker)?;
+        let marker = format!("<!-- {} -->", receipt.marker);
+        let matches = self
+            .comments(map, map.number)?
+            .into_iter()
+            .filter(|comment| {
+                comment["body"]
+                    .as_str()
+                    .is_some_and(|body| body.contains(&marker))
+            })
+            .collect::<Vec<_>>();
+        ensure!(
+            matches.len() == 1 && matches[0]["body"].as_str() == Some(expected.as_str()),
+            "execution override comment marker is missing, duplicated, or differs from the retained receipt"
+        );
+        if !receipt.comment_verified {
+            receipt.comment_verified = true;
+            store::atomic_json(&path, &receipt)?;
+        }
+        if store::start_recorded_or_pending(&dir, &state)? {
+            return Ok("Authorization comment verified; existing durable Start retained".into());
+        }
+        let request = store::enqueue(&dir, store::RequestKind::AuthorizedStart)?;
+        Ok(format!(
+            "Authorization comment verified; one durable Start queued as {request}"
+        ))
     }
 
     pub fn frontier(&self, map: &MapRef) -> Result<Vec<FrontierTicket>> {
@@ -455,7 +597,7 @@ impl GitHub {
         state_dir: &Path,
     ) -> Result<String> {
         let _lock = Lock::acquire_wait(&state_dir.join("state.lock"))?;
-        self.require_execution_override(map)?;
+        self.require_execution_override(map, state_dir)?;
         let login = self.resolve_assignee(assignee)?;
         let marker = operation_marker("claim", &json!([map.repo(), ticket, login]));
         let path = state_dir
@@ -529,7 +671,7 @@ impl GitHub {
         assignee: Option<&str>,
         state_dir: &Path,
     ) -> Result<String> {
-        self.require_execution_override(map)?;
+        self.require_execution_override(map, state_dir)?;
         let login = self.resolve_assignee(assignee)?;
         let marker = operation_marker("claim", &json!([map.repo(), ticket, login]));
         let intent_path = state_dir
@@ -623,8 +765,8 @@ impl GitHub {
     }
 
     /// Read the current map children only when the execution override is explicit.
-    pub fn dispatch_frontier(&self, map: &MapRef) -> Result<Vec<FrontierTicket>> {
-        self.require_execution_override(map)?;
+    pub fn dispatch_frontier(&self, map: &MapRef, state_dir: &Path) -> Result<Vec<FrontierTicket>> {
+        self.require_execution_override(map, state_dir)?;
         self.frontier(map)
     }
 
@@ -769,15 +911,70 @@ impl GitHub {
             .collect()
     }
 
-    fn require_execution_override(&self, map: &MapRef) -> Result<()> {
+    fn require_execution_override(&self, map: &MapRef, state_dir: &Path) -> Result<()> {
         let body = self.issue(map, map.number)?["body"]
             .as_str()
             .context("map omitted body")?
             .to_owned();
         let notes = section(&body, "Notes")?;
+        if affirmative_execution_override(notes) {
+            return Ok(());
+        }
+        let path = state_dir.join("authorization/existing-map.json");
         ensure!(
-            affirmative_execution_override(notes),
-            "map Notes do not record an explicit execution override"
+            path.exists(),
+            "map Notes do not record an explicit execution override and no verified existing-map receipt exists"
+        );
+        let receipt: ExistingMapReceipt = store::read_versioned(&path)?;
+        let state = store::read_state(state_dir)?;
+        let (identity, _) = store::map_identity(&format!("{}#{}", map.repo(), map.number))?;
+        let expected_marker = operation_marker(
+            "existing-map-authorization",
+            &json!([
+                receipt.map,
+                receipt.instruction,
+                receipt.source_session,
+                receipt.scope
+            ]),
+        );
+        let pinned_source = state
+            .orchestrator
+            .iter()
+            .chain(
+                state
+                    .orchestrator_history
+                    .iter()
+                    .map(|archive| &archive.binding),
+            )
+            .any(|binding| {
+                binding.foreground_process.as_ref() == Some(&receipt.source_process)
+                    && binding.pane_id == receipt.source_pane
+                    && binding.terminal_id.as_deref() == Some(receipt.source_terminal.as_str())
+            });
+        ensure!(
+            receipt.map == identity
+                && state.map == identity
+                && receipt.map_repository.eq_ignore_ascii_case(&map.repo())
+                && receipt.scope == EXISTING_MAP_SCOPE
+                && receipt.marker == expected_marker
+                && receipt.comment_verified
+                && pinned_source,
+            "existing-map execution override receipt does not match this map or a verified chat"
+        );
+        let expected = receipt.comment(map);
+        let marker = format!("<!-- {} -->", receipt.marker);
+        let matching = self
+            .comments(map, map.number)?
+            .into_iter()
+            .filter(|comment| {
+                comment["body"]
+                    .as_str()
+                    .is_some_and(|body| body.contains(&marker))
+            })
+            .collect::<Vec<_>>();
+        ensure!(
+            matching.len() == 1 && matching[0]["body"].as_str() == Some(expected.as_str()),
+            "existing-map execution override comment is missing or differs from its local receipt"
         );
         Ok(())
     }

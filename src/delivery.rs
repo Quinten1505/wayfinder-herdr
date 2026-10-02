@@ -24,6 +24,22 @@ pub struct DeliveryState {
     pub repository: Option<String>,
     #[serde(default)]
     pub feature_branch: Option<String>,
+    /// A verified checked-out feature worktree used for delivery. The runtime's
+    /// source repository binding remains unchanged for chat and authorization.
+    #[serde(default)]
+    pub feature_checkout: Option<PathBuf>,
+    /// Last head accepted by a verified delivery transition.
+    #[serde(default)]
+    pub feature_head: Option<String>,
+    #[serde(default)]
+    pub feature_base_ref: Option<String>,
+    #[serde(default)]
+    pub feature_base_commit: Option<String>,
+    /// Existing draft PR that proved the first map-scoped branch selection.
+    #[serde(default)]
+    pub feature_binding_pr: Option<u64>,
+    #[serde(default)]
+    pub feature_target_update: Option<FeatureTargetUpdate>,
     #[serde(default)]
     pub tickets: BTreeMap<String, TicketDelivery>,
     /// Complete latest direct-child snapshot. Closed task tickets remain visible
@@ -87,6 +103,14 @@ pub struct TicketDelivery {
     pub review: Option<ReviewSummary>,
     #[serde(default)]
     pub checks: Vec<CheckEvidence>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FeatureTargetUpdate {
+    old_head: String,
+    new_head: String,
+    base_commit: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -238,6 +262,357 @@ pub fn read(dir: &Path) -> Result<DeliveryState> {
     }
     let bytes = fs::read(&path)?;
     serde_json::from_slice(&bytes).context("decode delivery state")
+}
+
+/// Bind a pre-existing checked-out feature branch without moving the runtime's
+/// source checkout. Repeated calls verify the same binding and do not rewrite it.
+pub fn bind_feature_checkout(
+    dir: &Path,
+    state: &State,
+    checkout: &Path,
+    expected_branch: &str,
+    expected_head: &str,
+    base_ref: &str,
+    source_pr: Option<u64>,
+) -> Result<(PathBuf, String)> {
+    let _lock = Lock::acquire(&dir.join("integration.lock"))?;
+    let mut delivery = read(dir)?;
+    let checkout = fs::canonicalize(checkout).context("feature checkout must exist")?;
+    let (branch, head) =
+        validate_feature_checkout(&state.binding.repository, &checkout, Some(expected_branch))?;
+    ensure!(
+        head == expected_head,
+        "feature checkout HEAD does not match the map-scoped expected commit"
+    );
+    ensure!(
+        base_ref == "refs/remotes/origin/develop",
+        "current delivery PR target requires refs/remotes/origin/develop as its base"
+    );
+    let base = git(&state.binding.repository, &["rev-parse", base_ref])?
+        .trim()
+        .to_owned();
+    ensure!(
+        remote_ref(&state.binding.repository, "refs/heads", "develop")?.as_deref()
+            == Some(base.as_str()),
+        "saved develop base differs from the current origin target; fetch before binding"
+    );
+    ensure!(
+        delivery
+            .pr_base_commit
+            .as_deref()
+            .is_none_or(|saved| saved == base),
+        "saved PR target base differs from the selected delivery base"
+    );
+    if let Some(pr) = delivery.draft_pr.as_ref() {
+        ensure!(
+            pr.head == branch && pr.base == "develop",
+            "recorded draft PR head/base differs from the selected feature checkout"
+        );
+        ensure!(
+            source_pr.is_none_or(|number| number == pr.number),
+            "source PR differs from the recorded draft PR for this map"
+        );
+    }
+    if delivery.feature_branch.is_none() {
+        let number = source_pr.context(
+            "first feature binding needs the existing draft PR as map-scoped branch evidence",
+        )?;
+        verify_binding_pr(&state.map, number, &branch, &head)?;
+    } else {
+        ensure!(
+            source_pr.is_none() || source_pr == delivery.feature_binding_pr,
+            "source PR differs from the recorded feature binding"
+        );
+    }
+    ensure!(
+        is_ancestor(&checkout, &base, &head)?,
+        "feature head does not contain the selected delivery base"
+    );
+    for ticket in delivery.tickets.values() {
+        if let Some(commit) = ticket.integrated_commit.as_deref() {
+            ensure!(
+                is_ancestor(&checkout, commit, &head)?,
+                "feature head does not contain recorded ticket integration {commit}"
+            );
+        }
+    }
+    if let Some(existing) = delivery.feature_checkout.as_ref() {
+        ensure!(
+            existing == &checkout
+                && delivery.feature_branch.as_deref() == Some(&branch)
+                && delivery.feature_head.as_deref() == Some(&head)
+                && delivery.feature_base_ref.as_deref() == Some(base_ref)
+                && delivery.feature_base_commit.as_deref() == Some(&base)
+                && (source_pr.is_none() || delivery.feature_binding_pr == source_pr),
+            "feature checkout or saved head/base changed; existing binding preserved"
+        );
+        return Ok((checkout, branch));
+    }
+    ensure!(
+        delivery
+            .feature_branch
+            .as_deref()
+            .is_none_or(|recorded| recorded == branch),
+        "recorded feature branch differs from the requested checkout"
+    );
+    delivery.feature_checkout = Some(checkout.clone());
+    delivery.feature_branch = Some(branch.clone());
+    delivery.feature_head = Some(head);
+    delivery.feature_base_ref = Some(base_ref.to_owned());
+    delivery.feature_base_commit = Some(base);
+    delivery.feature_binding_pr = source_pr;
+    save(dir, &delivery)?;
+    Ok((checkout, branch))
+}
+
+fn verify_binding_pr(map: &str, number: u64, branch: &str, head: &str) -> Result<()> {
+    let map_ref = MapRef::parse(map)?;
+    let repository = format!("{}/{}", map_ref.owner, map_ref.repository);
+    let pr = gh_json(
+        Path::new("gh"),
+        &[
+            "pr",
+            "view",
+            &number.to_string(),
+            "--repo",
+            &repository,
+            "--json",
+            "headRefName,headRefOid,baseRefName,isDraft,body",
+        ],
+    )?;
+    let map_url =
+        format!("https://github.com/{repository}/issues/{}", map_ref.number).to_ascii_lowercase();
+    let body_names_map = pr["body"].as_str().is_some_and(|body| {
+        let body = body.to_ascii_lowercase();
+        body.match_indices(&map_url).any(|(at, _)| {
+            body.as_bytes().get(at + map_url.len()).is_none_or(|next| {
+                matches!(
+                    *next,
+                    b')' | b' ' | b'\n' | b'\r' | b'\t' | b'>' | b'#' | b'?' | b'.'
+                )
+            })
+        })
+    });
+    ensure!(
+        pr["isDraft"].as_bool() == Some(true)
+            && pr["headRefName"].as_str() == Some(branch)
+            && pr["headRefOid"].as_str() == Some(head)
+            && pr["baseRefName"].as_str() == Some("develop")
+            && body_names_map,
+        "draft PR does not prove this map's exact feature branch, head, and develop base"
+    );
+    Ok(())
+}
+
+fn git_common_dir(repository: &Path) -> Result<PathBuf> {
+    let raw = git(repository, &["rev-parse", "--git-common-dir"])?;
+    let path = Path::new(raw.trim());
+    let path = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        repository.join(path)
+    };
+    fs::canonicalize(path).context("resolve Git common directory")
+}
+
+fn checked_out_branch_count(repository: &Path, reference: &str) -> Result<usize> {
+    let listing = git(repository, &["worktree", "list", "--porcelain", "-z"])?;
+    let needle = format!("branch {reference}");
+    Ok(listing.split('\0').filter(|field| *field == needle).count())
+}
+
+fn validate_feature_checkout(
+    source: &Path,
+    checkout: &Path,
+    expected_branch: Option<&str>,
+) -> Result<(String, String)> {
+    let source = fs::canonicalize(source).context("resolve runtime source checkout")?;
+    let checkout = fs::canonicalize(checkout).context("resolve feature checkout")?;
+    ensure!(
+        source != checkout,
+        "feature checkout must be separate from the runtime source checkout"
+    );
+    ensure!(
+        git_common_dir(&source)? == git_common_dir(&checkout)?,
+        "feature checkout belongs to another Git repository"
+    );
+    let root = git(&checkout, &["rev-parse", "--show-toplevel"])?;
+    ensure!(
+        Path::new(root.trim()) == checkout,
+        "feature checkout path is not its worktree root"
+    );
+    let listing = git(&source, &["worktree", "list", "--porcelain", "-z"])?;
+    let registered = listing.split('\0').any(|field| {
+        field
+            .strip_prefix("worktree ")
+            .is_some_and(|path| Path::new(path) == checkout)
+    });
+    ensure!(
+        registered,
+        "feature checkout is not a registered Git worktree"
+    );
+    let reference =
+        git(&checkout, &["symbolic-ref", "HEAD"]).context("feature checkout is detached")?;
+    let reference = reference.trim();
+    let branch = reference
+        .strip_prefix("refs/heads/")
+        .context("feature checkout is detached")?;
+    validate_branch(branch)?;
+    ensure!(
+        branch.starts_with("feature/"),
+        "checkout must be on a feature/ branch"
+    );
+    ensure!(
+        checked_out_branch_count(&source, reference)? == 1,
+        "feature branch is checked out in more than one worktree"
+    );
+    if let Some(expected) = expected_branch {
+        ensure!(branch == expected, "feature checkout changed branch");
+    }
+    let head = git(&checkout, &["rev-parse", "HEAD"])?.trim().to_owned();
+    ensure!(
+        head == git(&checkout, &["rev-parse", reference])?.trim(),
+        "feature checkout HEAD differs from its branch ref"
+    );
+    ensure!(
+        git(&checkout, &["status", "--porcelain"])?
+            .trim()
+            .is_empty(),
+        "feature checkout has local changes"
+    );
+    Ok((branch.to_owned(), head))
+}
+
+fn delivery_checkout(delivery: &DeliveryState, source: &Path) -> Result<PathBuf> {
+    if let Some(checkout) = delivery.feature_checkout.as_ref() {
+        let (_, head) =
+            validate_feature_checkout(source, checkout, delivery.feature_branch.as_deref())?;
+        validate_saved_feature_base(delivery, checkout, &head)?;
+        ensure!(
+            delivery.feature_head.as_deref() == Some(&head),
+            "feature checkout moved after binding; exact review/check evidence must be reconciled"
+        );
+        Ok(checkout.clone())
+    } else {
+        fs::canonicalize(source).context("resolve bound repository")
+    }
+}
+
+fn validate_saved_feature_base(
+    delivery: &DeliveryState,
+    checkout: &Path,
+    head: &str,
+) -> Result<()> {
+    let base = delivery
+        .feature_base_commit
+        .as_deref()
+        .context("bound feature checkout has no saved base commit")?;
+    ensure!(
+        delivery.feature_base_ref.is_some(),
+        "bound feature checkout has no saved base ref"
+    );
+    // The initial base is pinned. The named ref may advance later; PR handoff
+    // independently fetches and verifies the current develop target.
+    ensure!(
+        is_ancestor(checkout, base, head)?,
+        "feature checkout no longer contains its saved delivery base {base}"
+    );
+    Ok(())
+}
+
+fn reconcile_feature_target_update(
+    dir: &Path,
+    delivery: &mut DeliveryState,
+    source: &Path,
+) -> Result<()> {
+    let Some(intent) = delivery.feature_target_update.clone() else {
+        return Ok(());
+    };
+    let checkout = delivery
+        .feature_checkout
+        .as_ref()
+        .context("target update intent has no feature checkout")?;
+    let (_, head) =
+        validate_feature_checkout(source, checkout, delivery.feature_branch.as_deref())?;
+    ensure!(
+        delivery.feature_head.as_deref() == Some(&intent.old_head),
+        "target update intent does not match saved feature head"
+    );
+    if head == intent.new_head {
+        ensure!(
+            is_ancestor(checkout, &intent.old_head, &intent.new_head)?
+                && is_ancestor(checkout, &intent.base_commit, &intent.new_head)?,
+            "completed target update does not contain the saved head and base"
+        );
+        delivery.feature_head = Some(intent.new_head);
+        delivery.pr_base_commit = Some(intent.base_commit);
+        delivery.ready_commit = None;
+        delivery.final_review_commit = None;
+        delivery.ready_error = Some("develop advanced; feature branch updated and final independent review is required again".into());
+    } else {
+        ensure!(
+            head == intent.old_head,
+            "feature checkout moved outside the saved target update intent"
+        );
+    }
+    delivery.feature_target_update = None;
+    save(dir, delivery)
+}
+
+fn reconcile_bound_feature_head(
+    dir: &Path,
+    delivery: &mut DeliveryState,
+    source: &Path,
+    run_id: &str,
+) -> Result<Option<Outcome>> {
+    let Some(checkout) = delivery.feature_checkout.as_ref() else {
+        return Ok(None);
+    };
+    let (branch, head) =
+        validate_feature_checkout(source, checkout, delivery.feature_branch.as_deref())?;
+    validate_saved_feature_base(delivery, checkout, &head)?;
+    ensure!(
+        delivery.feature_branch.as_deref() == Some(&branch),
+        "feature branch binding changed"
+    );
+    let Some(saved_head) = delivery.feature_head.as_deref() else {
+        bail!("bound feature checkout has no saved head");
+    };
+    if head == saved_head {
+        return Ok(None);
+    }
+    let exact_pending = delivery.tickets.get(run_id).is_some_and(|entry| {
+        entry.candidate_base.as_deref() == Some(saved_head)
+            && entry.candidate_commit.as_deref() == Some(&head)
+            && entry.review.as_ref().is_some_and(|review| {
+                review.commit == head && review.unresolved_findings.is_empty()
+            })
+            && !entry.checks.is_empty()
+            && entry
+                .checks
+                .iter()
+                .all(|check| check.commit == head && check.result.starts_with("passed"))
+    });
+    if !exact_pending || !is_ancestor(checkout, saved_head, &head)? {
+        return Ok(Some(Outcome::Held {
+            run_id: run_id.to_owned(),
+            detail: format!(
+                "feature checkout moved from saved head {saved_head} to {head}; no exact reviewed and checked integration intent matches"
+            ),
+        }));
+    }
+    let entry = delivery
+        .tickets
+        .get_mut(run_id)
+        .context("pending integration record disappeared")?;
+    entry.integrated_commit = Some(head.clone());
+    entry.last_error = None;
+    delivery.feature_head = Some(head.clone());
+    save(dir, delivery)?;
+    Ok(Some(Outcome::Integrated {
+        run_id: run_id.to_owned(),
+        commit: head,
+    }))
 }
 
 /// Retain the exact failed-check ancestry once its bounded implementer repair
@@ -860,6 +1235,9 @@ fn mark_ready_with(
     gh: &Path,
 ) -> Result<()> {
     let mut delivery = read(dir)?;
+    reconcile_feature_target_update(dir, &mut delivery, repository)?;
+    let checkout = delivery_checkout(&delivery, repository)?;
+    let repository = checkout.as_path();
     if delivery.readiness_intent.is_some() {
         let map_ref = MapRef::parse(map)?;
         let repository_name = format!("{}/{}", map_ref.owner, map_ref.repository);
@@ -1052,6 +1430,13 @@ pub fn reconcile(dir: &Path, state: &State, children: &[ChildTicket]) -> Result<
     if delivery.repository.is_none() {
         delivery.repository = Some(state.map.split('#').next().unwrap_or_default().to_owned());
     }
+    reconcile_feature_target_update(dir, &mut delivery, &state.binding.repository)?;
+    if let Some(outcome) =
+        reconcile_bound_feature_head(dir, &mut delivery, &state.binding.repository, &run.id)?
+    {
+        return Ok(outcome);
+    }
+    let repository = delivery_checkout(&delivery, &state.binding.repository)?;
     supersede_delivery_ancestors(state, &mut delivery, run);
     let entry = delivery
         .tickets
@@ -1106,8 +1491,6 @@ pub fn reconcile(dir: &Path, state: &State, children: &[ChildTicket]) -> Result<
         });
     }
     entry.review = Some(approved_review(reviewer, expected_review)?);
-    let repository =
-        fs::canonicalize(&state.binding.repository).context("resolve bound repository")?;
     let branch = match &delivery.feature_branch {
         Some(branch) => branch.clone(),
         None => {
@@ -1258,14 +1641,15 @@ pub fn reconcile(dir: &Path, state: &State, children: &[ChildTicket]) -> Result<
                 && candidate_run.status == WorkerStatus::Completed
                 && candidate_run.base_commit.as_deref() == Some(candidate_commit)
         });
-        if latest_review.is_none() {
+        let Some(latest_review) = latest_review else {
             return Ok(Outcome::Held {
                 run_id: run.id.clone(),
                 detail: format!(
                     "rebased commit {candidate_commit} requires a renewed independent review"
                 ),
             });
-        }
+        };
+        entry.review = Some(approved_review(latest_review, candidate_commit)?);
         let path = entry
             .integration_worktree
             .as_ref()
@@ -1339,9 +1723,25 @@ pub fn reconcile(dir: &Path, state: &State, children: &[ChildTicket]) -> Result<
         is_ancestor(&repository, &target, &candidate)?,
         "candidate cannot fast-forward the feature branch"
     );
-    advance_feature_branch(&repository, &reference, &candidate, &target)?;
-    entry.integrated_commit = Some(candidate.clone());
     entry.candidate_commit = Some(candidate.clone());
+    entry.candidate_base = Some(target.clone());
+    save(dir, &delivery)?;
+    if delivery.feature_checkout.is_some() {
+        validate_feature_checkout(&state.binding.repository, &repository, Some(&branch))?;
+        ensure!(
+            delivery.feature_head.as_deref() == Some(&target),
+            "saved feature head moved before integration"
+        );
+    }
+    advance_feature_branch(&repository, &reference, &candidate, &target)?;
+    let entry = delivery
+        .tickets
+        .get_mut(&run.id)
+        .context("integration record disappeared")?;
+    entry.integrated_commit = Some(candidate.clone());
+    if delivery.feature_checkout.is_some() {
+        delivery.feature_head = Some(candidate.clone());
+    }
     entry.last_error = None;
     save(dir, &delivery)?;
     Ok(Outcome::Integrated {
@@ -1490,7 +1890,7 @@ fn feature_review_outcome(
     let Some(branch) = delivery.feature_branch.as_deref() else {
         return Ok(Outcome::Nothing);
     };
-    let repository = fs::canonicalize(&state.binding.repository)?;
+    let repository = delivery_checkout(delivery, &state.binding.repository)?;
     let head = git(&repository, &["rev-parse", &format!("refs/heads/{branch}")])?
         .trim()
         .to_owned();
@@ -1593,6 +1993,9 @@ fn ensure_draft_pr_with_gh(
     gh: &Path,
 ) -> Result<Option<PullRequest>> {
     let mut delivery = read(dir)?;
+    reconcile_feature_target_update(dir, &mut delivery, repository)?;
+    let checkout = delivery_checkout(&delivery, repository)?;
+    let repository = checkout.as_path();
     if delivery.readiness_intent.is_some() {
         let map_ref = MapRef::parse(map)?;
         let repository_name = format!("{}/{}", map_ref.owner, map_ref.repository);
@@ -2030,12 +2433,37 @@ fn write_pr_body_file(body: &str) -> Result<tempfile::NamedTempFile> {
 
 fn remote_ref(repository: &Path, namespace: &str, branch: &str) -> Result<Option<String>> {
     let reference = format!("{namespace}/{branch}");
-    let output = Command::new("git")
+    let first = Command::new("git")
         .args(["-C"])
         .arg(repository)
         .args(["ls-remote", "origin", &reference])
         .output()
         .context("read remote feature head")?;
+    let output = if first.status.success() {
+        first
+    } else {
+        let origin = git(repository, &["remote", "get-url", "origin"])?;
+        let Some(https) = github_https_origin(origin.trim()) else {
+            bail!(
+                "git ls-remote failed: {}",
+                String::from_utf8_lossy(&first.stderr).trim()
+            );
+        };
+        Command::new("git")
+            .args(["-C"])
+            .arg(repository)
+            .args([
+                "-c",
+                "credential.helper=!gh auth git-credential",
+                "ls-remote",
+            ])
+            .arg(&https)
+            .arg(&reference)
+            // Keep mise's gh shim quiet while Git reads its credential output.
+            .env("MISE_QUIET", "1")
+            .output()
+            .context("read GitHub remote over HTTPS with existing gh credential")?
+    };
     ensure!(
         output.status.success(),
         "git ls-remote failed: {}",
@@ -2046,6 +2474,18 @@ fn remote_ref(repository: &Path, namespace: &str, branch: &str) -> Result<Option
         .next()
         .and_then(|line| line.split_whitespace().next())
         .map(str::to_owned))
+}
+
+fn github_https_origin(origin: &str) -> Option<String> {
+    let path = origin
+        .strip_prefix("git@github.com:")
+        .or_else(|| origin.strip_prefix("ssh://git@github.com/"))?;
+    let path = path.strip_suffix(".git").unwrap_or(path);
+    let (owner, repo) = path.split_once('/')?;
+    if owner.is_empty() || repo.is_empty() || repo.contains('/') {
+        return None;
+    }
+    Some(format!("https://github.com/{owner}/{repo}.git"))
 }
 
 fn sync_develop_target(
@@ -2142,7 +2582,24 @@ fn sync_develop_target_with_checks(
             git(&path, &["status", "--porcelain"])?.trim().is_empty(),
             "develop update worktree became dirty; preserving it"
         );
-        update_ref(repository, &reference, &updated, &old_head)?;
+        if delivery.feature_checkout.is_some() {
+            ensure!(
+                delivery.feature_head.as_deref() == Some(&old_head),
+                "saved feature head moved before target update"
+            );
+            delivery.feature_target_update = Some(FeatureTargetUpdate {
+                old_head: old_head.clone(),
+                new_head: updated.clone(),
+                base_commit: base.clone(),
+            });
+            save(dir, delivery)?;
+        }
+        advance_feature_branch(repository, &reference, &updated, &old_head)?;
+        if delivery.feature_checkout.is_some() {
+            delivery.feature_head = Some(updated);
+            delivery.feature_target_update = None;
+            save(dir, delivery)?;
+        }
         git(
             repository,
             &[
@@ -2556,6 +3013,11 @@ fn advance_feature_branch(
 ) -> Result<()> {
     let current = git(repository, &["branch", "--show-current"])?;
     let current_ref = format!("refs/heads/{}", current.trim());
+    let checked_out = checked_out_branch_count(repository, reference)?;
+    ensure!(
+        checked_out <= 1,
+        "feature branch has multiple checked-out worktrees"
+    );
     if current_ref == reference {
         ensure!(
             git(repository, &["rev-parse", "HEAD"])?.trim() == expected_old,
@@ -2592,6 +3054,10 @@ fn advance_feature_branch(
             "checked-out feature branch did not reach the reviewed integration commit"
         );
     } else {
+        ensure!(
+            checked_out == 0,
+            "feature branch is checked out in another worktree; bind that checkout before integration"
+        );
         update_ref(repository, reference, new, expected_old)?;
     }
     Ok(())
@@ -2627,6 +3093,19 @@ mod tests {
     use std::{fs, os::unix::fs::PermissionsExt, process::Command};
     use tempfile::TempDir;
 
+    #[test]
+    fn github_ssh_origin_can_be_read_over_https_without_mutating_remote() {
+        assert_eq!(
+            github_https_origin("git@github.com:Quinten1505/wayfinder-herdr.git"),
+            Some("https://github.com/Quinten1505/wayfinder-herdr.git".into())
+        );
+        assert_eq!(
+            github_https_origin("ssh://git@github.com/owner/repo"),
+            Some("https://github.com/owner/repo.git".into())
+        );
+        assert_eq!(github_https_origin("/tmp/local-origin.git"), None);
+    }
+
     fn command(path: &Path, args: &[&str]) -> String {
         let output = Command::new("git")
             .args(["-C"])
@@ -2641,6 +3120,46 @@ mod tests {
             String::from_utf8_lossy(&output.stderr)
         );
         String::from_utf8(output.stdout).unwrap().trim().to_owned()
+    }
+
+    fn prepare_feature_checkout(f: &Fixture) -> PathBuf {
+        command(&f.repo, &["switch", "develop"]);
+        let origin = f._temp.path().join("origin.git");
+        fs::create_dir(&origin).unwrap();
+        command(&origin, &["init", "--bare", "--quiet"]);
+        command(
+            &f.repo,
+            &["remote", "add", "origin", origin.to_str().unwrap()],
+        );
+        command(&f.repo, &["push", "origin", "develop"]);
+        command(&f.repo, &["fetch", "origin", "develop"]);
+        let checkout = f._temp.path().join("feature-checkout");
+        command(
+            &f.repo,
+            &[
+                "worktree",
+                "add",
+                checkout.to_str().unwrap(),
+                "feature/delivery-test",
+            ],
+        );
+        let mut delivery = read(&f.dir).unwrap();
+        delivery.feature_branch = Some("feature/delivery-test".into());
+        save(&f.dir, &delivery).unwrap();
+        checkout
+    }
+
+    fn bind_fixture_checkout(f: &Fixture, checkout: &Path) -> Result<(PathBuf, String)> {
+        let head = command(checkout, &["rev-parse", "HEAD"]);
+        bind_feature_checkout(
+            &f.dir,
+            &f.state,
+            checkout,
+            "feature/delivery-test",
+            &head,
+            "refs/remotes/origin/develop",
+            None,
+        )
     }
 
     struct Fixture {
@@ -2833,6 +3352,203 @@ mod tests {
                 state,
             }
         }
+    }
+
+    #[test]
+    fn separate_feature_checkout_integrates_without_touching_dirty_source() {
+        let f = Fixture::check_ready();
+        let source_head = command(&f.repo, &["rev-parse", "HEAD"]);
+        let feature_checkout = prepare_feature_checkout(&f);
+        fs::write(f.repo.join("human-note.txt"), "keep this\n").unwrap();
+        let first = bind_fixture_checkout(&f, &feature_checkout).unwrap();
+        let second = bind_fixture_checkout(&f, &feature_checkout).unwrap();
+        assert_eq!(first, second);
+        assert_eq!(first.1, "feature/delivery-test");
+        assert_eq!(
+            read(&f.dir).unwrap().feature_checkout,
+            Some(feature_checkout.clone())
+        );
+
+        let outcome = reconcile(&f.dir, &f.state, &[]).unwrap();
+        assert!(matches!(outcome, Outcome::Integrated { .. }), "{outcome:?}");
+        assert_eq!(
+            command(&feature_checkout, &["rev-parse", "HEAD"]),
+            f.implementation
+        );
+        assert_eq!(command(&f.repo, &["branch", "--show-current"]), "develop");
+        assert_eq!(command(&f.repo, &["rev-parse", "HEAD"]), source_head);
+        assert_eq!(
+            fs::read_to_string(f.repo.join("human-note.txt")).unwrap(),
+            "keep this\n"
+        );
+    }
+
+    #[test]
+    fn interrupted_checked_out_fast_forward_reconciles_exact_saved_evidence() {
+        let f = Fixture::check_ready();
+        let feature_checkout = prepare_feature_checkout(&f);
+        bind_fixture_checkout(&f, &feature_checkout).unwrap();
+        let old = command(&feature_checkout, &["rev-parse", "HEAD"]);
+        let mut delivery = read(&f.dir).unwrap();
+        delivery.tickets.insert(
+            "run-00000000000000000001".into(),
+            TicketDelivery {
+                issue: 15,
+                reviewed_commit: Some(f.implementation.clone()),
+                candidate_commit: Some(f.implementation.clone()),
+                candidate_base: Some(old.clone()),
+                review: Some(ReviewSummary {
+                    commit: f.implementation.clone(),
+                    summary: "exact independent approval".into(),
+                    unresolved_findings: vec![],
+                    known_limitations: vec![],
+                }),
+                checks: vec![CheckEvidence {
+                    commit: f.implementation.clone(),
+                    command: "cargo test --locked".into(),
+                    result: "passed (exit 0)".into(),
+                }],
+                ..TicketDelivery::default()
+            },
+        );
+        save(&f.dir, &delivery).unwrap();
+        command(
+            &feature_checkout,
+            &["merge", "--ff-only", &f.implementation],
+        );
+
+        let outcome = reconcile(&f.dir, &f.state, &[]).unwrap();
+        assert!(matches!(outcome, Outcome::Integrated { .. }), "{outcome:?}");
+        let recovered = read(&f.dir).unwrap();
+        assert_eq!(
+            recovered.feature_head.as_deref(),
+            Some(f.implementation.as_str())
+        );
+        assert_eq!(
+            recovered.tickets["run-00000000000000000001"]
+                .integrated_commit
+                .as_deref(),
+            Some(f.implementation.as_str())
+        );
+        assert_eq!(command(&f.repo, &["branch", "--show-current"]), "develop");
+    }
+
+    #[test]
+    fn interrupted_target_update_reconciles_only_its_exact_head() {
+        let f = Fixture::build(false, false, false, false);
+        let feature_checkout = prepare_feature_checkout(&f);
+        bind_fixture_checkout(&f, &feature_checkout).unwrap();
+        let old = command(&feature_checkout, &["rev-parse", "HEAD"]);
+        let target = command(&f._temp.path().join("target"), &["rev-parse", "HEAD"]);
+        let mut delivery = read(&f.dir).unwrap();
+        delivery.feature_target_update = Some(FeatureTargetUpdate {
+            old_head: old,
+            new_head: target.clone(),
+            base_commit: command(&f.repo, &["rev-parse", "develop"]),
+        });
+        save(&f.dir, &delivery).unwrap();
+        command(&feature_checkout, &["merge", "--ff-only", &target]);
+        reconcile_feature_target_update(&f.dir, &mut delivery, &f.repo).unwrap();
+        assert_eq!(delivery.feature_head.as_deref(), Some(target.as_str()));
+        assert!(delivery.feature_target_update.is_none());
+        assert_eq!(command(&f.repo, &["branch", "--show-current"]), "develop");
+    }
+
+    #[test]
+    fn binding_rejects_dirty_or_changed_feature_checkout() {
+        let f = Fixture::build(false, false, false, false);
+        let feature_checkout = prepare_feature_checkout(&f);
+        bind_fixture_checkout(&f, &feature_checkout).unwrap();
+        fs::write(feature_checkout.join("untracked.txt"), "do not overwrite\n").unwrap();
+        assert!(
+            bind_fixture_checkout(&f, &feature_checkout)
+                .unwrap_err()
+                .to_string()
+                .contains("local changes")
+        );
+        assert!(
+            delivery_checkout(&read(&f.dir).unwrap(), &f.repo)
+                .unwrap_err()
+                .to_string()
+                .contains("local changes")
+        );
+        fs::remove_file(feature_checkout.join("untracked.txt")).unwrap();
+        fs::write(
+            feature_checkout.join("external.txt"),
+            "clean external change\n",
+        )
+        .unwrap();
+        command(&feature_checkout, &["add", "external.txt"]);
+        command(
+            &feature_checkout,
+            &["commit", "--quiet", "-m", "external move"],
+        );
+        command(
+            &feature_checkout,
+            &["push", "origin", "feature/delivery-test"],
+        );
+        assert!(
+            delivery_checkout(&read(&f.dir).unwrap(), &f.repo)
+                .unwrap_err()
+                .to_string()
+                .contains("moved after binding")
+        );
+        assert!(
+            bind_fixture_checkout(&f, &feature_checkout)
+                .unwrap_err()
+                .to_string()
+                .contains("saved head/base changed")
+        );
+        command(&feature_checkout, &["switch", "--detach"]);
+        assert!(
+            delivery_checkout(&read(&f.dir).unwrap(), &f.repo)
+                .unwrap_err()
+                .to_string()
+                .contains("detached")
+        );
+    }
+
+    #[test]
+    fn saved_feature_base_is_revalidated_after_restart() {
+        let f = Fixture::build(false, false, false, false);
+        let feature_checkout = prepare_feature_checkout(&f);
+        bind_fixture_checkout(&f, &feature_checkout).unwrap();
+        let mut saved = read(&f.dir).unwrap();
+        saved.feature_base_commit = Some(f.implementation.clone());
+        save(&f.dir, &saved).unwrap();
+        let restarted = read(&f.dir).unwrap();
+        assert!(
+            delivery_checkout(&restarted, &f.repo)
+                .unwrap_err()
+                .to_string()
+                .contains("saved delivery base")
+        );
+    }
+
+    #[test]
+    fn unbound_integration_refuses_branch_checked_out_elsewhere() {
+        let f = Fixture::build(false, false, false, false);
+        command(&f.repo, &["switch", "develop"]);
+        let feature_checkout = f._temp.path().join("feature-checkout");
+        command(
+            &f.repo,
+            &[
+                "worktree",
+                "add",
+                feature_checkout.to_str().unwrap(),
+                "feature/delivery-test",
+            ],
+        );
+        let head = command(&feature_checkout, &["rev-parse", "HEAD"]);
+        let error = advance_feature_branch(
+            &f.repo,
+            "refs/heads/feature/delivery-test",
+            &f.implementation,
+            &head,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("bind that checkout"));
+        assert_eq!(command(&feature_checkout, &["rev-parse", "HEAD"]), head);
     }
 
     #[test]

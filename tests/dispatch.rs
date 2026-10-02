@@ -43,7 +43,7 @@ def child(number=13):
     label='wayfinder:task' if number == 13 else 'wayfinder:research'
     return {'id':number*100,'number':number,'title':f'Implement sample task {number}','html_url':f'https://github.com/example/project/issues/{number}','body':'Implement the requested feature.','state':'open','assignees':([{'login':state['login']}] if assigned else []),'labels':[{'name':label}]}
 def map_issue():
-    return {'id':4200,'number':42,'title':'Map','body':'## Notes\n\nExecution override: selected by the user for this effort.','state':'open','assignees':[],'labels':[{'name':'wayfinder:map'}]}
+    return {'id':4200,'number':42,'title':'Map','body':state.get('map_body','## Notes\n\nExecution override: selected by the user for this effort.'),'state':'open','assignees':[],'labels':[{'name':'wayfinder:map'}]}
 if path == 'user': dump({'login':state['login']})
 elif '--paginate' in args:
     route=path.split('?')[0]
@@ -51,6 +51,7 @@ elif '--paginate' in args:
     elif '/dependencies/blocked_by' in route:
         ticket=int(route.split('/')[-3])
         page=[child(number) for number in state.get('blockers',{}).get(str(ticket),[])]
+    elif route.endswith('/issues/42/comments'): page=state.get('comments', [])
     else: page=[]
     dump([page])
 elif '--method' in args:
@@ -72,6 +73,13 @@ elif '--method' in args:
             with open(state_path,'w') as f: json.dump(state,f)
             sys.stderr.write('simulated lost GitHub claim response\n'); sys.exit(1)
         dump({'assignees':[{'login':state['login']}]})
+    elif route.endswith('/issues/42/comments'):
+        comment={'id':len(state.setdefault('comments',[]))+1,'body':body['body']}
+        state['comments'].append(comment)
+        with open(state_path,'w') as f: json.dump(state,f)
+        if state.get('lose_comment_ack'):
+            sys.stderr.write('simulated lost comment acknowledgement\n'); sys.exit(1)
+        dump(comment)
     else: dump({})
 elif path.endswith('/issues/42'): dump(map_issue())
 elif path.endswith('/issues/13'):
@@ -372,6 +380,192 @@ fn record_pending_worker_question(f: &Fixture) -> store::State {
 }
 
 #[test]
+fn existing_map_authorization_requires_the_pinned_chat_and_reuses_comment_and_start() {
+    let f = Fixture::new();
+    let mut github = serde_json::from_slice::<Value>(&fs::read(&f.gh_state).unwrap()).unwrap();
+    github["map_body"] = json!("## Notes\n\nPlanning only.");
+    github["lose_comment_ack"] = json!(true);
+    fs::write(&f.gh_state, serde_json::to_vec(&github).unwrap()).unwrap();
+    success(f.chat());
+    let binding = f.state().orchestrator.unwrap();
+    f.herdr_state.lock().unwrap().sessions.insert(
+        binding.pane_id.clone(),
+        json!({"source":"herdr:codex","agent":"codex","kind":"id","value":"conversation-after-compaction"}),
+    );
+    let instruction = "Authorize delivery of this named map through a ready PR.";
+    let displayed_map = "Example/project#42";
+    let authorize = || {
+        let mut command = f.cli();
+        command
+            .args([
+                "authorize-existing",
+                "--map",
+                displayed_map,
+                "--instruction",
+                instruction,
+            ])
+            .env("HERDR_ENV", "1")
+            .env("HERDR_PANE_ID", &binding.pane_id)
+            .env("HERDR_SOCKET_PATH", &f.state().binding.socket);
+        command.output().unwrap()
+    };
+
+    let unverified = f
+        .cli()
+        .args([
+            "authorize-existing",
+            "--map",
+            MAP,
+            "--instruction",
+            instruction,
+        ])
+        .env_remove("HERDR_ENV")
+        .output()
+        .unwrap();
+    assert!(!unverified.status.success());
+    assert!(!f.dir.join("authorization/existing-map.json").exists());
+
+    let changed_session = authorize();
+    assert!(!changed_session.status.success());
+    assert!(String::from_utf8_lossy(&changed_session.stderr).contains("session identity changed"));
+    assert!(!f.dir.join("authorization/existing-map.json").exists());
+    f.herdr_state.lock().unwrap().sessions.insert(
+        binding.pane_id.clone(),
+        serde_json::to_value(binding.session.clone().unwrap()).unwrap(),
+    );
+
+    success(authorize());
+    success(authorize());
+    let github = serde_json::from_slice::<Value>(&fs::read(&f.gh_state).unwrap()).unwrap();
+    assert_eq!(github["comments"].as_array().unwrap().len(), 1);
+    assert!(
+        github["comments"][0]["body"]
+            .as_str()
+            .unwrap()
+            .contains("body refresh pending for a human")
+    );
+    let receipt = serde_json::from_slice::<Value>(
+        &fs::read(f.dir.join("authorization/existing-map.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(receipt["map"], MAP);
+    assert_eq!(receipt["map_repository"], "Example/project");
+    assert_eq!(receipt["instruction"], instruction);
+    assert_eq!(
+        receipt["source_session"]["value"],
+        "conversation-orchestrator-pane"
+    );
+    assert_eq!(receipt["comment_verified"], true);
+    let starts = fs::read_dir(f.dir.join("inbox"))
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .filter(|path| {
+            serde_json::from_slice::<Value>(&fs::read(path).unwrap()).unwrap()["command"]
+                == "authorized_start"
+        })
+        .count();
+    assert_eq!(starts, 1);
+    assert_eq!(f.state().authorization, Authorization::AwaitingStart);
+    success(f.once());
+    assert_eq!(f.state().authorization, Authorization::Started);
+    assert!(!f.state().suspension.contains("execution override"));
+}
+
+#[test]
+fn existing_map_authorization_preserves_an_explicit_pause() {
+    let f = Fixture::new();
+    let mut github = serde_json::from_slice::<Value>(&fs::read(&f.gh_state).unwrap()).unwrap();
+    github["map_body"] = json!("## Notes\n\nPlanning only.");
+    fs::write(&f.gh_state, serde_json::to_vec(&github).unwrap()).unwrap();
+    success(f.chat());
+    f.apply(RequestKind::Pause);
+    let binding = f.state().orchestrator.unwrap();
+    success(
+        f.cli()
+            .args([
+                "authorize-existing",
+                "--map",
+                MAP,
+                "--instruction",
+                "Deliver this named map.",
+            ])
+            .env("HERDR_ENV", "1")
+            .env("HERDR_PANE_ID", &binding.pane_id)
+            .env("HERDR_SOCKET_PATH", &f.state().binding.socket)
+            .output()
+            .unwrap(),
+    );
+    assert_eq!(f.state().authorization, Authorization::Paused);
+    assert!(store::start_recorded_or_pending(&f.dir, &f.state()).unwrap());
+    success(f.once());
+    assert_eq!(f.state().authorization, Authorization::Paused);
+    f.apply(RequestKind::Resume);
+    assert_eq!(f.state().authorization, Authorization::Started);
+}
+
+#[test]
+fn pending_pause_precedes_authorization_start_without_reopening_dispatch() {
+    let f = Fixture::new();
+    let mut github = serde_json::from_slice::<Value>(&fs::read(&f.gh_state).unwrap()).unwrap();
+    github["map_body"] = json!("## Notes\n\nPlanning only.");
+    fs::write(&f.gh_state, serde_json::to_vec(&github).unwrap()).unwrap();
+    success(f.chat());
+    store::enqueue(&f.dir, RequestKind::Pause).unwrap();
+    let binding = f.state().orchestrator.unwrap();
+    success(
+        f.cli()
+            .args([
+                "authorize-existing",
+                "--map",
+                MAP,
+                "--instruction",
+                "Deliver this named map.",
+            ])
+            .env("HERDR_ENV", "1")
+            .env("HERDR_PANE_ID", &binding.pane_id)
+            .env("HERDR_SOCKET_PATH", &f.state().binding.socket)
+            .output()
+            .unwrap(),
+    );
+    success(f.once());
+    assert_eq!(f.state().authorization, Authorization::Paused);
+    assert_eq!(
+        f.state()
+            .history
+            .iter()
+            .filter(|request| request.command == RequestKind::AuthorizedStart)
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn orchestrator_launch_retries_a_definitive_busy_shell_without_repeating_the_prompt() {
+    let f = Fixture::new();
+    f.herdr_state.lock().unwrap().fail_agent_start_with_busy = true;
+    success(f.chat());
+    let calls = f.herdr_state.lock().unwrap().requests.clone();
+    assert_eq!(
+        calls
+            .iter()
+            .filter(|call| call["method"] == "agent.start")
+            .count(),
+        2
+    );
+    assert_eq!(
+        calls
+            .iter()
+            .filter(|call| call["method"] == "agent.prompt")
+            .count(),
+        1
+    );
+    assert_eq!(
+        f.state().orchestrator.unwrap().status,
+        store::OrchestratorStatus::Running
+    );
+}
+
+#[test]
 fn late_orchestrator_session_is_pinned_for_the_same_process_before_chat_delivery() {
     let f = Fixture::new();
     f.herdr_state.lock().unwrap().hide_session_reads = 1;
@@ -404,6 +598,7 @@ fn process_replacement_after_initial_prompt_does_not_pin_its_session() {
     {
         let mut herdr = f.herdr_state.lock().unwrap();
         herdr.process_info_sequence = vec![
+            (std::process::id(), "bash".into()),
             (std::process::id(), "codex".into()),
             (replacement.id(), "codex".into()),
         ];
@@ -536,6 +731,20 @@ fn changed_pinned_orchestrator_session_is_held_without_overwriting_identity() {
     );
 }
 
+#[test]
+fn changed_chat_session_holds_new_worker_dispatch_after_start() {
+    let f = Fixture::new();
+    success(f.chat());
+    f.herdr_state.lock().unwrap().sessions.insert(
+        "orchestrator-pane".into(),
+        json!({"source":"fixture","agent":"codex","kind":"id","value":"different-conversation"}),
+    );
+    f.apply(RequestKind::Start);
+    assert!(f.state().workers.runs.is_empty());
+    assert!(f.state().suspension.contains("dispatch held"));
+    assert!(f.state().suspension.contains("session identity changed"));
+}
+
 fn handle_request(mut stream: std::os::unix::net::UnixStream, state: &Arc<Mutex<HerdrState>>) {
     let mut line = String::new();
     if BufReader::new(&stream).read_line(&mut line).is_err() {
@@ -553,7 +762,7 @@ fn handle_request(mut stream: std::os::unix::net::UnixStream, state: &Arc<Mutex<
             if pane == "origin-pane" {
                 result = json!({"type":"pane_info","pane":{"pane_id":"origin-pane","workspace_id":"origin-workspace","tab_id":"origin-tab","terminal_id":"origin-terminal","agent_status":"working"}});
             } else if let Some(chat) = state.chat_panes.get(pane) {
-                result = json!({"type":"pane_info","pane":{"pane_id":chat.pane,"workspace_id":chat.workspace,"tab_id":chat.tab,"terminal_id":chat.terminal,"agent_status":"idle"}});
+                result = json!({"type":"pane_info","pane":{"pane_id":chat.pane,"workspace_id":chat.workspace,"tab_id":chat.tab,"terminal_id":chat.terminal,"cwd":chat.path,"agent_status":"idle"}});
             } else if let Some(tree) = state.opened_worktrees.iter().find(|tree| tree.pane == pane)
             {
                 result = json!({"type":"pane_info","pane":{"pane_id":tree.pane,"workspace_id":tree.workspace,"tab_id":tree.tab,"terminal_id":tree.terminal,"cwd":tree.path,"agent_status":"unknown"}});

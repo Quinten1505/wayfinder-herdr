@@ -13,7 +13,7 @@ flowchart TD
     Install[Install plugin] --> Attach[Attach repository workspace and GitHub map]
     Attach --> Chat[Open Wayfinder orchestrator chat]
     Chat --> Plan[Clarify destination, decisions, and dependencies]
-    Plan --> Gate{Execution override in map Notes<br/>and explicit Start?}
+    Plan --> Gate{Map Notes override or verified existing-map receipt<br/>and explicit Start?}
     Gate -->|No| Plan
     Gate -->|Yes| Frontier[Dispatch open, unassigned, unblocked tickets]
     Frontier --> Research[Research worker captures findings]
@@ -30,7 +30,7 @@ flowchart TD
     Merge --> Cleanup[Remove eligible clean, merged worktrees]
 ```
 
-Planning is the default. **Installing, attaching, or opening Chat does not authorize workers.** Dispatch requires both an execution override in the map's `## Notes` and an explicit Start. Research dispatch also uses this gate.
+Planning is the default. **Installing, attaching, or opening Chat does not authorize workers.** Dispatch requires an explicit Start and either an execution override in the map's `## Notes` or a verified, map-scoped existing-map receipt. Research dispatch uses the same gate. In an already attached map, the verified orchestrator may run `authorize-existing --map OWNER/REPOSITORY#NUMBER --instruction 'exact human response'` after the human explicitly authorizes delivery of that named map. The command records a durable receipt, reconciles one append-only GitHub map comment, and queues Start once; it preserves Pause and never edits the map body.
 
 Jump to [startup](#start-using-wayfinder), [skills and agents](#skills-and-agents), [ticket pairs and integration](#when-ticket-pairs-start-and-how-work-is-integrated), [daily use](#daily-use-and-human-questions), or [recovery](#worker-controls-and-recovery).
 
@@ -315,7 +315,7 @@ The orchestrator can record a resolution with the following command after the ac
   --resolution "Actual resolution and links to its evidence"
 ```
 
-Planning operations, including ticket creation, dependencies, frontier reads, and decision resolution, do not require the execution override. Claims are GitHub assignments and require an affirmative execution override in the map Notes. Any existing assignment is a claim. A reassignment or closure racing with a claim makes its durable local intent uncertain; the command fails and preserves all GitHub assignments. To recover, `tracker reconcile-claim` reads the current issue, map membership, assignees, and blockers; it clears the uncertain hold only when GitHub proves the ticket is still open, unblocked, and assigned exclusively to the requested user. It never assigns or reassigns. Foreign, empty, closed, blocked, or unreadable states remain uncertain for later inspection. After confirming that no previous worker is active, the human can use `retry-worker --confirmed-absent-or-stopped`; this records a separate retry intent and the runtime reuses the proven assignment. On resolution, the orchestrator posts a named decision pointer comment on the map and a proposed specification delta comment on the spec. Both say **body refresh pending for a human**; automation never patches existing map/spec bodies. Stable operation markers let retries find comments after ambiguous writes without duplicating them. This follows the human decision in [How should map updates handle non-atomic GitHub body writes?](https://github.com/Quinten1505/wayfinder-herdr/issues/18#issuecomment-5931910902).
+Planning operations, including ticket creation, dependencies, frontier reads, and decision resolution, do not require the execution override. Claims are GitHub assignments and require either an affirmative execution override in the map Notes or a verified existing-map receipt. Any existing assignment is a claim. A reassignment or closure racing with a claim makes its durable local intent uncertain; the command fails and preserves all GitHub assignments. To recover, `tracker reconcile-claim` reads the current issue, map membership, assignees, and blockers; it clears the uncertain hold only when GitHub proves the ticket is still open, unblocked, and assigned exclusively to the requested user. It never assigns or reassigns. Foreign, empty, closed, blocked, or unreadable states remain uncertain for later inspection. After confirming that no previous worker is active, the human can use `retry-worker --confirmed-absent-or-stopped`; this records a separate retry intent and the runtime reuses the proven assignment. On resolution, the orchestrator posts a named decision pointer comment on the map and a proposed specification delta comment on the spec. Both say **body refresh pending for a human**; automation never patches existing map/spec bodies. Stable operation markers let retries find comments after ambiguous writes without duplicating them. This follows the human decision in [How should map updates handle non-atomic GitHub body writes?](https://github.com/Quinten1505/wayfinder-herdr/issues/18#issuecomment-5931910902).
 
 ## State, restart, and upgrades
 

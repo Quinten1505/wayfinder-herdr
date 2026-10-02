@@ -24,6 +24,24 @@ def atomic_copy(source, destination):
         temporary_path.unlink(missing_ok=True)
 
 
+def link_public_command(private_command, public_command):
+    public_command.parent.mkdir(parents=True, exist_ok=True)
+    check_public_command(private_command, public_command)
+    if public_command.is_symlink():
+        return
+    staged = public_command.with_name(public_command.name + '.new')
+    if staged.exists() or staged.is_symlink():
+        raise RuntimeError(f'Cannot install Wayfinder command: {staged} already exists.')
+    staged.symlink_to(private_command)
+    os.replace(staged, public_command)
+
+
+def check_public_command(private_command, public_command):
+    if public_command.exists() or public_command.is_symlink():
+        if not public_command.is_symlink() or public_command.resolve() != private_command:
+            raise RuntimeError(f'{public_command} already exists and is not this Wayfinder installation.')
+
+
 def unit_quote(value, expand_environment=True):
     # systemd specifiers and ExecStart environment expansion are independent.
     if '\n' in str(value) or '\r' in str(value):
@@ -43,6 +61,9 @@ def main():
     config = Path(os.environ.get('XDG_CONFIG_HOME', Path.home() / '.config')).resolve()
     state = Path(os.environ.get('XDG_STATE_HOME', Path.home() / '.local/state')).resolve() / 'wayfinder-herdr'
     install = Path(os.environ.get('WAYFINDER_INSTALL_DIR', Path.home() / '.local/lib/wayfinder-herdr')).resolve()
+    public_bin = Path(os.environ.get('WAYFINDER_BIN_DIR', Path.home() / '.local/bin')).resolve()
+    if public_bin != install / 'bin':
+        check_public_command(install / 'bin/wayfinder', public_bin / 'wayfinder')
     # Refuse a downgrade before replacing any installed artifact.
     for path in sorted((state / 'maps').glob('*/state.json')):
         if json.loads(path.read_text()).get('format_version') != 1:
@@ -57,7 +78,10 @@ def main():
     metadata = json.loads(run('cargo', 'metadata', '--format-version', '1', '--no-deps', '--locked', cwd=source, capture_output=True).stdout)
     binary = Path(metadata['target_directory']) / 'release/wayfinder-herdr'
     atomic_copy(binary, install / 'bin/wayfinder-herdr')
+    atomic_copy(source / 'scripts/wayfinder.py', install / 'bin/wayfinder')
     atomic_copy(source / 'herdr-plugin.toml', install / 'herdr-plugin.toml')
+    if public_bin != install / 'bin':
+        link_public_command(install / 'bin/wayfinder', public_bin / 'wayfinder')
     unit = config / 'systemd/user/wayfinder-herdr@.service'
     unit.parent.mkdir(parents=True, exist_ok=True)
     text = '\n'.join([
@@ -80,7 +104,7 @@ def main():
         staged.unlink(missing_ok=True)
     run('systemctl', '--user', 'daemon-reload')
     run('herdr', 'plugin', 'link', str(install), '--enabled')
-    print(f'Installed {install}\nService template: {unit}\nNo map started. Attach a map and explicitly Start when ready.')
+    print(f'Installed {install}\nWayfinder command: {public_bin / "wayfinder"}\nService template: {unit}\nNo map started. Attach a map and explicitly Start when ready.')
 
 
 if __name__ == '__main__':

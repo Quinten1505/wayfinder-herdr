@@ -2,6 +2,7 @@ use anyhow::{Context, Result, ensure};
 use clap::{Parser, Subcommand};
 use std::{env, fs, path::PathBuf, process::Command};
 use wayfinder_herdr::{
+    delivery,
     herdr::Client,
     orchestration, runtime,
     store::{
@@ -48,6 +49,33 @@ enum CommandName {
     Start {
         #[arg(long)]
         map: String,
+    },
+    /// Reconcile one explicit human delivery instruction from this map's verified chat.
+    AuthorizeExisting {
+        #[arg(long)]
+        map: String,
+        /// Exact human instruction as given in the orchestrator chat.
+        #[arg(long)]
+        instruction: String,
+    },
+    /// Verify and bind a separate checked-out feature branch for delivery.
+    BindFeatureCheckout {
+        #[arg(long)]
+        map: String,
+        #[arg(long)]
+        checkout: PathBuf,
+        /// Exact feature branch selected for this map.
+        #[arg(long)]
+        branch: String,
+        /// Exact feature commit expected before binding.
+        #[arg(long)]
+        head: String,
+        /// Explicit Git ref whose current commit is the saved delivery base.
+        #[arg(long)]
+        base_ref: String,
+        /// Existing draft PR proving this map's first branch selection.
+        #[arg(long)]
+        source_pr: Option<u64>,
     },
     Pause {
         #[arg(long)]
@@ -366,6 +394,33 @@ fn run() -> Result<()> {
             }
         }
         CommandName::Start { map } => request(&root, &map, RequestKind::Start)?,
+        CommandName::AuthorizeExisting { map, instruction } => {
+            let map = MapRef::parse(&map)?;
+            let outcome =
+                tracker::GitHub::default().authorize_existing_map(&root, &map, &instruction)?;
+            println!("{outcome}");
+        }
+        CommandName::BindFeatureCheckout {
+            map,
+            checkout,
+            branch,
+            head,
+            base_ref,
+            source_pr,
+        } => {
+            let (_, key) = store::map_identity(&map)?;
+            let dir = store::map_dir(&root, &key)?;
+            let state =
+                store::read_state(&dir).context("attach this map before binding delivery")?;
+            ensure!(state.map == map, "map binding differs from the named map");
+            let (checkout, branch) = delivery::bind_feature_checkout(
+                &dir, &state, &checkout, &branch, &head, &base_ref, source_pr,
+            )?;
+            println!(
+                "Feature delivery checkout: {} ({branch})",
+                checkout.display()
+            );
+        }
         CommandName::Pause { map } => request(&root, &map, RequestKind::Pause)?,
         CommandName::Resume { map } => request(&root, &map, RequestKind::Resume)?,
         CommandName::Status { map } => {

@@ -330,12 +330,37 @@ fn launch_chat(mut state: State, launch: ChatLaunch<'_>) -> Result<()> {
         chat.terminal_id = pane["terminal_id"].as_str().map(str::to_owned);
     }
     store::atomic_json(&dir.join("state.json"), &state)?;
-    let started = match client.start_agent(
-        &orchestrator_agent_name(key),
-        &provider.kind,
-        pane_id,
-        &args,
-    ) {
+    let shell =
+        wait_for_empty_orchestrator_shell(client, pane_id, &context, pane["terminal_id"].as_str())?;
+    let mut attempts = 0;
+    let started = match loop {
+        attempts += 1;
+        match client.start_agent(
+            &orchestrator_agent_name(key, pane_id),
+            &provider.kind,
+            pane_id,
+            &args,
+        ) {
+            Ok(started) => break Ok(started),
+            Err(error) => {
+                let explicit_busy = error
+                    .downcast_ref::<HerdrApiError>()
+                    .is_some_and(HerdrApiError::is_agent_pane_busy);
+                let same_shell = empty_orchestrator_shell(
+                    client,
+                    pane_id,
+                    &context,
+                    pane["terminal_id"].as_str(),
+                )
+                .is_ok_and(|observed| observed.as_ref() == Some(&shell));
+                if explicit_busy && same_shell && attempts < 10 {
+                    thread::sleep(Duration::from_millis(100));
+                    continue;
+                }
+                break Err(error);
+            }
+        }
+    } {
         Ok(result) => result,
         Err(error) => {
             state.orchestrator.as_mut().unwrap().status = OrchestratorStatus::Uncertain;
@@ -427,8 +452,75 @@ fn launch_chat(mut state: State, launch: ChatLaunch<'_>) -> Result<()> {
     Ok(())
 }
 
-fn orchestrator_agent_name(map_key: &str) -> String {
-    format!("wf-orch-{}", &map_key[..24])
+fn orchestrator_agent_name(map_key: &str, pane_id: &str) -> String {
+    let digest = Sha256::digest(pane_id.as_bytes());
+    format!(
+        "wf-orch-{}-{}",
+        &map_key[..12],
+        digest[..5]
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>()
+    )
+}
+
+fn empty_orchestrator_shell(
+    client: &Client,
+    pane_id: &str,
+    context: &ActionContext,
+    expected_terminal: Option<&str>,
+) -> Result<Option<(String, store::LinuxProcessIdentity)>> {
+    match client.agent(pane_id) {
+        Err(error)
+            if error
+                .downcast_ref::<HerdrApiError>()
+                .is_some_and(HerdrApiError::is_agent_not_found) => {}
+        Ok(_) => return Ok(None),
+        Err(error) => return Err(error).context("inspect empty orchestrator pane"),
+    }
+    let pane = client.pane(pane_id)?;
+    let pane = &pane["pane"];
+    ensure!(
+        pane["pane_id"].as_str() == Some(pane_id)
+            && pane["workspace_id"].as_str() == Some(context.workspace_id.as_str())
+            && pane["tab_id"].as_str() == Some(context.tab_id.as_str()),
+        "orchestrator pane identity changed before agent.start"
+    );
+    let terminal = required(pane, "terminal_id")?.to_owned();
+    ensure!(
+        Some(terminal.as_str()) == expected_terminal,
+        "orchestrator terminal changed before agent.start"
+    );
+    let cwd = context
+        .cwd
+        .to_str()
+        .context("orchestrator repository path is not UTF-8")?;
+    ensure!(
+        pane["cwd"].as_str() == Some(cwd),
+        "orchestrator pane changed checkout before agent.start"
+    );
+    let process =
+        crate::herdr::capture_shell_process(&client.pane_process_info(pane_id)?, pane_id, cwd)?;
+    Ok(Some((terminal, process)))
+}
+
+fn wait_for_empty_orchestrator_shell(
+    client: &Client,
+    pane_id: &str,
+    context: &ActionContext,
+    expected_terminal: Option<&str>,
+) -> Result<(String, store::LinuxProcessIdentity)> {
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        match empty_orchestrator_shell(client, pane_id, context, expected_terminal) {
+            Ok(Some(shell)) => return Ok(shell),
+            Ok(None) => bail!("new orchestrator pane acquired an agent before agent.start"),
+            Err(error) if Instant::now() >= deadline => {
+                return Err(error).context("wait for the new orchestrator shell");
+            }
+            Err(_) => thread::sleep(Duration::from_millis(50)),
+        }
+    }
 }
 
 fn wait_for_orchestrator_identity(
@@ -1318,6 +1410,32 @@ fn verify_orchestrator(client: &Client, binding: &OrchestratorBinding) -> Result
     Ok(observed)
 }
 
+/// Pin a human instruction relayed by this exact, currently running chat.
+/// The agent still has to preserve what the human said; Herdr proves which
+/// orchestrator relayed it, not the semantics of the words.
+pub fn verified_caller_session(state: &State) -> Result<store::AgentSessionIdentity> {
+    let binding = state
+        .orchestrator
+        .as_ref()
+        .context("this map has no attached orchestrator chat")?;
+    ensure!(
+        binding.status == OrchestratorStatus::Running,
+        "the orchestrator chat is not running"
+    );
+    ensure!(
+        env::var("HERDR_ENV").as_deref() == Ok("1")
+            && env::var("HERDR_PANE_ID").as_deref() == Ok(binding.pane_id.as_str())
+            && env::var_os("HERDR_SOCKET_PATH").as_deref()
+                == Some(state.binding.socket.as_os_str()),
+        "authorization must be relayed from this map's verified orchestrator pane"
+    );
+    verify_orchestrator(&Client::new(&state.binding.socket), binding)?;
+    binding
+        .session
+        .clone()
+        .context("the orchestrator has no pinned agent session identity")
+}
+
 fn verify_orchestrator_observation(
     client: &Client,
     binding: &OrchestratorBinding,
@@ -1429,7 +1547,7 @@ fn initial_prompt(
     effort: Option<&str>,
 ) -> String {
     format!(
-        "You are the one human-facing Wayfinder orchestrator chat for map {map} at https://github.com/{}/issues/{}.\n\nFirst load and follow the Wayfinder skill at `$HOME/.agents/skills/wayfinder/SKILL.md`. Read AGENTS.md and docs/agents/issue-tracker.md. Inspect the canonical map and linked spec with `gh issue view NUMBER --repo OWNER/REPO --json title,body,comments`; include comments and use them to determine accepted scope and decisions. GitHub Issues is canonical. Never use a worker response as a human answer.\n\nWayfinding is planning by default. Opening this chat does not grant execution authorization. Inspect the accepted map Notes for an explicit execution override, and follow its actual value; do not claim or assume that it exists. Even when a map has an execution override, worker dispatch also requires Wayfinder's durable explicit Start and an unpaused runtime. Never start workers or claim execution is authorized unless the accepted map authorization and runtime state both permit it.\n\nFollow the map and specification. Give brief milestone summaries in this chat while detailed worker/reviewer output stays in their Herdr panes. Group independent pending human questions into a round, provide grounded recommendations, name the linked work each answer unblocks, and continue unaffected work. Never answer for the human. Wait for the human to respond naturally in this chat. For a `worker_question`, only after a genuine human response, invoke the attached Wayfinder binary with `--state-dir {state_root} answer-worker --map {map} --run RUN --request-id REQUEST_ID --request-type worker_question --response RESPONSE`, preserving the exact response and request correlation. The durable state root is `{state_root}`; this Wayfinder executable is `{binary}`. For `herdr_blocked_ui`, preserve the accepted manual path: have the human inspect and interact directly with the named pane, and never send raw pane input.\n\nWorker controls require actual human intent. `pause --map {map}` prevents future dispatch but does not stop active workers. Use `stop-worker --map {map} --run RUN` only after a clear human stop request; claims and artifacts remain retained. `retry-worker --map {map} --run RUN` resumes a confirmed stopped or failed attempt; for uncertain or human-blocked work, first inspect status and the named pane, then require the human to confirm the prior worker is absent or stopped and pass `--confirmed-absent-or-stopped`. Never retry a running or stop-requested worker. `abandon-worker --map {map} --run RUN` requires a clear human decision and applies only to retained or settled work; it records abandonment without proving termination, releasing uncertain capacity, or deleting artifacts. The human controls merges. To operate controls, use the same executable: `start --map {map}` only after explicit human authorization, `resume --map {map}`, and `status --map {map}`.\n\nIf an interrupted orchestrator launch is in PaneIntent, AgentIntent without saved session identity, PromptIntent, or Uncertain, never repeat pane creation, agent start, or prompt automatically. Tell the human to inspect Herdr and confirm the old launch is absent or stop it manually. Only after both that confirmation and the human replacement decision, invoke Herdr's Recover Wayfinder chat action from the original repository workspace and session; the action carries the verified socket and source-pane context required by recovery. Recovery archives its prior binding and leaves all unknown/replacement panes untouched. For an acknowledged AgentIntent with a persisted session, Chat safely submits its not-yet-attempted initial prompt once. For PromptAccepted, Chat verifies the saved identity and reconnects without resubmitting it. A missing or changed Running identity still requires the human replacement decision; do not focus, stop, reuse, or send input to the old pane. For delivery uncertainty, `chat-outbox --map {map}` lists durable messages. After checking the old chat history, the human may run `resolve-chat-delivery --map {map} --message MESSAGE_ID --confirmed-delivered` or `--confirmed-not-delivered`; the latter permits one replay. Never replay an uncertain message without that explicit human decision.\n\nA scheduler-decision notice is not a worker question. Briefly frame the linked ticket title and the exhausted review/conflict choice. Ask the human to choose an explicit disposition: `continue` for one bounded rework, `defer` to keep the ticket held while freeing only proven-completed worker capacity, or `abandon` to retain artifacts without claiming unimplemented work is integrated or ready. Recommend using retained evidence, while detailed evidence stays in reviewer/worker panes. Wait for a real human response, preserve its exact text verbatim, and record that text separately from the human-selected disposition with `answer-decision --map {map} --request-id REQUEST_ID --response RESPONSE --disposition continue|defer|abandon`. Never infer an action from response text. Deferred and legacy response-only decisions remain visibly actionable until a typed action is applied. This command records locally and never sends input to a completed or stale worker.\n\nOrchestrator provider: {}{}{}. Use the existing attached runtime for status and controls. Do not create a second orchestrating chat.",
+        "You are the one human-facing Wayfinder orchestrator chat for map {map} at https://github.com/{}/issues/{}.\n\nFirst load and follow the Wayfinder skill at `$HOME/.agents/skills/wayfinder/SKILL.md`. Read AGENTS.md and docs/agents/issue-tracker.md. Inspect the canonical map and linked spec with `gh issue view NUMBER --repo OWNER/REPO --json title,body,comments`; include comments and use them to determine accepted scope and decisions. GitHub Issues is canonical. Never use a worker response as a human answer.\n\nWayfinding is planning by default. Opening this chat does not grant execution authorization. Inspect the accepted map Notes for an explicit execution override, and follow its actual value; do not claim or assume that it exists. For an already attached map without that Notes override, a genuine explicit instruction from the human for this named map may be recorded with `{binary} --state-dir {state_root} authorize-existing --map {map} --instruction RESPONSE`, preserving the exact response. This command verifies this chat, records a durable map-scoped receipt, reconciles its named GitHub comment, and queues one Start. Never derive that instruction from attachment, chat opening, a worker answer, or your own inference. Worker dispatch also requires Wayfinder's durable explicit Start and an unpaused runtime. Never start workers or claim execution is authorized unless the accepted map authorization and runtime state both permit it.\n\nFollow the map and specification. Give brief milestone summaries in this chat while detailed worker/reviewer output stays in their Herdr panes. Group independent pending human questions into a round, provide grounded recommendations, name the linked work each answer unblocks, and continue unaffected work. Never answer for the human. Wait for the human to respond naturally in this chat. For a `worker_question`, only after a genuine human response, invoke the attached Wayfinder binary with `--state-dir {state_root} answer-worker --map {map} --run RUN --request-id REQUEST_ID --request-type worker_question --response RESPONSE`, preserving the exact response and request correlation. The durable state root is `{state_root}`; this Wayfinder executable is `{binary}`. For `herdr_blocked_ui`, preserve the accepted manual path: have the human inspect and interact directly with the named pane, and never send raw pane input.\n\nWorker controls require actual human intent. `pause --map {map}` prevents future dispatch but does not stop active workers. Use `stop-worker --map {map} --run RUN` only after a clear human stop request; claims and artifacts remain retained. `retry-worker --map {map} --run RUN` resumes a confirmed stopped or failed attempt; for uncertain or human-blocked work, first inspect status and the named pane, then require the human to confirm the prior worker is absent or stopped and pass `--confirmed-absent-or-stopped`. Never retry a running or stop-requested worker. `abandon-worker --map {map} --run RUN` requires a clear human decision and applies only to retained or settled work; it records abandonment without proving termination, releasing uncertain capacity, or deleting artifacts. The human controls merges. To operate controls, use the same executable: `start --map {map}` only after explicit human authorization, `resume --map {map}`, and `status --map {map}`.\n\nIf an interrupted orchestrator launch is in PaneIntent, AgentIntent without saved session identity, PromptIntent, or Uncertain, never repeat pane creation, agent start, or prompt automatically. Tell the human to inspect Herdr and confirm the old launch is absent or stop it manually. Only after both that confirmation and the human replacement decision, invoke Herdr's Recover Wayfinder chat action from the original repository workspace and session; the action carries the verified socket and source-pane context required by recovery. Recovery archives its prior binding and leaves all unknown/replacement panes untouched. For an acknowledged AgentIntent with a persisted session, Chat safely submits its not-yet-attempted initial prompt once. For PromptAccepted, Chat verifies the saved identity and reconnects without resubmitting it. A missing or changed Running identity still requires the human replacement decision; do not focus, stop, reuse, or send input to the old pane. For delivery uncertainty, `chat-outbox --map {map}` lists durable messages. After checking the old chat history, the human may run `resolve-chat-delivery --map {map} --message MESSAGE_ID --confirmed-delivered` or `--confirmed-not-delivered`; the latter permits one replay. Never replay an uncertain message without that explicit human decision.\n\nA scheduler-decision notice is not a worker question. Briefly frame the linked ticket title and the exhausted review/conflict choice. Ask the human to choose an explicit disposition: `continue` for one bounded rework, `defer` to keep the ticket held while freeing only proven-completed worker capacity, or `abandon` to retain artifacts without claiming unimplemented work is integrated or ready. Recommend using retained evidence, while detailed evidence stays in reviewer/worker panes. Wait for a real human response, preserve its exact text verbatim, and record that text separately from the human-selected disposition with `answer-decision --map {map} --request-id REQUEST_ID --response RESPONSE --disposition continue|defer|abandon`. Never infer an action from response text. Deferred and legacy response-only decisions remain visibly actionable until a typed action is applied. This command records locally and never sends input to a completed or stale worker.\n\nOrchestrator provider: {}{}{}. Use the existing attached runtime for status and controls. Do not create a second orchestrating chat.",
         MapRef::parse(map)
             .map(|reference| format!("{}/{}", reference.owner, reference.repository))
             .unwrap_or_else(|_| "OWNER/REPO".into()),
@@ -1458,8 +1576,16 @@ mod tests {
     fn orchestrator_agent_name_fits_herdr_limit() {
         let name = orchestrator_agent_name(
             "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+            "w1:p3",
         );
-        assert_eq!(name, "wf-orch-0123456789abcdef01234567");
+        assert!(name.starts_with("wf-orch-0123456789ab-"));
+        assert_ne!(
+            name,
+            orchestrator_agent_name(
+                "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+                "w1:p4"
+            )
+        );
         assert!(name.len() <= 32);
         assert!(
             name.bytes()

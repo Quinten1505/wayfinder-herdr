@@ -43,6 +43,14 @@ title = "Recover Wayfinder chat (confirm any interrupted launch is stopped)"
 contexts = ["workspace"]
 command = ["./bin/wayfinder-herdr", "recover-chat", "--confirm-replacement", "--confirm-launch-absent-or-stopped"]
 
+[[panes]]
+id = "feature-input"
+title = "Start a Wayfinder feature"
+placement = "popup"
+width = "80%"
+height = 20
+command = ["./bin/wayfinder", "popup"]
+
 [[events]]
 on = "pane.agent_status_changed"
 command = ["./bin/wayfinder-herdr", "reconcile"]
