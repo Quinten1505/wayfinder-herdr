@@ -1,0 +1,54 @@
+{
+  "format_version": 1,
+  "reviewed_source_base": "9a48533fbe1427a26ca71925b48f7b66348e35c3",
+  "source_changes": [
+    "Newest named append-only canonical-spec pointer supersedes stale human-owned map body.",
+    "Tests retain ordinary-comment exclusion and body/pointer ambiguity rejection, and exercise readiness against a realistic map body/comment sequence.",
+    "Versioned live evidence records actual tracker-resolve lost-ack recovery, the owner-casing distinction, the completed AFK task, and corrected ready-unmerged PR4."
+  ],
+  "cargo_environment": {
+    "cargo_home": "/tmp/wayfinder-12-review-cargo-home",
+    "cargo_target_dir": "/tmp/wf16-acceptance/evidence/source-final-target"
+  },
+  "source_checks": [
+    {
+      "command": "cargo fmt --all -- --check",
+      "result": "passed"
+    },
+    {
+      "command": "cargo clippy --locked --all-targets -- -D warnings",
+      "result": "passed"
+    },
+    {
+      "command": "cargo test --locked --all-targets",
+      "sandbox_attempt": "blocked: dispatch fixtures could not create isolated Unix sockets (EPERM)",
+      "escalated_rerun": "passed: 131 tests (36 library, 72 dispatch, 12 runtime, 11 tracker)"
+    }
+  ],
+  "installer_smoke": {
+    "command": "WAYFINDER_INSTALL_DIR=/tmp/wf16-acceptance/install python3 tests/install_smoke.py",
+    "cargo_target_dir": "/tmp/wf16-acceptance/evidence/source-final-target",
+    "sandbox_attempt": "blocked: isolated herdr plugin link returned EPERM",
+    "escalated_rerun": "passed: isolated plugin link, systemd unit syntax, no map auto-start, unsupported-upgrade preservation checks",
+    "temporary_test_root": "/tmp/wayfinder-install-xfhdz85m",
+    "systemctl": "recording stub; this is installer smoke only, not proof of runtime supervision"
+  },
+  "real_runtime": {
+    "separate_supervision_evidence": "issue-16-round2-source-runtime-restart.json",
+    "source_binary_sha256": "e5065fb12110744ac421163a3b5ca3e8d13729fdcd188ce82c2b5ddcf88fd678",
+    "named_unit_restarted": true,
+    "same_active_run30_identity_preserved": true
+  },
+  "disposable_complete_feature": {
+    "commit": "3784c1e19dabc4a36efce25b6d8a1884d409dc4f",
+    "independent_review_run": "run-00000000000000000030",
+    "review": "approved complete feature; zero unresolved findings; zero known limitations",
+    "checks": "fmt, locked warnings-denied clippy, and all locked targets passed",
+    "pr": "https://github.com/Quinten1505/wayfinder-herdr-acceptance-20261001-issue16-7c4a/pull/4",
+    "pr_state": "open, ready, unmerged"
+  },
+  "limitations": [
+    "The injected tracker acknowledgement loss is deliberate acceptance fault injection and is not represented as an organic transport failure.",
+    "Installer smoke uses a recording systemctl stub; real supervision is evidenced separately by the isolated named user-service restart record."
+  ]
+}

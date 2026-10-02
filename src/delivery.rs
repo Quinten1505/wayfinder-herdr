@@ -3788,11 +3788,16 @@ else:
         );
         let evidence = temp.path().join("final-review.json");
         let review_base = command(&repo, &["rev-parse", "refs/remotes/origin/develop"]);
-        let map_body = "## Destination\n\nAcceptance: exact milli-unit quantity parsing\n\n## Notes\n\nDisposable end-to-end acceptance map.\n\n## Decisions so far\n\n## Not yet specified\n\n## Out of scope\n";
+        let map_body = "## Destination\n\nAcceptance: exact milli-unit quantity parsing\n\n**Canonical specification:** [Stale body link](https://github.com/Quinten1505/wayfinder-herdr-acceptance-20261001-issue16-7c4a/issues/10)\n\n## Notes\n\nDisposable end-to-end acceptance map.\n\n## Decisions so far\n\n## Not yet specified\n\n## Out of scope\n";
         let map_comments = vec!["### Canonical linked specification — body refresh pending for a human\n\n- [Draft spec: parser example format](https://github.com/Quinten1505/wayfinder-herdr-acceptance-20261001-issue16-7c4a/issues/5)\n\nThis named append-only pointer identifies the map's canonical linked specification. Refresh the map body manually when a human chooses to apply the link.\n\n<!-- issue16-live-canonical-spec:map-1:spec-5 -->".to_owned()];
         let canonical_spec = crate::tracker::canonical_spec_from_map_text(map_body, &map_comments)
             .unwrap()
             .unwrap();
+        assert_eq!(
+            canonical_spec,
+            "https://github.com/Quinten1505/wayfinder-herdr-acceptance-20261001-issue16-7c4a/issues/5",
+            "the accepted pointer governs over the intentionally stale body link"
+        );
         fs::write(
             &evidence,
             serde_json::to_vec(&json!({
@@ -3849,7 +3854,15 @@ else:
             )
             .is_err()
         );
-        let changed_comments = vec!["### Canonical linked specification — body refresh pending for a human\n\n- [Updated draft spec](https://github.com/Quinten1505/wayfinder-herdr-acceptance-20261001-issue16-7c4a/issues/6)\n\nThis named append-only pointer identifies the map's canonical linked specification. Refresh the map body manually when a human chooses to apply the link.\n\n<!-- issue16-live-canonical-spec:map-1:spec-6 -->".to_owned()];
+        assert!(
+            read(&state_dir).unwrap().ready_commit.is_none(),
+            "a complete-feature review scoped to the old pointer cannot ready the PR after a newer accepted pointer supersedes a stale map body"
+        );
+        let changed_comments = vec![
+            map_comments[0].clone(),
+            "### Canonical linked specification update — body refresh pending for a human\n\n- [Updated draft spec](https://github.com/Quinten1505/wayfinder-herdr-acceptance-20261001-issue16-7c4a/issues/6)\n\nThis newer named append-only pointer identifies the map's canonical linked specification. Refresh the map body manually when a human chooses to apply the link.\n\n<!-- issue16-live-canonical-spec:map-1:spec-6 -->".to_owned(),
+            "Ordinary comment: [an unrelated issue](https://github.com/Quinten1505/wayfinder-herdr-acceptance-20261001-issue16-7c4a/issues/12).".to_owned(),
+        ];
         let changed_spec =
             crate::tracker::canonical_spec_from_map_text(map_body, &changed_comments)
                 .unwrap()

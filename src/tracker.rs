@@ -245,9 +245,10 @@ impl GitHub {
         Ok(frontier)
     }
 
-    /// Resolve the map's canonical specification from its body declaration or
-    /// a specifically named append-only map comment. Other GitHub links (for
-    /// example decision tickets) do not count as specification links.
+    /// Resolve the map's canonical specification from its body declaration
+    /// and specifically named append-only map comments. The newest named
+    /// pointer governs while a human-owned body refresh is pending. Other
+    /// GitHub links (for example decision tickets) do not count as specification links.
     pub fn canonical_linked_spec_url(&self, map: &MapRef) -> Result<Option<String>> {
         let issue = self.issue(map, map.number)?;
         let body = issue["body"].as_str().context("map issue omitted body")?;
@@ -891,14 +892,12 @@ pub(crate) fn canonical_spec_from_map_text(
         body_links.len() <= 1,
         "map body declares more than one canonical linked specification"
     );
-    if let Some(body_link) = body_links.into_iter().next() {
-        return Ok(Some(body_link));
-    }
+    let mut canonical = body_links.into_iter().next();
 
-    // With issue18's append-only policy, a newer named pointer supersedes an
-    // older pointer. The comment stream is returned in creation order; body
-    // declarations, when manually refreshed, take precedence above.
-    let mut canonical = None;
+    // With issue18's append-only policy, a newer named pointer supersedes a
+    // stale human-owned body and older pointers. The caller orders comments
+    // in creation order; a manual body refresh will agree with the latest
+    // accepted pointer.
     for text in comments {
         let is_named_pointer = text.lines().any(|line| {
             line.trim_start()
@@ -1078,8 +1077,9 @@ mod tests {
         );
         assert_eq!(canonical_spec_from_map_text(body, &[]).unwrap(), None);
         let refreshed_body = "## Destination\n\n- Specification: [Refreshed spec](https://github.com/acme/project/issues/12).";
+        let refreshed_comments = vec!["### Canonical linked specification update — body refresh pending for a human\n\n- [Refreshed spec](https://github.com/acme/project/issues/12)\n\n<!-- marker -->".to_owned()];
         assert_eq!(
-            canonical_spec_from_map_text(refreshed_body, &comments)
+            canonical_spec_from_map_text(refreshed_body, &refreshed_comments)
                 .unwrap()
                 .as_deref(),
             Some("https://github.com/acme/project/issues/12")
@@ -1094,6 +1094,39 @@ mod tests {
                 .as_deref(),
             Some("https://github.com/acme/project/issues/11")
         );
+    }
+
+    #[test]
+    fn newest_named_spec_pointer_supersedes_stale_body_and_ordinary_links() {
+        let stale_body = "## Destination\n\n**Canonical specification:** [Old spec](https://github.com/acme/project/issues/10)";
+        let comments = vec![
+            "### Canonical linked specification — body refresh pending for a human\n\n[Previous spec](https://github.com/acme/project/issues/10)\n\n<!-- old-pointer -->".to_owned(),
+            "A ticket mentions [an unrelated issue](https://github.com/acme/project/issues/12).".to_owned(),
+            "### Canonical linked specification update — body refresh pending for a human\n\n[Accepted new spec](https://github.com/acme/project/issues/11)\n\n<!-- new-pointer -->".to_owned(),
+            "A later ordinary comment links [another issue](https://github.com/acme/project/issues/13).".to_owned(),
+        ];
+
+        assert_eq!(
+            canonical_spec_from_map_text(stale_body, &comments)
+                .unwrap()
+                .as_deref(),
+            Some("https://github.com/acme/project/issues/11")
+        );
+
+        let refreshed_body = "## Destination\n\n**Canonical specification:** [Accepted new spec](https://github.com/acme/project/issues/11)";
+        assert_eq!(
+            canonical_spec_from_map_text(refreshed_body, &comments)
+                .unwrap()
+                .as_deref(),
+            Some("https://github.com/acme/project/issues/11")
+        );
+
+        let ambiguous = vec![
+            "### Canonical linked specification update — body refresh pending for a human\n\n[First](https://github.com/acme/project/issues/11) [Second](https://github.com/acme/project/issues/14)".to_owned(),
+        ];
+        assert!(canonical_spec_from_map_text(stale_body, &ambiguous).is_err());
+        let ambiguous_body = "**Canonical specification:** [First](https://github.com/acme/project/issues/10) [Second](https://github.com/acme/project/issues/14)";
+        assert!(canonical_spec_from_map_text(ambiguous_body, &comments).is_err());
     }
 
     #[test]

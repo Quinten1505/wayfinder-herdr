@@ -1,0 +1,32 @@
+{
+  "format_version": 1,
+  "observed_at": "2026-10-02",
+  "unit": "wayfinder-acceptance-20261001-issue16-runtime.service",
+  "restart_command": "systemctl --machine=qbruinsma@.host --user restart wayfinder-acceptance-20261001-issue16-runtime.service",
+  "install_target": "/tmp/wf16-acceptance/install",
+  "installed_binary_sha256": "e5065fb12110744ac421163a3b5ca3e8d13729fdcd188ce82c2b5ddcf88fd678",
+  "service_main_pid_after_restart": 1758258,
+  "service_executable_sha256": "e5065fb12110744ac421163a3b5ca3e8d13729fdcd188ce82c2b5ddcf88fd678",
+  "prior_service_main_pid": 1695172,
+  "prior_service_pid_absent_after_restart": true,
+  "isolated_roots": {
+    "xdg_config_home": "/tmp/wf16-acceptance/config",
+    "xdg_state_home": "/tmp/wf16-acceptance/state",
+    "herdr_session": "wayfinder-acceptance-20261001-issue16",
+    "herdr_socket": "/tmp/wf16-acceptance/config/herdr/sessions/wayfinder-acceptance-20261001-issue16/herdr.sock",
+    "cargo_target_dir": "/tmp/wf16-acceptance/evidence/runtime-cargo-target"
+  },
+  "canonical_spec_after_restart": "https://github.com/Quinten1505/wayfinder-herdr-acceptance-20261001-issue16-7c4a/issues/5",
+  "retained_worker": {
+    "run": "run-00000000000000000030",
+    "status_at_capture": "running",
+    "reviewed_commit": "3784c1e19dabc4a36efce25b6d8a1884d409dc4f",
+    "terminal": "term_65cd55fb36d301b",
+    "codex_session": "01a0fb3b-54c2-7061-a0e4-e5ee6706f512",
+    "boot_id": "a093fcea-966d-46f2-8931-2d79488ce85b",
+    "pid": 1756203,
+    "start_time_ticks_before_and_after": 7879264,
+    "replacement_or_duplicate_prompt": false
+  },
+  "verification_source": "/tmp/wf16-acceptance/evidence/round2-source-runtime-restart.json"
+}
