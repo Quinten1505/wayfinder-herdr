@@ -1,0 +1,11 @@
+id = "wayfinder.popup.prototype23"
+name = "Wayfinder input prototype"
+version = "0.0.1"
+min_herdr_version = "0.9.3"
+platforms = ["linux"]
+
+[[panes]]
+id = "feature-input"
+title = "Try the Wayfinder feature input"
+placement = "popup"
+command = ["./popup.py", "--repo-name", "wayfinder-herdr"]
