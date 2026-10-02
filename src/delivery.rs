@@ -2459,6 +2459,8 @@ fn remote_ref(repository: &Path, namespace: &str, branch: &str) -> Result<Option
             ])
             .arg(&https)
             .arg(&reference)
+            // Keep mise's gh shim quiet while Git reads its credential output.
+            .env("MISE_QUIET", "1")
             .output()
             .context("read GitHub remote over HTTPS with existing gh credential")?
     };
