@@ -404,13 +404,13 @@ def run_tui(window, repo: str, launch_id: str, on_submit, initial_value=""):
                 message = "Describe a feature before pressing Enter."
                 continue
             draw_progress(window, repo, "Saving your description and preparing the chat")
-            on_submit(value.strip())
+            on_submit(value)
             draw_recovery(window, repo, launch_id)
             while True:
                 dismiss, _ = read_key()
                 if dismiss in ("enter", "escape"):
                     break
-            return "submitted", value.strip()
+            return "submitted", value
         if kind == "newline":
             value = value[:cursor] + "\n" + value[cursor:]
             cursor += 1
