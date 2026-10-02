@@ -49,6 +49,14 @@ enum CommandName {
         #[arg(long)]
         map: String,
     },
+    /// Reconcile one explicit human delivery instruction from this map's verified chat.
+    AuthorizeExisting {
+        #[arg(long)]
+        map: String,
+        /// Exact human instruction as given in the orchestrator chat.
+        #[arg(long)]
+        instruction: String,
+    },
     Pause {
         #[arg(long)]
         map: String,
@@ -366,6 +374,12 @@ fn run() -> Result<()> {
             }
         }
         CommandName::Start { map } => request(&root, &map, RequestKind::Start)?,
+        CommandName::AuthorizeExisting { map, instruction } => {
+            let map = MapRef::parse(&map)?;
+            let outcome =
+                tracker::GitHub::default().authorize_existing_map(&root, &map, &instruction)?;
+            println!("{outcome}");
+        }
         CommandName::Pause { map } => request(&root, &map, RequestKind::Pause)?,
         CommandName::Resume { map } => request(&root, &map, RequestKind::Resume)?,
         CommandName::Status { map } => {

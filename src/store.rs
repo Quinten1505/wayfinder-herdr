@@ -928,6 +928,32 @@ pub fn enqueue(dir: &Path, command: RequestKind) -> Result<String> {
     Ok(id)
 }
 
+/// Called while holding state.lock before an existing-map authorization enqueues
+/// its first Start. A lost acknowledgement is found in either applied history or
+/// the durable inbox, so retrying the same human instruction cannot add another.
+pub fn start_recorded_or_pending(dir: &Path, state: &State) -> Result<bool> {
+    if state
+        .history
+        .iter()
+        .any(|applied| applied.command == RequestKind::Start)
+    {
+        return Ok(true);
+    }
+    for entry in fs::read_dir(dir.join("inbox"))? {
+        let path = entry?.path();
+        if path
+            .extension()
+            .is_some_and(|extension| extension == "json")
+        {
+            let request: Request = read_versioned(&path)?;
+            if request.command == RequestKind::Start {
+                return Ok(true);
+            }
+        }
+    }
+    Ok(false)
+}
+
 pub fn process_requests(dir: &Path, state: &mut State) -> Result<()> {
     let mut paths = fs::read_dir(dir.join("inbox"))?
         .map(|r| r.map(|e| e.path()))

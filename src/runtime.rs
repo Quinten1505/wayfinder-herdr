@@ -147,7 +147,7 @@ fn reconcile(dir: &Path, state: &mut State) -> Result<String> {
             "Host and GitHub reconciled; dispatch held: attach this map with its owning Herdr workspace ID".into(),
         );
     }
-    let ready = match github.dispatch_frontier(&map) {
+    let ready = match github.dispatch_frontier(&map, dir) {
         Ok(ready) => ready,
         Err(error) if format!("{error:#}").contains("execution override") => {
             return Ok(format!(

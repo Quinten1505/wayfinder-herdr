@@ -43,7 +43,7 @@ def child(number=13):
     label='wayfinder:task' if number == 13 else 'wayfinder:research'
     return {'id':number*100,'number':number,'title':f'Implement sample task {number}','html_url':f'https://github.com/example/project/issues/{number}','body':'Implement the requested feature.','state':'open','assignees':([{'login':state['login']}] if assigned else []),'labels':[{'name':label}]}
 def map_issue():
-    return {'id':4200,'number':42,'title':'Map','body':'## Notes\n\nExecution override: selected by the user for this effort.','state':'open','assignees':[],'labels':[{'name':'wayfinder:map'}]}
+    return {'id':4200,'number':42,'title':'Map','body':state.get('map_body','## Notes\n\nExecution override: selected by the user for this effort.'),'state':'open','assignees':[],'labels':[{'name':'wayfinder:map'}]}
 if path == 'user': dump({'login':state['login']})
 elif '--paginate' in args:
     route=path.split('?')[0]
@@ -51,6 +51,7 @@ elif '--paginate' in args:
     elif '/dependencies/blocked_by' in route:
         ticket=int(route.split('/')[-3])
         page=[child(number) for number in state.get('blockers',{}).get(str(ticket),[])]
+    elif route.endswith('/issues/42/comments'): page=state.get('comments', [])
     else: page=[]
     dump([page])
 elif '--method' in args:
@@ -72,6 +73,13 @@ elif '--method' in args:
             with open(state_path,'w') as f: json.dump(state,f)
             sys.stderr.write('simulated lost GitHub claim response\n'); sys.exit(1)
         dump({'assignees':[{'login':state['login']}]})
+    elif route.endswith('/issues/42/comments'):
+        comment={'id':len(state.setdefault('comments',[]))+1,'body':body['body']}
+        state['comments'].append(comment)
+        with open(state_path,'w') as f: json.dump(state,f)
+        if state.get('lose_comment_ack'):
+            sys.stderr.write('simulated lost comment acknowledgement\n'); sys.exit(1)
+        dump(comment)
     else: dump({})
 elif path.endswith('/issues/42'): dump(map_issue())
 elif path.endswith('/issues/13'):
@@ -369,6 +377,111 @@ fn record_pending_worker_question(f: &Fixture) -> store::State {
     });
     store::atomic_json(&f.dir.join("state.json"), &state).unwrap();
     state
+}
+
+#[test]
+fn existing_map_authorization_requires_the_pinned_chat_and_reuses_comment_and_start() {
+    let f = Fixture::new();
+    let mut github = serde_json::from_slice::<Value>(&fs::read(&f.gh_state).unwrap()).unwrap();
+    github["map_body"] = json!("## Notes\n\nPlanning only.");
+    github["lose_comment_ack"] = json!(true);
+    fs::write(&f.gh_state, serde_json::to_vec(&github).unwrap()).unwrap();
+    success(f.chat());
+    let binding = f.state().orchestrator.unwrap();
+    f.herdr_state.lock().unwrap().sessions.insert(
+        binding.pane_id.clone(),
+        json!({"source":"herdr:codex","agent":"codex","kind":"id","value":"conversation-after-compaction"}),
+    );
+    let instruction = "Authorize delivery of this named map through a ready PR.";
+    let authorize = || {
+        let mut command = f.cli();
+        command
+            .args([
+                "authorize-existing",
+                "--map",
+                MAP,
+                "--instruction",
+                instruction,
+            ])
+            .env("HERDR_ENV", "1")
+            .env("HERDR_PANE_ID", &binding.pane_id)
+            .env("HERDR_SOCKET_PATH", &f.state().binding.socket);
+        command.output().unwrap()
+    };
+
+    let unverified = f
+        .cli()
+        .args([
+            "authorize-existing",
+            "--map",
+            MAP,
+            "--instruction",
+            instruction,
+        ])
+        .env_remove("HERDR_ENV")
+        .output()
+        .unwrap();
+    assert!(!unverified.status.success());
+    assert!(!f.dir.join("authorization/existing-map.json").exists());
+
+    success(authorize());
+    success(authorize());
+    let github = serde_json::from_slice::<Value>(&fs::read(&f.gh_state).unwrap()).unwrap();
+    assert_eq!(github["comments"].as_array().unwrap().len(), 1);
+    assert!(
+        github["comments"][0]["body"]
+            .as_str()
+            .unwrap()
+            .contains("body refresh pending for a human")
+    );
+    let receipt = serde_json::from_slice::<Value>(
+        &fs::read(f.dir.join("authorization/existing-map.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(receipt["map"], MAP);
+    assert_eq!(receipt["instruction"], instruction);
+    assert_eq!(
+        receipt["source_session"]["value"],
+        "conversation-after-compaction"
+    );
+    assert_eq!(receipt["comment_verified"], true);
+    let starts = fs::read_dir(f.dir.join("inbox"))
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .filter(|path| {
+            serde_json::from_slice::<Value>(&fs::read(path).unwrap()).unwrap()["command"] == "start"
+        })
+        .count();
+    assert_eq!(starts, 1);
+    assert_eq!(f.state().authorization, Authorization::AwaitingStart);
+}
+
+#[test]
+fn existing_map_authorization_preserves_an_explicit_pause() {
+    let f = Fixture::new();
+    let mut github = serde_json::from_slice::<Value>(&fs::read(&f.gh_state).unwrap()).unwrap();
+    github["map_body"] = json!("## Notes\n\nPlanning only.");
+    fs::write(&f.gh_state, serde_json::to_vec(&github).unwrap()).unwrap();
+    success(f.chat());
+    f.apply(RequestKind::Pause);
+    let binding = f.state().orchestrator.unwrap();
+    success(
+        f.cli()
+            .args([
+                "authorize-existing",
+                "--map",
+                MAP,
+                "--instruction",
+                "Deliver this named map.",
+            ])
+            .env("HERDR_ENV", "1")
+            .env("HERDR_PANE_ID", &binding.pane_id)
+            .env("HERDR_SOCKET_PATH", &f.state().binding.socket)
+            .output()
+            .unwrap(),
+    );
+    assert_eq!(f.state().authorization, Authorization::Paused);
+    assert!(!store::start_recorded_or_pending(&f.dir, &f.state()).unwrap());
 }
 
 #[test]
