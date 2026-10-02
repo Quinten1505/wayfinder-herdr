@@ -1,0 +1,58 @@
+{
+  "format_version": 1,
+  "map": "quinten1505/wayfinder-herdr-acceptance-20261001-issue16-7c4a#1",
+  "implementation_ticket": "https://github.com/Quinten1505/wayfinder-herdr-acceptance-20261001-issue16-7c4a/issues/2",
+  "failure": {
+    "run_id": "run-00000000000000000004",
+    "reviewer_run_id": "run-00000000000000000005",
+    "candidate_commit": "b465193990a9a02907f8668fead3f66a36eb3d8a",
+    "candidate_base": "4155227aa9beb20bfb72a3ec953c8c3c4fcd09fe",
+    "required_check": "cargo clippy --locked --all-targets -- -D warnings",
+    "observed": "Cargo.lock absent; --locked prevented Cargo from creating it",
+    "integrated": false
+  },
+  "rework": {
+    "run_id": "run-00000000000000000006",
+    "base_commit": "b465193990a9a02907f8668fead3f66a36eb3d8a",
+    "candidate_commit": "4e0cefd83e6f853ed8748745cad34682644b56d4",
+    "change": "Added Cargo.lock for locked integration checks"
+  },
+  "independent_review": {
+    "run_id": "run-00000000000000000007",
+    "reviewed_commit": "4e0cefd83e6f853ed8748745cad34682644b56d4",
+    "verdict": "approved",
+    "unresolved_findings": []
+  },
+  "runtime_required_checks": [
+    { "command": "cargo fmt --all -- --check", "result": "passed", "candidate_commit": "4e0cefd83e6f853ed8748745cad34682644b56d4" },
+    { "command": "cargo clippy --locked --all-targets -- -D warnings", "result": "passed", "candidate_commit": "4e0cefd83e6f853ed8748745cad34682644b56d4" },
+    { "command": "cargo test --locked --all-targets", "result": "passed", "candidate_commit": "4e0cefd83e6f853ed8748745cad34682644b56d4" }
+  ],
+  "root_supplemental_validation": {
+    "executor": "root, separate from reviewer run7",
+    "checkout": "pinned reviewer run7 checkout",
+    "target_dir": "/tmp/wf16-acceptance/evidence/root-cargo-target",
+    "commands": [
+      "cargo fmt --all -- --check",
+      "cargo clippy --locked --all-targets -- -D warnings",
+      "cargo test --locked --all-targets"
+    ],
+    "test_result": "5 tests passed"
+  },
+  "integration": {
+    "root_approval": "explicit approval for candidate 4e0cefd83e6f853ed8748745cad34682644b56d4 after run7 independent approval",
+    "branch": "feature/issue-16-acceptance",
+    "commit": "4e0cefd83e6f853ed8748745cad34682644b56d4",
+    "disposable_ticket_state": "closed after append-only evidence comment https://github.com/Quinten1505/wayfinder-herdr-acceptance-20261001-issue16-7c4a/issues/2#issuecomment-5940632657"
+  },
+  "build_artifact": {
+    "cause": "first runtime required-check attempt used Cargo's default target/ under the implementer checkout",
+    "checkout": "/tmp/wf16-acceptance/.wayfinder-1-2-6",
+    "artifact": "/tmp/wf16-acceptance/evidence/build-artifacts/run6-target",
+    "preserved": true,
+    "file_count": 124,
+    "size_bytes": 20971520,
+    "git_init_omitted_standard_rust_target_ignore": true,
+    "subsequent_runtime_CARGO_TARGET_DIR": "/tmp/wf16-acceptance/evidence/runtime-cargo-target"
+  }
+}

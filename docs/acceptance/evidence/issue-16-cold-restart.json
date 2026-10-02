@@ -1,0 +1,54 @@
+{
+  "format_version": 1,
+  "scope": "private disposable acceptance session only",
+  "session": "wayfinder-acceptance-20261001-issue16",
+  "map": "quinten1505/wayfinder-herdr-acceptance-20261001-issue16-7c4a#1",
+  "test": "cold Herdr server restart while an actual worker question and orchestrator binding were unanswered/live",
+  "before": {
+    "map_authorization": "paused",
+    "worker_run": "run-00000000000000000022",
+    "worker_status": "needs_human",
+    "request_id": "human-run-00000000000000000022-0002",
+    "request_kind": "worker_question",
+    "answer_history": [],
+    "worker_terminal": "term_65cd010f42af817",
+    "worker_session": "01a0f9df-7d78-7183-9101-5b04dce7c7df",
+    "worker_process": {"boot_id":"a093fcea-966d-46f2-8931-2d79488ce85b","pid":1454004,"start_time_ticks":5599665},
+    "orchestrator_terminal": "term_65ccf5049057216",
+    "orchestrator_process": {"boot_id":"a093fcea-966d-46f2-8931-2d79488ce85b","pid":1327454,"start_time_ticks":5276413}
+  },
+  "cold_stop": {
+    "scope": "only owned isolated runtime unit and named disposable Herdr session/server",
+    "all_prior_provider_pids_absent_before_restart": true,
+    "provider_pid_absence_evidence_sha256": "e97997abfede8d000955ba899bf4fcdab1c9668a3a8dbdcc252794ead22d3e51",
+    "orchestrator_stop_check_sha256": "aabc2f397d0433c3efd85b6a81b441f7410f6091dfd15d264469842bbc05a5ec"
+  },
+  "after": {
+    "authorization": "paused",
+    "worker_run_count_before_retry": 22,
+    "worker_status": "needs_human",
+    "request_id": "human-run-00000000000000000022-0002",
+    "request_kind": "worker_question",
+    "answer_history": [],
+    "saved_worker_terminal_unchanged": "term_65cd010f42af817",
+    "saved_worker_session_unchanged": "01a0f9df-7d78-7183-9101-5b04dce7c7df",
+    "saved_worker_process_unchanged": {"boot_id":"a093fcea-966d-46f2-8931-2d79488ce85b","pid":1454004,"start_time_ticks":5599665},
+    "same_name_replacement_not_adopted": {"terminal":"term_65cd034b4e99c13","pid":1473668,"saved_identity_retained":true},
+    "orchestrator_saved_binding_retained": {"terminal":"term_65ccf5049057216","pid":1327454,"start_time_ticks":5276413,"boot_id":"a093fcea-966d-46f2-8931-2d79488ce85b"},
+    "worker_state_sha256": "a92eb49a0da29e63d6684f0b4e51cdf57d5e4071f2d10b3d854b979cf6ba0202",
+    "map_state_sha256": "f002e83e245f80cace1cea4a36c1f720baf2daac80b75d8ab29c639c236a97c3"
+  },
+  "recovery": {
+    "replacement_stopped_after_cold_result_capture": true,
+    "old_run_and_question_artifacts_preserved": true,
+    "supported_confirmed_stopped_retry_created_run": "run-00000000000000000023",
+    "new_request_id": "human-run-00000000000000000023-0001",
+    "no_answer_submitted": true
+  },
+  "evidence": {
+    "retained_external_directory": "/tmp/wf16-acceptance/evidence/cold-session",
+    "run22_cold_recovery_directory": "/tmp/wf16-acceptance/evidence/run22-cold-recovery",
+    "old_process_absence_capture": "/tmp/wf16-acceptance/evidence/cold-question-after-pid-check.json"
+  },
+  "limitations": ["Evidence is from the named private disposable session; no production Herdr session or runtime was stopped."]
+}

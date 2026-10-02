@@ -1,0 +1,49 @@
+{
+  "format_version": 1,
+  "implementation_base": "ae0c0916ffb41d9cdf47e0f244586480aae53b94",
+  "checks": [
+    {
+      "command": "cargo fmt --all -- --check",
+      "result": "passed"
+    },
+    {
+      "command": "cargo clippy --locked --all-targets -- -D warnings",
+      "result": "passed"
+    },
+    {
+      "command": "cargo test --locked --all-targets",
+      "result": "passed",
+      "tests": {
+        "unit": 32,
+        "dispatch": 66,
+        "runtime": 12,
+        "tracker": 11,
+        "total": 121
+      },
+      "includes": "checked_out_fast_forward_preserves_ignored_user_file_at_new_candidate_path"
+    },
+    {
+      "command": "CARGO_HOME=/tmp/wayfinder-12-review-cargo-home CARGO_TARGET_DIR=/tmp/wf16-acceptance/evidence/installer-cargo-target WAYFINDER_INSTALL_DIR=/tmp/wf16-acceptance/install python3 tests/install_smoke.py",
+      "result": "passed",
+      "isolated_root": "/tmp/wayfinder-install-fle8yj6w",
+      "systemctl": "recording stub; not runtime supervision evidence",
+      "systemctl_log_sha256": "fb4d5af37da1d31a76e4eb2b828c64c325e038d612d8e640da6336e528c984fd",
+      "built_installed_binary_sha256": "9fda585da8f5afae10394986de0464f79243564d8afd8a8629e122cd64386990"
+    }
+  ],
+  "cargo_environment": {
+    "CARGO_HOME": "/tmp/wayfinder-12-review-cargo-home",
+    "CARGO_TARGET_DIR": "/tmp/wf16-acceptance/evidence/final-cargo-target",
+    "dispatch_socket_tests_required_escalation": true,
+    "sandbox_failure": "Unix socket fixture creation returned EPERM"
+  },
+  "real_supervision_evidence": "Separate live acceptance evidence records the isolated transient systemd user service; the installer smoke above used only its recording systemctl stub.",
+  "live_acceptance": {
+    "missed_hook": "issue-16-missed-hook-and-recovery.json",
+    "hook_controls": "issue-16-live-hooks-and-controls.json",
+    "full_feature_review": "issue-16-final-feature-review.json",
+    "disposable_feature_pr": "https://github.com/Quinten1505/wayfinder-herdr-acceptance-20261001-issue16-7c4a/pull/4",
+    "pr_state": "ready and unmerged"
+  },
+  "scope": "This is an implementation handoff for canonical issue16. It does not self-accept or close issue16, merge the disposable PR, or replace the root-owned independent paired review."
+}

@@ -1,0 +1,158 @@
+{
+  "format_version": 1,
+  "session": "wayfinder-acceptance-20261001-issue16",
+  "map": "quinten1505/wayfinder-herdr-acceptance-20261001-issue16-7c4a#1",
+  "service_unit": "wayfinder-acceptance-20261001-issue16-runtime.service",
+  "installed_herdr": "0.9.3",
+  "plugin_id": "wayfinder.herdr",
+  "plugin_manifest_hooks": [
+    "pane.agent_status_changed -> ./bin/wayfinder-herdr reconcile",
+    "pane.exited -> ./bin/wayfinder-herdr reconcile"
+  ],
+  "real_native_hook_execution": {
+    "log_ids": [
+      "plugin-log-22",
+      "plugin-log-23",
+      "plugin-log-33",
+      "plugin-log-35",
+      "plugin-log-36",
+      "plugin-log-117",
+      "plugin-log-118",
+      "plugin-log-119",
+      "plugin-log-120",
+      "plugin-log-121",
+      "plugin-log-122"
+    ],
+    "event": "pane.agent_status_changed",
+    "command": [
+      "./bin/wayfinder-herdr",
+      "reconcile"
+    ],
+    "outcome": "Herdr plugin log records command execution, exit_code 0, status succeeded",
+    "note": "This is execution evidence from Herdr's plugin log, not action metadata returned by herdr plugin action invoke."
+  },
+  "durable_wakeups": {
+    "reconcile_request_history": [
+      "request-00000000000000000228",
+      "request-00000000000000000229",
+      "request-00000000000000000230",
+      "request-00000000000000000231",
+      "request-00000000000000000232",
+      "request-00000000000000000233",
+      "request-00000000000000000234",
+      "request-00000000000000000235",
+      "request-00000000000000000236"
+    ],
+    "outcome": "each is retained in state history as a processed reconcile request; inbox files were consumed",
+    "pause_request": {
+      "id": "request-00000000000000000226",
+      "outcome": "Dispatch paused"
+    },
+    "resume_request": {
+      "id": "request-00000000000000000237",
+      "outcome": "Resume recorded; dispatch still requires successful reconciliation"
+    },
+    "distinction": "Inbox request IDs are explicit wakeups/actions. The 30-second runtime poll calls reconciliation directly and does not enqueue an inbox request. Herdr's plugin log has event/time/exit status but no inbox request ID, so this record does not claim a one-to-one mapping between a particular hook log and a particular reconcile request."
+  },
+  "duplicate_safety": {
+    "live_observation": "After the deliberately missed chat-exit callback was recovered by timer, three actual pane.agent_status_changed plugin command executions (plugin-log-128 through 130) and reconcile requests 242 through 244 occurred during one recovered-chat startup. Worker run count stayed 21, and the outbox remained 77/77 delivered with no duplicate messages. Herdr does not provide event-instance IDs, so this proves repeated callback executions are idempotent at the observed map level, not exact replay of one same event ID.",
+    "final_review_worker_count": 1,
+    "approved_run": "run-00000000000000000021",
+    "approved_commit": "f9c55676781e3163747e0fc466dc012132bf0f32",
+    "fixture_coverage": [
+      "tests/runtime.rs::duplicate_hook_enqueues_serialize_without_dropping_a_request",
+      "tests/runtime.rs::queued_start_survives_restart_and_duplicate_request_is_not_reapplied"
+    ],
+    "live_exact_context_replay": {
+      "evidence": "issue-16-native-hook-duplicate-after.json",
+      "temporary_wrapper_events": [
+        "plugin-log-131",
+        "plugin-log-132"
+      ],
+      "contexts_replayed_twice_each": true,
+      "original_hook_command": [
+        "./bin/wayfinder-herdr",
+        "reconcile"
+      ],
+      "processed_request_ids": [
+        "request-00000000000000000245",
+        "request-00000000000000000246",
+        "request-00000000000000000247",
+        "request-00000000000000000248"
+      ],
+      "worker_runs": {
+        "before": 21,
+        "after": 21
+      },
+      "outbox_messages": {
+        "before": 77,
+        "after": 77
+      },
+      "outbox_sha256_unchanged": "3d974bd78dc7934e75401fa043cf70c28be3506c9d9aba4ced421c60765421ff",
+      "manifest_restored_sha256": "482e59c9bff5adeeeaea2dcde7cf73ced7d4391cd99557345d3df9149af6b1ca",
+      "boundary": "Replay at the installed native command boundary with actual captured context; not Herdr event-instance redelivery."
+    }
+  },
+  "periodic_polling": {
+    "configured_poll_seconds": 30,
+    "supervised_service_observed_active": true,
+    "effect": "reconciliation continues through the serving loop independently of hook inbox requests"
+  },
+  "not_exercised_live": {
+    "pane_exited_hook": "Exercised live as a deliberately missed pane.exited callback during the bound chat stop.",
+    "herdr_event_instance_redelivery": "Herdr event-instance redelivery itself is not observable in its logs. The installed original reconcile command was replayed twice with each captured real native-event context in an isolated wrapper, with four requests processed and no duplicate worker/outbox effects; see issue-16-native-hook-duplicate-after.json."
+  },
+  "failed_plugin_attempts": [
+    {
+      "log_id": "plugin-log-24",
+      "command": "action pause",
+      "exit_code": 1,
+      "invoking_workspace": "w7",
+      "bound_source_workspace": "w2",
+      "reason": "Wayfinder: action requires exactly one attached map in this workspace/session; use explicit CLI --map"
+    },
+    {
+      "log_id": "plugin-log-25",
+      "command": "action pause",
+      "exit_code": 1,
+      "invoking_workspace": "w7",
+      "bound_source_workspace": "w2",
+      "reason": "Wayfinder: action requires exactly one attached map in this workspace/session; use explicit CLI --map"
+    },
+    {
+      "log_id": "plugin-log-34",
+      "command": "recover-chat --confirm-replacement --confirm-launch-absent-or-stopped",
+      "exit_code": 1,
+      "reason": "Wayfinder: initial orchestrator prompt outcome is uncertain and will not be repeated: herdr agent.prompt failed: agent w2:p6 is not an active named agent (agent_not_ready)"
+    },
+    {
+      "log_id": "plugin-log-127",
+      "action": "recover-chat from the installed Wayfinder plugin in bound workspace w2",
+      "exit_code": 1,
+      "reason": "Wayfinder: initial orchestrator prompt outcome is uncertain and will not be repeated: herdr agent.prompt failed: agent w2:p7 is not an active named agent (agent_not_ready)",
+      "resolution": "The saved state classified this exact same foreground process as an unattempted initial prompt; after Herdr reported it active, normal reconciliation continued the original launch without a second pane or duplicate worker. Subsequent successful native reconciles are logs 128-130."
+    }
+  ],
+  "current_disposable_state": {
+    "authorization_after_pause_then_resume": "started",
+    "runtime_unit": "active/running",
+    "active_workers": 0,
+    "complete_feature_review_run": "run-00000000000000000021",
+    "PR4": "OPEN, ready, not merged"
+  },
+  "deliberately_missed_callback": {
+    "owned_manifest_only": true,
+    "original_sha256": "482e59c9bff5adeeeaea2dcde7cf73ced7d4391cd99557345d3df9149af6b1ca",
+    "hooks_temporarily_removed": [
+      "pane.agent_status_changed",
+      "pane.exited"
+    ],
+    "plugin_enabled_with_no_events_verified": true,
+    "state_change": "Verified stop/exit of the exact bound orchestrator Codex process in pane w2:p6, terminal term_65cce662e5cbb10, session 01a0f972-3c6d-7421-ba37-de3bbebd14b9, boot a093fcea-966d-46f2-8931-2d79488ce85b, PID 1188931, start ticks 4883656.",
+    "timer_only_detection": "After 38 seconds with the supervised runtime left active and no explicit Wayfinder request, periodic reconcile held the unchanged old binding after herdr agent.get reported agent_not_found.",
+    "no_inbox_wakeup": "history remained at request 241, next sequence 242, and inbox was empty before/after detection.",
+    "preservation": "run21 result SHA remained 0dd2ff7ab39b7bccf1d8490c6d93399eee03e0859373b07a32ce906e59a1e39e; 21 worker runs, 77 delivered outbox items, and ready unmerged PR4 remained.",
+    "manifest_restored_sha256": "482e59c9bff5adeeeaea2dcde7cf73ced7d4391cd99557345d3df9149af6b1ca",
+    "versioned_record": "issue-16-missed-hook-and-recovery.json"
+  }
+}

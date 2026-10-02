@@ -1,0 +1,79 @@
+{
+  "format_version": 1,
+  "acceptance_repo": "Quinten1505/wayfinder-herdr-acceptance-20261001-issue16-7c4a",
+  "map": "quinten1505/wayfinder-herdr-acceptance-20261001-issue16-7c4a#1",
+  "pull_request": {
+    "number": 4,
+    "url": "https://github.com/Quinten1505/wayfinder-herdr-acceptance-20261001-issue16-7c4a/pull/4",
+    "state": "OPEN",
+    "is_draft": false,
+    "head_ref": "feature/issue-16-acceptance",
+    "head_commit": "f9c55676781e3163747e0fc466dc012132bf0f32",
+    "base_ref": "develop",
+    "base_commit": "4155227aa9beb20bfb72a3ec953c8c3c4fcd09fe",
+    "merged": false
+  },
+  "readiness_invalidation": {
+    "prior_ready_status_invalidated": true,
+    "reason": "run17's immutable approval covered only README ticket #3 and did not qualify as a complete-feature review",
+    "verified_draft_operation": "gh pr ready 4 --undo --repo Quinten1505/wayfinder-herdr-acceptance-20261001-issue16-7c4a",
+    "remote_draft_observed": true,
+    "old_run17_artifact_preserved": true,
+    "premature_readiness_from_run17": {
+      "occurred": true,
+      "prior_delivery_ready_commit": "f9c55676781e3163747e0fc466dc012132bf0f32",
+      "prior_final_review_commit": "f9c55676781e3163747e0fc466dc012132bf0f32",
+      "prior_github_is_draft": false,
+      "reason": "run17 approved only README ticket #3; the runtime incorrectly accepted it as final-feature approval and marked PR4 ready",
+      "correction": "root invalidated readiness through the supported GitHub draft operation, preserved run17 immutably, and dispatched complete-feature run21",
+      "corrected_review_run": "run-00000000000000000021",
+      "corrected_review_commit": "f9c55676781e3163747e0fc466dc012132bf0f32",
+      "corrected_ready_status": "PR4 was re-readied only after run21 and its required checks passed"
+    }
+  },
+  "narrow_ticket_review": {
+    "run": "run-00000000000000000017",
+    "artifact": "worker-results/run-00000000000000000017.json",
+    "versioned_artifact": "issue-16-run17-narrow-review.json",
+    "artifact_sha256": "a8d0cd4e6a2643173c27135aa2fa714eeea250cdeb30fa684eeb94e9cc3f464f",
+    "scope": "README ticket #3 only",
+    "qualification": "The immutable README ticket #3 approval was incorrectly used to ready PR4 at f9c5567. This premature readiness was invalidated; the original artifact remains preserved as narrow ticket-review evidence only."
+  },
+  "complete_feature_review": {
+    "run": "run-00000000000000000021",
+    "artifact": "worker-results/run-00000000000000000021.json",
+    "versioned_artifact": "issue-16-run21-final-review-result.json",
+    "artifact_sha256": "0dd2ff7ab39b7bccf1d8490c6d93399eee03e0859373b07a32ce906e59a1e39e",
+    "reviewer_worktree": "/tmp/wf16-acceptance/.wayfinder-1-3-21",
+    "source_run": "run-00000000000000000020",
+    "scope": "complete_feature",
+    "map": "quinten1505/wayfinder-herdr-acceptance-20261001-issue16-7c4a#1",
+    "base_ref": "origin/develop",
+    "base_commit": "4155227aa9beb20bfb72a3ec953c8c3c4fcd09fe",
+    "reviewed_commit": "f9c55676781e3163747e0fc466dc012132bf0f32",
+    "spec": "none-linked",
+    "accepted_decisions_reviewed": true,
+    "verdict": "approved",
+    "unresolved_findings": [],
+    "known_limitations": []
+  },
+  "required_checks": [
+    {
+      "commit": "f9c55676781e3163747e0fc466dc012132bf0f32",
+      "command": "cargo fmt --all -- --check",
+      "result": "passed"
+    },
+    {
+      "commit": "f9c55676781e3163747e0fc466dc012132bf0f32",
+      "command": "cargo clippy --locked --all-targets -- -D warnings",
+      "result": "passed"
+    },
+    {
+      "commit": "f9c55676781e3163747e0fc466dc012132bf0f32",
+      "command": "cargo test --locked --all-targets",
+      "result": "passed"
+    }
+  ],
+  "source": "real runtime-dispatched Codex reviewer in the private disposable repository; separate from fixture tests and from root's independent ticket review",
+  "merge": "not performed; human merge decision remains required"
+}

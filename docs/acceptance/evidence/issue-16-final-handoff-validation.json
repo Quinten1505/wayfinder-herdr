@@ -1,0 +1,48 @@
+{
+  "format_version": 1,
+  "source_revision_under_test": "answer-worker pre-effect identity-verification recovery and accepted-decision context for typed final-feature reviewers",
+  "checks": [
+    {
+      "command": "CARGO_HOME=/tmp/wayfinder-12-review-cargo-home CARGO_TARGET_DIR=/tmp/wf16-acceptance/evidence/source-final-target cargo fmt --all -- --check",
+      "result": "passed"
+    },
+    {
+      "command": "CARGO_HOME=/tmp/wayfinder-12-review-cargo-home CARGO_TARGET_DIR=/tmp/wf16-acceptance/evidence/source-final-target cargo clippy --locked --all-targets -- -D warnings",
+      "result": "passed"
+    },
+    {
+      "command": "CARGO_HOME=/tmp/wayfinder-12-review-cargo-home CARGO_TARGET_DIR=/tmp/wf16-acceptance/evidence/source-final-target cargo test --locked --all-targets",
+      "result": "passed",
+      "tests": {"library":35,"dispatch":72,"runtime":12,"tracker":11,"total":130}
+    },
+    {
+      "command": "CARGO_HOME=/tmp/wayfinder-12-review-cargo-home CARGO_TARGET_DIR=/tmp/wf16-acceptance/evidence/installer-cargo-target WAYFINDER_INSTALL_DIR=/tmp/wf16-acceptance/install python3 tests/install_smoke.py",
+      "result": "passed",
+      "installer_root": "/tmp/wf16-acceptance/install",
+      "systemctl": "recording-only stub; not evidence of runtime supervision"
+    }
+  ],
+  "live_source_install": {
+    "path": "/tmp/wf16-acceptance/install",
+    "binary_sha256": "39aaf2c554795ab6e32e6a26cfc6eab9e042a3fd9117e31a7709f65208e77be8",
+    "owned_runtime_unit": "wayfinder-acceptance-20261001-issue16-runtime.service",
+    "invocation_id": "760cae99d41c4ab5966d4456fad61e5c",
+    "main_pid": 1617535,
+    "observed_executable_sha256": "39aaf2c554795ab6e32e6a26cfc6eab9e042a3fd9117e31a7709f65208e77be8",
+    "result": "active supervised runtime restarted on the source-installed binary; bound p8 terminal/session/provider/PID/start identity remained unchanged"
+  },
+  "acceptance_endpoint": {
+    "implementation_commit": "3ca068c00782ebbc54168db2484cbc18869e5c41",
+    "ticket_reviewer_run": "run-00000000000000000025",
+    "complete_feature_reviewer_run_revision": "run-00000000000000000026 revision 2",
+    "complete_feature_review": "approved with no unresolved findings; reviewer did not run tests, which were covered by the passing required checks above",
+    "disposable_pr": "https://github.com/Quinten1505/wayfinder-herdr-acceptance-20261001-issue16-7c4a/pull/4",
+    "pr_state": "open, ready, unmerged",
+    "canonical_issue16": "left open for root-owned independent paired review and integration"
+  },
+  "limitations": [
+    "Installer smoke uses a recording systemctl stub. Actual runtime supervision is separately evidenced by the isolated live user unit.",
+    "The unintended write/replacement at default user-local installer paths is preserved as an incident; prior contents are unknown and were not restored or altered.",
+    "The disposable feature PR was intentionally left unmerged."
+  ]
+}

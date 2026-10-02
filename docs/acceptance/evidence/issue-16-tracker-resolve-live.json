@@ -1,0 +1,142 @@
+{
+  "format_version": 1,
+  "acceptance_repo": "Quinten1505/wayfinder-herdr-acceptance-20261001-issue16-7c4a",
+  "map": "Quinten1505/wayfinder-herdr-acceptance-20261001-issue16-7c4a#1",
+  "canonical_spec": "Quinten1505/wayfinder-herdr-acceptance-20261001-issue16-7c4a#5",
+  "verification_task": {
+    "issue": 7,
+    "classification_correction": {
+      "from": "wayfinder:grilling",
+      "to": "wayfinder:task",
+      "method": "normal GitHub issue edit before claim"
+    },
+    "claim_history": "An early manual claim was released through ordinary issue editing while the runtime was paused after confirming no worker run existed. The claim intent/history was retained. On resume, the runtime—not a fabricated run—claimed the now-unassigned task as run-00000000000000000027.",
+    "current_observation": {
+      "issue_state": "open",
+      "labels": ["wayfinder:task"],
+      "assignees": ["Quinten1505"],
+      "run": "run-00000000000000000027",
+      "run_status_at_capture": "running",
+      "worktree": "/tmp/wf16-acceptance/.wayfinder-1-7-27",
+      "result_commit_at_capture": "840415e (worker worktree HEAD; runtime result not yet recorded)"
+    },
+    "final_delivery": {
+      "implementation_run": "run-00000000000000000027",
+      "implementation_commit": "86c943f5162829940eca769e87d8e56e61643b62",
+      "independent_ticket_review_run": "run-00000000000000000028",
+      "independent_ticket_review": "approved exact commit 86c943f5162829940eca769e87d8e56e61643b62 with no unresolved findings",
+      "required_checks": [
+        "cargo fmt --all -- --check",
+        "cargo clippy --locked --all-targets -- -D warnings",
+        "cargo test --locked --all-targets"
+      ],
+      "integrated_commit": "86c943f5162829940eca769e87d8e56e61643b62",
+      "close_operation": "Repeated the exact uppercase-owner original Rust tracker resolve command after integration; CLI confirmed resolution/index updates and found the existing markers.",
+      "final_issue_state": "closed",
+      "final_live_capture": "/tmp/wf16-acceptance/evidence/tracker-resolve-live-final.json",
+      "evidence_correction_commit": "3784c1e19dabc4a36efce25b6d8a1884d409dc4f",
+      "complete_feature_reviews": [
+        {
+          "run": "run-00000000000000000029",
+          "commit": "86c943f5162829940eca769e87d8e56e61643b62",
+          "verdict": "approved, but stale after the evidence correction commit; not used for readiness"
+        },
+        {
+          "run": "run-00000000000000000030",
+          "commit": "3784c1e19dabc4a36efce25b6d8a1884d409dc4f",
+          "verdict": "approved complete-feature review; no unresolved findings or known limitations",
+          "base_commit": "4155227aa9beb20bfb72a3ec953c8c3c4fcd09fe",
+          "canonical_spec": "https://github.com/Quinten1505/wayfinder-herdr-acceptance-20261001-issue16-7c4a/issues/5",
+          "accepted_decisions_reviewed": true
+        }
+      ],
+      "required_checks_on_3784c1e": {
+        "cargo fmt --all -- --check": "passed",
+        "cargo clippy --locked --all-targets -- -D warnings": "passed",
+        "cargo test --locked --all-targets": "passed"
+      },
+      "pr4_at_capture": {
+        "head": "3784c1e19dabc4a36efce25b6d8a1884d409dc4f",
+        "is_draft": false,
+        "state": "OPEN",
+        "merged": false
+      },
+      "service_restart_capture": "/tmp/wf16-acceptance/evidence/round2-source-runtime-restart.json"
+    }
+  },
+  "decision_provenance": {
+    "text": "comparison table",
+    "source_run": "run-00000000000000000023",
+    "source_request": "human-run-00000000000000000023-0001",
+    "use": "Historical input to an AFK verification task only; no new human choice was created."
+  },
+  "product_path": {
+    "binary": "/tmp/wf16-acceptance/install/bin/wayfinder-herdr",
+    "subcommand": "tracker resolve",
+    "first_and_recovery_arguments": {
+      "map": "Quinten1505/wayfinder-herdr-acceptance-20261001-issue16-7c4a#1",
+      "ticket": 7,
+      "spec": 5,
+      "resolution": "Acceptance verification only: the actual user selected comparison table for the parser guide (run23, request human-run-00000000000000000023-0001). This operation records the existing decision and verifies the installed tracker resolution, append-only indexes, unchanged map/spec bodies, and marker-based recovery after an injected lost acknowledgement; it creates no new human choice."
+    },
+    "map_owner_casing": "Quinten1505 (uppercase), identical for the first attempt and supported retry",
+    "first_attempt": {
+      "outcome": "GitHub created the resolution comment, but the acceptance wrapper deliberately withheld the real POST acknowledgement and hid that comment from exactly one immediate marker read. The CLI reported an ambiguous write and retained the intent at pending.",
+      "stderr": "Wayfinder: comment write outcome is ambiguous; intent retained for marker reconciliation: gh api failed (exit status: 75): acceptance fault: real GitHub comment succeeded; POST acknowledgement deliberately withheld",
+      "fault_is_injected": true,
+      "evidence": "/tmp/wf16-acceptance/evidence/tracker-resolve-fault/first-attempt.log"
+    },
+    "recovery": {
+      "method": "Supported installed CLI retry with the exact original uppercase-owner arguments; no marker or intent was edited.",
+      "stdout": "Recorded resolution for #7; map and spec indexes updated.",
+      "intent": "wayfinder-operation:resolve:f9c2abda1502300a9edb40afebad2784",
+      "intent_stage": "complete",
+      "evidence": "/tmp/wf16-acceptance/evidence/tracker-resolve-fault/retry.log"
+    },
+    "distinct_lowercase_operation": {
+      "map_owner_casing": "quinten1505 (lowercase)",
+      "intent": "wayfinder-operation:resolve:a4b6b50afb7cd271b99d82ddf0beae84",
+      "intent_stage_at_capture": "pending",
+      "remote_effect": "none; the marker differs because repository-owner casing is part of the operation identity, and the closed-ticket guard refused this distinct operation",
+      "handling": "Preserved as separate historical evidence; it is not treated as the same operation or retried."
+    }
+  },
+  "remote_effects": {
+    "resolution_comment": {
+      "id": 5946320093,
+      "marker": "wayfinder-operation:resolve:f9c2abda1502300a9edb40afebad2784:resolution",
+      "count": 1,
+      "live_url": "https://github.com/Quinten1505/wayfinder-herdr-acceptance-20261001-issue16-7c4a/issues/7#issuecomment-5946320093"
+    },
+    "map_pointer": {
+      "id": 5946329021,
+      "marker": "wayfinder-operation:resolve:f9c2abda1502300a9edb40afebad2784:map-pointer",
+      "count": 1,
+      "live_url": "https://github.com/Quinten1505/wayfinder-herdr-acceptance-20261001-issue16-7c4a/issues/1#issuecomment-5946329021"
+    },
+    "spec_delta": {
+      "id": 5946329247,
+      "marker": "wayfinder-operation:resolve:f9c2abda1502300a9edb40afebad2784:spec-delta",
+      "count": 1,
+      "live_url": "https://github.com/Quinten1505/wayfinder-herdr-acceptance-20261001-issue16-7c4a/issues/5#issuecomment-5946329247"
+    }
+  },
+  "body_preservation": {
+    "map_issue_1": {
+      "before_sha256": "eec9ba10689af163c5b456c4dd8bedf0cc1eff81f0a76c3288f2d59eea01f334",
+      "after_sha256": "eec9ba10689af163c5b456c4dd8bedf0cc1eff81f0a76c3288f2d59eea01f334"
+    },
+    "spec_issue_5": {
+      "before_sha256": "c4535c6be9a9ea7af039d3cec58a8497c6eb2cba7591984c822b630a41d7221a",
+      "after_sha256": "c4535c6be9a9ea7af039d3cec58a8497c6eb2cba7591984c822b630a41d7221a"
+    },
+    "source_captures": [
+      "/tmp/wf16-acceptance/evidence/tracker-resolve-live-before.json",
+      "/tmp/wf16-acceptance/evidence/tracker-resolve-live-after-round2.json"
+    ]
+  },
+  "scope_limitations": [
+    "The acknowledgement loss and single immediate-read omission were deliberately injected by the acceptance wrapper; they are not organic network failures.",
+    "The fresh complete-feature review and required checks for the corrected PR head remain in progress; the disposable PR stays draft and unmerged."
+  ]
+}

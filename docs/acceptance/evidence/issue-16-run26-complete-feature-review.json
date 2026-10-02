@@ -1,0 +1,47 @@
+{
+  "format_version": 1,
+  "run": "run-00000000000000000026",
+  "revision": 2,
+  "role": "reviewer",
+  "status": "completed",
+  "reviewed_commit": "3ca068c00782ebbc54168db2484cbc18869e5c41",
+  "verdict": "approved",
+  "unresolved_findings": [],
+  "known_limitations": [
+    "The reviewer did not run tests; the runtime's configured required checks passed separately."
+  ],
+  "final_feature_review": {
+    "scope": "complete_feature",
+    "base_ref": "origin/develop",
+    "base_commit": "4155227aa9beb20bfb72a3ec953c8c3c4fcd09fe",
+    "map": "quinten1505/wayfinder-herdr-acceptance-20261001-issue16-7c4a#1",
+    "spec": "https://github.com/Quinten1505/wayfinder-herdr-acceptance-20261001-issue16-7c4a/issues/5",
+    "accepted_decisions_reviewed": true
+  },
+  "decision_provenance": {
+    "actual_user_response": "comparison table",
+    "source_run": "run-00000000000000000023",
+    "source_request": "human-run-00000000000000000023-0001",
+    "review_run_initial_revision": "The immutable initial changes-requested artifact asked for the same format choice; it remains preserved in result_evidence_history.",
+    "revision_2": "The exact submitted answer was included in final-review context and the reviewer approved without a second human question."
+  },
+  "delivery": {
+    "required_checks": [
+      {"command":"cargo fmt --all -- --check","result":"passed"},
+      {"command":"cargo clippy --locked --all-targets -- -D warnings","result":"passed"},
+      {"command":"cargo test --locked --all-targets","result":"passed"}
+    ],
+    "ticket_integration": "ticket #6 integrated by the runtime delivery flow after exact-commit reviews and passing configured checks",
+    "feature_pr": {
+      "url": "https://github.com/Quinten1505/wayfinder-herdr-acceptance-20261001-issue16-7c4a/pull/4",
+      "state": "open",
+      "draft": false,
+      "merged": false
+    }
+  },
+  "historical_safety": {
+    "narrow_run17": "retained as an immutable README-ticket review only; it was not relied upon for the corrected ready state",
+    "earlier_premature_ready": "recorded in issue-16-final-feature-review.json and corrected through the supported PR draft operation before run21/run26 review and readiness"
+  },
+  "external_immutable_result": "/tmp/wf16-acceptance/state/wayfinder-herdr/maps/a17b3c907d0d945e87e2bb22ba9e1b3751b80d2885e472dfd6222e28405db1ab/worker-results/run-00000000000000000026-revision-0002.json"
+}

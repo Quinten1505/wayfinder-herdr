@@ -1,0 +1,52 @@
+id = "wayfinder.herdr"
+name = "Wayfinder"
+version = "0.1.0"
+min_herdr_version = "0.9.3"
+platforms = ["linux"]
+
+[[startup]]
+command = ["./bin/wayfinder-herdr", "reconcile"]
+
+[[actions]]
+id = "start"
+title = "Start Wayfinder dispatch"
+contexts = ["workspace"]
+command = ["./bin/wayfinder-herdr", "action", "start"]
+
+[[actions]]
+id = "pause"
+title = "Pause Wayfinder dispatch"
+contexts = ["workspace"]
+command = ["./bin/wayfinder-herdr", "action", "pause"]
+
+[[actions]]
+id = "resume"
+title = "Resume Wayfinder dispatch"
+contexts = ["workspace"]
+command = ["./bin/wayfinder-herdr", "action", "resume"]
+
+[[actions]]
+id = "status"
+title = "Wayfinder status"
+contexts = ["workspace"]
+command = ["./bin/wayfinder-herdr", "action", "status"]
+
+[[actions]]
+id = "chat"
+title = "Open or focus the Wayfinder orchestrator chat"
+contexts = ["workspace"]
+command = ["./bin/wayfinder-herdr", "chat"]
+
+[[actions]]
+id = "recover-chat"
+title = "Recover Wayfinder chat (confirm any interrupted launch is stopped)"
+contexts = ["workspace"]
+command = ["./bin/wayfinder-herdr", "recover-chat", "--confirm-replacement", "--confirm-launch-absent-or-stopped"]
+
+[[events]]
+on = "pane.agent_status_changed"
+command = ["./bin/wayfinder-herdr", "reconcile"]
+
+[[events]]
+on = "pane.exited"
+command = ["./bin/wayfinder-herdr", "reconcile"]

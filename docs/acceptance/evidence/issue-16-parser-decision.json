@@ -1,0 +1,28 @@
+{
+  "format_version": 1,
+  "map": "quinten1505/wayfinder-herdr-acceptance-20261001-issue16-7c4a#1",
+  "ticket": "quinten1505/wayfinder-herdr-acceptance-20261001-issue16-7c4a#2",
+  "map_url": "https://github.com/quinten1505/wayfinder-herdr-acceptance-20261001-issue16-7c4a/issues/1",
+  "ticket_url": "https://github.com/quinten1505/wayfinder-herdr-acceptance-20261001-issue16-7c4a/issues/2",
+  "run_id": "run-00000000000000000004",
+  "worker_name": "wf-2-run-00000000000000000004",
+  "human_request_id": "human-run-00000000000000000004-0002",
+  "human_request_seq": 2,
+  "request_type": "worker_question",
+  "question": "Should parse_milli accept and trim leading/trailing ASCII whitespace, or reject surrounding whitespace?",
+  "options": [
+    "Accept and trim (recommended, friendlier CLI input)",
+    "Reject surrounding whitespace (strict parsing)"
+  ],
+  "actual_human_response_verbatim": "Accept and trim (Recommended)",
+  "recorded_with": "answer-worker --map quinten1505/wayfinder-herdr-acceptance-20261001-issue16-7c4a#1 --run run-00000000000000000004 --request-id human-run-00000000000000000004-0002 --request-type worker_question --response 'Accept and trim (Recommended)'",
+  "herdr_session": "wayfinder-acceptance-20261001-issue16",
+  "workspace_id": "w4",
+  "tab_id": "w4:t1",
+  "pane_id": "w4:p1",
+  "terminal_id": "term_65cccd4c26b9a4",
+  "agent_session_id": "01a0f90b-7900-7ea0-adc1-c7c82c0cf623",
+  "pane_evidence_path": "/tmp/wf16-acceptance/evidence/issue-16-parser-question-run4.txt",
+  "request_evidence_path": "/tmp/wf16-human-request.json",
+  "recording_outcome": "answer-worker reported 'Human response submitted to owned pane w4:p1'; subsequent durable status recorded the exact response, cleared the pending request, and kept run4 running."
+}

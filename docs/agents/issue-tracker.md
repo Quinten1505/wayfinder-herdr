@@ -21,9 +21,15 @@ Find the frontier by listing the map's sub-issues with `gh api --paginate repos/
 
 Claim before work by assigning the ticket to the driving developer using `gh issue edit NUMBER --repo Quinten1505/wayfinder-herdr --add-assignee @me`. Re-read before dispatch. GitHub assignment is the visible claim convention, not an atomic scheduling lock; parallel sessions belonging to one developer must coordinate through the orchestrator.
 
-Resolve by posting the answer as a comment using `gh issue comment NUMBER --repo Quinten1505/wayfinder-herdr --body-file FILE`, closing the issue, and appending a named link and one-line gist to the map's Decisions so far. Link artifacts from the resolution. Open work is found through sub-issue queries, not a duplicate list in the map body.
+Resolve by posting the answer as a comment using `gh issue comment NUMBER --repo Quinten1505/wayfinder-herdr --body-file FILE` and closing the issue. Automated index updates go in append-only map/spec comments under the accepted policy below. Link artifacts from the resolution. Open work is found through sub-issue queries, not a duplicate list in the map body.
 
-Use temporary body files for multiline creates, comments, and edits. Preserve unrelated changes when editing the map or specification; serialize shared index updates through the orchestrator.
+Use temporary body files for multiline creates and comments. Preserve unrelated changes during any human-authorized body refresh; serialize shared index updates through the orchestrator.
+
+## Automated map and spec updates
+
+The human resolved [How should map updates handle non-atomic GitHub body writes?](https://github.com/Quinten1505/wayfinder-herdr/issues/18#issuecomment-5931910902) in favor of append-only comments. Automated resolution/index/spec updates must post the named map decision pointer and proposed spec delta as comments, explicitly marking **body refresh pending for a human**. Do not PATCH existing map or spec bodies for these updates; initial issue creation may set its body.
+
+Future workers must read relevant issue comments for accepted policy or specification deltas that have not yet been refreshed into the issue body. Reconcile uncertain comment submissions by searching for their durable operation marker before retrying, so a repeated request does not duplicate a comment.
 
 ## Scope
 

@@ -1,0 +1,52 @@
+{
+  "format_version": 1,
+  "observed_at_utc": "2026-10-01T23:23:40Z",
+  "session": "wayfinder-acceptance-20261001-issue16",
+  "map": "quinten1505/wayfinder-herdr-acceptance-20261001-issue16-7c4a#1",
+  "native_event": "pane.agent_status_changed",
+  "installed_manifest_sha256": "dfb75de78b271868dd1a4ecb65dfc2548a02e52d990b6c6efd94b7bc5f5fceff",
+  "original_installed_command": [
+    "./bin/wayfinder-herdr",
+    "reconcile"
+  ],
+  "temporary_command": [
+    "./bin/wf16-duplicate-hook"
+  ],
+  "runtime_unit": "wayfinder-acceptance-20261001-issue16-runtime.service",
+  "runtime_invocation": "c74a22f45360400da1f9a67e8aede0ad",
+  "runtime_binary_sha256": "6a2fcc6f981e78db97babffffbf240aac14052ae7bd7457cdb8e4e509f9a2dd6",
+  "p7_identity": {
+    "pane_id": "w2:p7",
+    "terminal_id": "term_65ccf5049057216",
+    "provider": "codex",
+    "session": {
+      "source": "herdr:codex",
+      "agent": "codex",
+      "kind": "id",
+      "value": "01a0f9ae-2cbf-70e2-8622-ea8fd7c9fff0"
+    },
+    "foreground_process": {
+      "boot_id": "a093fcea-966d-46f2-8931-2d79488ce85b",
+      "pid": 1327454,
+      "start_time_ticks": 5276413
+    },
+    "initial_prompt_attempted": true
+  },
+  "kernel_boot_id": "a093fcea-966d-46f2-8931-2d79488ce85b",
+  "kernel_pid": 1327454,
+  "kernel_start_time_ticks": 5276413,
+  "worker_run_count": 21,
+  "outbox_message_count": 77,
+  "outbox_delivered_count": 77,
+  "outbox_sha256": "3d974bd78dc7934e75401fa043cf70c28be3506c9d9aba4ced421c60765421ff",
+  "history_count": 244,
+  "last_history_entry": {
+    "id": "request-00000000000000000244",
+    "command": "reconcile",
+    "outcome": "Reconciliation requested"
+  },
+  "next_request_sequence": 245,
+  "pending_inbox_files": [],
+  "herdr_pane_state": "idle",
+  "status_prompt_sent": false
+}
