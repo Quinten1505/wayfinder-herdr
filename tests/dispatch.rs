@@ -490,6 +490,32 @@ fn existing_map_authorization_preserves_an_explicit_pause() {
 }
 
 #[test]
+fn orchestrator_launch_retries_a_definitive_busy_shell_without_repeating_the_prompt() {
+    let f = Fixture::new();
+    f.herdr_state.lock().unwrap().fail_agent_start_with_busy = true;
+    success(f.chat());
+    let calls = f.herdr_state.lock().unwrap().requests.clone();
+    assert_eq!(
+        calls
+            .iter()
+            .filter(|call| call["method"] == "agent.start")
+            .count(),
+        2
+    );
+    assert_eq!(
+        calls
+            .iter()
+            .filter(|call| call["method"] == "agent.prompt")
+            .count(),
+        1
+    );
+    assert_eq!(
+        f.state().orchestrator.unwrap().status,
+        store::OrchestratorStatus::Running
+    );
+}
+
+#[test]
 fn late_orchestrator_session_is_pinned_for_the_same_process_before_chat_delivery() {
     let f = Fixture::new();
     f.herdr_state.lock().unwrap().hide_session_reads = 1;
@@ -522,6 +548,7 @@ fn process_replacement_after_initial_prompt_does_not_pin_its_session() {
     {
         let mut herdr = f.herdr_state.lock().unwrap();
         herdr.process_info_sequence = vec![
+            (std::process::id(), "bash".into()),
             (std::process::id(), "codex".into()),
             (replacement.id(), "codex".into()),
         ];
@@ -671,7 +698,7 @@ fn handle_request(mut stream: std::os::unix::net::UnixStream, state: &Arc<Mutex<
             if pane == "origin-pane" {
                 result = json!({"type":"pane_info","pane":{"pane_id":"origin-pane","workspace_id":"origin-workspace","tab_id":"origin-tab","terminal_id":"origin-terminal","agent_status":"working"}});
             } else if let Some(chat) = state.chat_panes.get(pane) {
-                result = json!({"type":"pane_info","pane":{"pane_id":chat.pane,"workspace_id":chat.workspace,"tab_id":chat.tab,"terminal_id":chat.terminal,"agent_status":"idle"}});
+                result = json!({"type":"pane_info","pane":{"pane_id":chat.pane,"workspace_id":chat.workspace,"tab_id":chat.tab,"terminal_id":chat.terminal,"cwd":chat.path,"agent_status":"idle"}});
             } else if let Some(tree) = state.opened_worktrees.iter().find(|tree| tree.pane == pane)
             {
                 result = json!({"type":"pane_info","pane":{"pane_id":tree.pane,"workspace_id":tree.workspace,"tab_id":tree.tab,"terminal_id":tree.terminal,"cwd":tree.path,"agent_status":"unknown"}});

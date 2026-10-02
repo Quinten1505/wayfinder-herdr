@@ -330,12 +330,37 @@ fn launch_chat(mut state: State, launch: ChatLaunch<'_>) -> Result<()> {
         chat.terminal_id = pane["terminal_id"].as_str().map(str::to_owned);
     }
     store::atomic_json(&dir.join("state.json"), &state)?;
-    let started = match client.start_agent(
-        &orchestrator_agent_name(key, pane_id),
-        &provider.kind,
-        pane_id,
-        &args,
-    ) {
+    let shell =
+        wait_for_empty_orchestrator_shell(client, pane_id, &context, pane["terminal_id"].as_str())?;
+    let mut attempts = 0;
+    let started = match loop {
+        attempts += 1;
+        match client.start_agent(
+            &orchestrator_agent_name(key, pane_id),
+            &provider.kind,
+            pane_id,
+            &args,
+        ) {
+            Ok(started) => break Ok(started),
+            Err(error) => {
+                let explicit_busy = error
+                    .downcast_ref::<HerdrApiError>()
+                    .is_some_and(HerdrApiError::is_agent_pane_busy);
+                let same_shell = empty_orchestrator_shell(
+                    client,
+                    pane_id,
+                    &context,
+                    pane["terminal_id"].as_str(),
+                )
+                .is_ok_and(|observed| observed.as_ref() == Some(&shell));
+                if explicit_busy && same_shell && attempts < 10 {
+                    thread::sleep(Duration::from_millis(100));
+                    continue;
+                }
+                break Err(error);
+            }
+        }
+    } {
         Ok(result) => result,
         Err(error) => {
             state.orchestrator.as_mut().unwrap().status = OrchestratorStatus::Uncertain;
@@ -437,6 +462,65 @@ fn orchestrator_agent_name(map_key: &str, pane_id: &str) -> String {
             .map(|byte| format!("{byte:02x}"))
             .collect::<String>()
     )
+}
+
+fn empty_orchestrator_shell(
+    client: &Client,
+    pane_id: &str,
+    context: &ActionContext,
+    expected_terminal: Option<&str>,
+) -> Result<Option<(String, store::LinuxProcessIdentity)>> {
+    match client.agent(pane_id) {
+        Err(error)
+            if error
+                .downcast_ref::<HerdrApiError>()
+                .is_some_and(HerdrApiError::is_agent_not_found) => {}
+        Ok(_) => return Ok(None),
+        Err(error) => return Err(error).context("inspect empty orchestrator pane"),
+    }
+    let pane = client.pane(pane_id)?;
+    let pane = &pane["pane"];
+    ensure!(
+        pane["pane_id"].as_str() == Some(pane_id)
+            && pane["workspace_id"].as_str() == Some(context.workspace_id.as_str())
+            && pane["tab_id"].as_str() == Some(context.tab_id.as_str()),
+        "orchestrator pane identity changed before agent.start"
+    );
+    let terminal = required(pane, "terminal_id")?.to_owned();
+    ensure!(
+        Some(terminal.as_str()) == expected_terminal,
+        "orchestrator terminal changed before agent.start"
+    );
+    let cwd = context
+        .cwd
+        .to_str()
+        .context("orchestrator repository path is not UTF-8")?;
+    ensure!(
+        pane["cwd"].as_str() == Some(cwd),
+        "orchestrator pane changed checkout before agent.start"
+    );
+    let process =
+        crate::herdr::capture_shell_process(&client.pane_process_info(pane_id)?, pane_id, cwd)?;
+    Ok(Some((terminal, process)))
+}
+
+fn wait_for_empty_orchestrator_shell(
+    client: &Client,
+    pane_id: &str,
+    context: &ActionContext,
+    expected_terminal: Option<&str>,
+) -> Result<(String, store::LinuxProcessIdentity)> {
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        match empty_orchestrator_shell(client, pane_id, context, expected_terminal) {
+            Ok(Some(shell)) => return Ok(shell),
+            Ok(None) => bail!("new orchestrator pane acquired an agent before agent.start"),
+            Err(error) if Instant::now() >= deadline => {
+                return Err(error).context("wait for the new orchestrator shell");
+            }
+            Err(_) => thread::sleep(Duration::from_millis(50)),
+        }
+    }
 }
 
 fn wait_for_orchestrator_identity(
