@@ -11,6 +11,9 @@ explicitly names a disposable prototype file.
 import argparse
 import curses
 import json
+import os
+import re
+import select
 import time
 from pathlib import Path
 
@@ -91,7 +94,7 @@ def draw(window, value: str, cursor: int, repo: str, message: str):
         if index < len(rows):
             put(window, y, left + 4, rows[index])
     put(window, top + 10, left + 3, "'" + "-" * field_width + "'", curses.color_pair(2))
-    hint = "Enter starts  Ctrl+N new line  Esc cancels"
+    hint = "Enter starts  Shift+Enter new line  Esc cancels"
     put(window, top + 11, left + 3, hint, curses.color_pair(2))
     if message:
         put(window, top + 13, left + 2, message, curses.color_pair(4))
@@ -119,8 +122,56 @@ def draw_progress(window, repo: str):
     window.refresh()
 
 
+def read_key():
+    # curses.get_wch() normalizes both CR and LF to '\n' even in raw mode.
+    # Read the PTY bytes directly so Enter and Shift+Enter can differ.
+    if not select.select([0], [], [], 0.25)[0]:
+        return "idle", ""
+    first = os.read(0, 1)
+    if first == b"\x1b":
+        tail = bytearray()
+        deadline = time.monotonic() + 0.05
+        while len(tail) < 32:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0 or not select.select([0], [], [], remaining)[0]:
+                break
+            part = os.read(0, 1)
+            tail.extend(part)
+            if not tail.startswith(b"[") or (len(tail) > 1 and (part.isalpha() or part == b"~")):
+                break
+        sequence = bytes(tail)
+        if not sequence:
+            return "escape", ""
+        if re.fullmatch(rb"\[(?:13|10);2(?::\d+)?u", sequence) or sequence in (b"[27;2;13~", b"\r"):
+            return "newline", ""
+        navigation = {b"[A": "up", b"[B": "down", b"[C": "right", b"[D": "left", b"[H": "home", b"[F": "end", b"[3~": "delete"}
+        return navigation.get(sequence, "idle"), ""
+    if first == b"\r":
+        return "enter", ""
+    if first in (b"\n", b"\x0e"):
+        return "newline", ""
+    if first in (b"\x7f", b"\x08"):
+        return "backspace", ""
+    if first == b"\x03":
+        return "escape", ""
+    if first[0] < 32:
+        return "idle", ""
+    if first[0] < 128:
+        return "text", first.decode("ascii")
+
+    expected = 2 if first[0] < 224 else 3 if first[0] < 240 else 4
+    encoded = bytearray(first)
+    while len(encoded) < expected and select.select([0], [], [], 0.05)[0]:
+        encoded.extend(os.read(0, 1))
+    try:
+        return "text", encoded.decode("utf-8")
+    except UnicodeDecodeError:
+        return "idle", ""
+
+
 def run_tui(window, repo: str, delay: float):
     curses.set_escdelay(25)
+    curses.raw()
     try:
         curses.curs_set(1)
     except curses.error:
@@ -132,45 +183,45 @@ def run_tui(window, repo: str, delay: float):
         curses.init_pair(3, curses.COLOR_GREEN, -1)
         curses.init_pair(4, curses.COLOR_RED, -1)
 
-    window.keypad(True)
+    window.keypad(False)
     value = ""
     cursor = 0
     message = ""
     while True:
         draw(window, value, cursor, repo, message)
-        key = window.get_wch()
-        if key == "\x1b":
+        kind, char = read_key()
+        if kind == "escape":
             return "cancelled", ""
-        if key in ("\n", "\r", curses.KEY_ENTER):
+        if kind == "enter":
             if not value.strip():
                 message = "Describe a feature before pressing Enter."
                 continue
             draw_progress(window, repo)
             time.sleep(delay)
             return "submitted", value.strip()
-        if key == "\x0e":
+        if kind == "newline":
             value = value[:cursor] + "\n" + value[cursor:]
             cursor += 1
-        elif key in (curses.KEY_BACKSPACE, "\b", "\x7f"):
+        elif kind == "backspace":
             if cursor:
                 value = value[: cursor - 1] + value[cursor:]
                 cursor -= 1
-        elif key == curses.KEY_DC:
+        elif kind == "delete":
             value = value[:cursor] + value[cursor + 1 :]
-        elif key == curses.KEY_LEFT:
+        elif kind == "left":
             cursor = max(0, cursor - 1)
-        elif key == curses.KEY_RIGHT:
+        elif kind == "right":
             cursor = min(len(value), cursor + 1)
-        elif key in (curses.KEY_UP, curses.KEY_DOWN):
+        elif kind in ("up", "down"):
             _, positions = layout(value, max(1, min(window.getmaxyx()[1] - 10, 68)))
-            cursor = move_vertical(cursor, positions, -1 if key == curses.KEY_UP else 1)
-        elif key == curses.KEY_HOME:
+            cursor = move_vertical(cursor, positions, -1 if kind == "up" else 1)
+        elif kind == "home":
             cursor = value.rfind("\n", 0, cursor) + 1
-        elif key == curses.KEY_END:
+        elif kind == "end":
             next_break = value.find("\n", cursor)
             cursor = len(value) if next_break < 0 else next_break
-        elif isinstance(key, str) and key.isprintable() and len(value) < 4000:
-            value = value[:cursor] + key + value[cursor:]
+        elif kind == "text" and len(value) < 4000:
+            value = value[:cursor] + char + value[cursor:]
             cursor += 1
         message = ""
 
