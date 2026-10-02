@@ -61,6 +61,8 @@ fn reconcile(dir: &Path, state: &mut State) -> Result<String> {
     host::check(&state.binding)?;
     let map = MapRef::parse(&state.map)?;
     let github = GitHub::default();
+    state.canonical_linked_spec_url = github.canonical_linked_spec_url(&map)?;
+    state.canonical_linked_spec_resolved = true;
     let frontier = github.reconcile(&map)?;
     let tracker_dir = dir.join("tracker");
     fs::create_dir_all(&tracker_dir)?;
@@ -360,14 +362,19 @@ fn apply_delivery_outcome(
                     && run.base_commit.as_deref() == Some(commit)
                     && !matches!(run.status, WorkerStatus::Failed | WorkerStatus::Stopped)
                     && (run.status != WorkerStatus::Completed
-                        || delivery_state
-                            .pr_base_commit
-                            .as_deref()
-                            .is_some_and(|base| {
-                                delivery::final_feature_review_scope_matches(
-                                    run, &state.map, base, commit,
-                                )
-                            }))
+                        || (state.canonical_linked_spec_resolved
+                            && delivery_state
+                                .pr_base_commit
+                                .as_deref()
+                                .is_some_and(|base| {
+                                    delivery::final_feature_review_scope_matches(
+                                        run,
+                                        &state.map,
+                                        base,
+                                        commit,
+                                        state.canonical_linked_spec_url.as_deref(),
+                                    )
+                                })))
             }) {
                 let source = state
                     .workers
@@ -785,6 +792,7 @@ mod tests {
         let dir = store::map_dir(temp.path(), &key).unwrap();
         let map = MapRef::parse("example/project#42").unwrap();
         let mut state = store::read_state(&dir).unwrap();
+        state.canonical_linked_spec_resolved = true;
         new_run(
             &mut state,
             NewRun {
@@ -2130,7 +2138,13 @@ fn accept_result(
                     .trim()
                     .to_owned();
                 ensure!(
-                    scope.matches(&state.map, &base, target),
+                    state.canonical_linked_spec_resolved
+                        && scope.matches(
+                            &state.map,
+                            &base,
+                            target,
+                            state.canonical_linked_spec_url.as_deref(),
+                        ),
                     "final-feature review scope does not match the complete map, origin/develop base, accepted decisions, and pinned commit"
                 );
             }
@@ -2846,6 +2860,14 @@ fn worker_prompt(run: &WorkerRun, state: &State) -> Result<String> {
     };
     let final_feature_review = run.is_final_feature_review();
     let (work, context) = if final_feature_review {
+        ensure!(
+            state.canonical_linked_spec_resolved,
+            "final review cannot launch before canonical linked specification resolution"
+        );
+        let spec = state
+            .canonical_linked_spec_url
+            .as_deref()
+            .unwrap_or("none-linked");
         let target = run
             .base_commit
             .as_deref()
@@ -2856,7 +2878,7 @@ fn worker_prompt(run: &WorkerRun, state: &State) -> Result<String> {
         ensure!(is_full_commit(&base), "origin/develop is not a full commit");
         (
             format!(
-                "This is the independent COMPLETE-FEATURE review, not a review of ticket #{} alone or only the latest commit. Read the entire map #{}, its every linked ticket, linked spec (if any), and all accepted map/spec comments and human decisions. Inspect the complete change range `origin/develop..{target}` and the resulting tree, then compare the complete feature with the map/spec. Do not edit or commit. The exact review correlation is map `{}`; base ref `origin/develop` at `{base}`; pinned HEAD `{target}`. Record the linked spec's canonical GitHub issue URL, or `none-linked` only if the map has no linked spec.",
+                "This is the independent COMPLETE-FEATURE review, not a review of ticket #{} alone or only the latest commit. Read the entire map #{}, its every linked ticket, linked spec (if any), and all accepted map/spec comments and human decisions. Inspect the complete change range `origin/develop..{target}` and the resulting tree, then compare the complete feature with the map/spec. Do not edit or commit. The exact review correlation is map `{}`; base ref `origin/develop` at `{base}`; pinned HEAD `{target}`. The canonical linked spec is exactly `{spec}`; report that exact URL, or `none-linked` only when this runtime resolved no canonical link.",
                 run.ticket, map.number, state.map
             ),
             String::new(),
@@ -2885,11 +2907,11 @@ fn worker_prompt(run: &WorkerRun, state: &State) -> Result<String> {
             "base_ref": "origin/develop",
             "base_commit": git(&run.worktree, &["rev-parse", "refs/remotes/origin/develop"])?.trim(),
             "reviewed_commit": run.base_commit.as_deref().unwrap_or_default(),
-            "spec": "<canonical linked GitHub issue URL, or none-linked>",
+            "spec": state.canonical_linked_spec_url.as_deref().unwrap_or("none-linked"),
             "accepted_decisions_reviewed": true,
         });
         format!(
-            "Also include this correlated object as `final_feature_review` in `.wayfinder-result.json`, replacing the `spec` placeholder with the linked spec URL or `none-linked` only when there is no linked spec:\n```json\n{}\n``` The runtime requires this scope block before the result can authorize readiness.",
+            "Also include this correlated object as `final_feature_review` in `.wayfinder-result.json` exactly as shown:\n```json\n{}\n``` The runtime requires this scope block before the result can authorize readiness.",
             serde_json::to_string_pretty(&example)?
         )
     } else {

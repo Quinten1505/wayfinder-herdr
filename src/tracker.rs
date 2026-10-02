@@ -245,6 +245,25 @@ impl GitHub {
         Ok(frontier)
     }
 
+    /// Resolve the map's canonical specification from its body declaration or
+    /// a specifically named append-only map comment. Other GitHub links (for
+    /// example decision tickets) do not count as specification links.
+    pub fn canonical_linked_spec_url(&self, map: &MapRef) -> Result<Option<String>> {
+        let issue = self.issue(map, map.number)?;
+        let body = issue["body"].as_str().context("map issue omitted body")?;
+        let mut raw_comments = self.comments(map, map.number)?;
+        raw_comments.sort_by(|left, right| {
+            left["created_at"]
+                .as_str()
+                .cmp(&right["created_at"].as_str())
+        });
+        let comments = raw_comments
+            .into_iter()
+            .filter_map(|comment| comment["body"].as_str().map(str::to_owned))
+            .collect::<Vec<_>>();
+        canonical_spec_from_map_text(body, &comments)
+    }
+
     /// Read the named child tickets that currently list `blocker` as a native dependency.
     pub fn ticket_dependents(
         &self,
@@ -839,6 +858,98 @@ impl GitHub {
     }
 }
 
+fn specification_declaration(line: &str) -> bool {
+    let line = line
+        .trim()
+        .trim_start_matches(['-', '*', ' '])
+        .trim()
+        .trim_start_matches('*')
+        .trim();
+    let Some((label, _)) = line.split_once(':') else {
+        return false;
+    };
+    let label = label.trim().trim_matches('*').trim();
+    label.eq_ignore_ascii_case("specification")
+        || label.eq_ignore_ascii_case("canonical specification")
+}
+
+pub(crate) fn canonical_spec_from_map_text(
+    body: &str,
+    comments: &[String],
+) -> Result<Option<String>> {
+    let mut body_links = body
+        .lines()
+        .filter(|line| specification_declaration(line))
+        .map(markdown_issue_links)
+        .collect::<Result<Vec<_>>>()?
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>();
+    body_links.sort();
+    body_links.dedup();
+    ensure!(
+        body_links.len() <= 1,
+        "map body declares more than one canonical linked specification"
+    );
+    if let Some(body_link) = body_links.into_iter().next() {
+        return Ok(Some(body_link));
+    }
+
+    // With issue18's append-only policy, a newer named pointer supersedes an
+    // older pointer. The comment stream is returned in creation order; body
+    // declarations, when manually refreshed, take precedence above.
+    let mut canonical = None;
+    for text in comments {
+        let is_named_pointer = text.lines().any(|line| {
+            line.trim_start()
+                .starts_with("### Canonical linked specification")
+        });
+        if is_named_pointer {
+            let mut links = markdown_issue_links(text)?;
+            links.sort();
+            links.dedup();
+            ensure!(
+                links.len() <= 1,
+                "named map comment declares more than one canonical linked specification"
+            );
+            if let Some(link) = links.into_iter().next() {
+                canonical = Some(link);
+            }
+        }
+    }
+    Ok(canonical)
+}
+
+fn markdown_issue_links(text: &str) -> Result<Vec<String>> {
+    let mut links = Vec::new();
+    let mut remainder = text;
+    while let Some((_, after_marker)) = remainder.split_once("](") {
+        let (url, after_url) = after_marker
+            .split_once(')')
+            .context("malformed Markdown link in canonical specification declaration")?;
+        validate_github_issue_url(url)?;
+        links.push(url.to_owned());
+        remainder = after_url;
+    }
+    Ok(links)
+}
+
+fn validate_github_issue_url(url: &str) -> Result<()> {
+    let path = url
+        .strip_prefix("https://github.com/")
+        .context("canonical specification URL must use https://github.com")?;
+    let parts = path.split('/').collect::<Vec<_>>();
+    ensure!(
+        parts.len() == 4
+            && !parts[0].is_empty()
+            && !parts[1].is_empty()
+            && parts[2] == "issues"
+            && parts[3].parse::<u64>().is_ok_and(|number| number > 0),
+        "canonical specification URL must identify one GitHub issue"
+    );
+    Ok(())
+}
+
 fn validate_repo(owner: &str, repository: &str) -> Result<()> {
     ensure!(
         !owner.is_empty()
@@ -953,5 +1064,68 @@ mod tests {
         }
         assert!(section("## Destination\n\nExecution override: selected", "Notes").is_err());
         assert!(!affirmative_execution_override("Execution override: TBD"));
+    }
+
+    #[test]
+    fn canonical_spec_reader_ignores_unrelated_links_and_accepts_named_append_comment() {
+        let body = "## Destination\n\n- Map notes.\n\n## Notes\n\n- Decision: [ticket](https://github.com/acme/project/issues/7).";
+        let comments = vec!["### Canonical linked specification — body refresh pending for a human\n\n- [Spec](https://github.com/acme/project/issues/10)\n\n<!-- marker -->".to_owned()];
+        assert_eq!(
+            canonical_spec_from_map_text(body, &comments)
+                .unwrap()
+                .as_deref(),
+            Some("https://github.com/acme/project/issues/10")
+        );
+        assert_eq!(canonical_spec_from_map_text(body, &[]).unwrap(), None);
+        let refreshed_body = "## Destination\n\n- Specification: [Refreshed spec](https://github.com/acme/project/issues/12).";
+        assert_eq!(
+            canonical_spec_from_map_text(refreshed_body, &comments)
+                .unwrap()
+                .as_deref(),
+            Some("https://github.com/acme/project/issues/12")
+        );
+        let superseding_comments = vec![
+            comments[0].clone(),
+            "### Canonical linked specification update — body refresh pending for a human\n\n- [New spec](https://github.com/acme/project/issues/11)".to_owned(),
+        ];
+        assert_eq!(
+            canonical_spec_from_map_text("## Destination", &superseding_comments)
+                .unwrap()
+                .as_deref(),
+            Some("https://github.com/acme/project/issues/11")
+        );
+    }
+
+    #[test]
+    fn canonical_spec_declaration_rejects_non_issue_or_non_https_urls() {
+        for url in [
+            "https://github.com/acme/project/pull/10",
+            "https://example.com/acme/project/issues/10",
+            "https://github.com/acme/project/issues/0",
+            "https://github.com/acme/project/issues/10?tab=comments",
+        ] {
+            let text = format!("### Canonical linked specification\n[Spec]({url})");
+            assert!(markdown_issue_links(&text).is_err(), "accepted {url}");
+        }
+    }
+
+    #[test]
+    fn specification_declaration_is_explicit_and_case_insensitive() {
+        assert!(specification_declaration(
+            "- Specification: [Canonical](https://github.com/acme/project/issues/10)."
+        ));
+        assert!(specification_declaration(
+            "**Canonical specification:** [Canonical](https://github.com/acme/project/issues/10)"
+        ));
+        let actual_map_body = "## Destination\n\n**Canonical specification:** [Wayfinder herdr plugin specification](https://github.com/Quinten1505/wayfinder-herdr/issues/10).";
+        assert_eq!(
+            canonical_spec_from_map_text(actual_map_body, &[])
+                .unwrap()
+                .as_deref(),
+            Some("https://github.com/Quinten1505/wayfinder-herdr/issues/10")
+        );
+        assert!(!specification_declaration(
+            "- Decision: [ticket](https://github.com/acme/project/issues/7)"
+        ));
     }
 }

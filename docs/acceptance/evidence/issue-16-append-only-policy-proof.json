@@ -1,0 +1,34 @@
+{
+  "format_version": 1,
+  "repo": "Quinten1505/wayfinder-herdr-acceptance-20261001-issue16-7c4a",
+  "method": "Root orchestrator gh issue comment with body files and read-before-retry operation markers; no existing issue body write. This tests the real append-only policy outcome, not the Rust tracker resolve CLI.",
+  "source_resolution_url": "https://github.com/Quinten1505/wayfinder-herdr-acceptance-20261001-issue16-7c4a/issues/2#issuecomment-5940632657",
+  "accepted_parser_commit": "4e0cefd83e6f853ed8748745cad34682644b56d4",
+  "started_at_utc": "2026-10-02T00:21:37.803966+00:00",
+  "targets": {
+    "1": {
+      "title": "Acceptance: exact milli-unit quantity parsing",
+      "body_sha256_before": "eec9ba10689af163c5b456c4dd8bedf0cc1eff81f0a76c3288f2d59eea01f334",
+      "comment_confirmed": true,
+      "operation_marker": "wayfinder-live-policy-map-2-4e0cefd",
+      "phase": "confirmed",
+      "comment_url": "https://github.com/Quinten1505/wayfinder-herdr-acceptance-20261001-issue16-7c4a/issues/1#issuecomment-5943213620",
+      "comment_sha256": "53af0d1c69d68c01b033713f7f92c78c660fdf6e1e3d7f768bc5e5033e358267",
+      "body_sha256_after": "eec9ba10689af163c5b456c4dd8bedf0cc1eff81f0a76c3288f2d59eea01f334",
+      "body_unchanged": true
+    },
+    "5": {
+      "title": "Draft spec: parser example format",
+      "body_sha256_before": "c4535c6be9a9ea7af039d3cec58a8497c6eb2cba7591984c822b630a41d7221a",
+      "comment_confirmed": true,
+      "operation_marker": "wayfinder-live-policy-spec-2-4e0cefd",
+      "phase": "confirmed",
+      "comment_url": "https://github.com/Quinten1505/wayfinder-herdr-acceptance-20261001-issue16-7c4a/issues/5#issuecomment-5943214058",
+      "comment_sha256": "8d053e93ab88221e1a65407472956b8510341c2d88ba3e3d5c351ab0639b4d39",
+      "body_sha256_after": "c4535c6be9a9ea7af039d3cec58a8497c6eb2cba7591984c822b630a41d7221a",
+      "body_unchanged": true
+    }
+  },
+  "completed_at_utc": "2026-10-02T00:22:23.345328+00:00",
+  "outcome": "Both named append-only comments confirmed once, both existing issue bodies unchanged, no pending documentation answer supplied."
+}

@@ -1,0 +1,21 @@
+{
+  "format_version": 1,
+  "source_checkout_base": "9514222631ee5ded6084c1ba64c7eba5e5e91781",
+  "checks": [
+    {"command":"CARGO_HOME=/tmp/wayfinder-12-review-cargo-home CARGO_TARGET_DIR=/tmp/wf16-acceptance/evidence/source-final-target cargo fmt --all -- --check","result":"passed"},
+    {"command":"CARGO_HOME=/tmp/wayfinder-12-review-cargo-home CARGO_TARGET_DIR=/tmp/wf16-acceptance/evidence/source-final-target cargo clippy --locked --all-targets -- -D warnings","result":"passed"},
+    {"command":"CARGO_HOME=/tmp/wayfinder-12-review-cargo-home CARGO_TARGET_DIR=/tmp/wf16-acceptance/evidence/source-final-target cargo test --locked --all-targets","result":"passed: 35 library, 71 dispatch, 12 runtime, 11 tracker tests (129 total)"},
+    {"command":"CARGO_HOME=/tmp/wayfinder-12-review-cargo-home CARGO_TARGET_DIR=/tmp/wf16-acceptance/evidence/installer-cargo-target WAYFINDER_INSTALL_DIR=/tmp/wf16-acceptance/install python3 tests/install_smoke.py","result":"passed after sandbox herdr plugin link returned EPERM; escalated rerun passed using isolated temporary XDG/install roots and recording-only systemctl"},
+    {"command":"git diff --check","result":"passed"}
+  ],
+  "quota_event": {
+    "initial_full_test_attempt": "failed during target linking because the shared user disk quota was exhausted; no test assertion ran in that attempt",
+    "root_cleanup_receipt": "/tmp/wf16-acceptance/evidence/root-cargo-cache-cleanup.json",
+    "root_cleanup_receipt_sha256": "99a1d0c5abd989473564e01b4fec8209c0ae7b2f50e3426fb1d6dff25f076de7",
+    "removed_dirs": ["final-cargo-target","final-session-pin-target","session-pin-target","source-check-cargo-target"],
+    "preserved_current_targets": ["issue16-target","source-final-target"]
+  },
+  "installer_limit": "Installer smoke's systemctl is a recording stub; real user-service supervision is separate live evidence in issue-16-live.md.",
+  "human_gate": {"status":"pending","run":"run-00000000000000000023","request":"human-run-00000000000000000023-0001","answer":null},
+  "scope": "Checkpoint validation only; no independent acceptance review was invoked."
+}

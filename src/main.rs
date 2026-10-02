@@ -481,6 +481,31 @@ fn run() -> Result<()> {
                 .position(|worker| worker.id == run)
                 .context("worker run not found")?;
             let worker = state.workers.runs[i].clone();
+            let unsent_queued = worker.status == WorkerStatus::Queued
+                && worker.workspace_id.is_none()
+                && worker.tab_id.is_none()
+                && worker.pane_id.is_none()
+                && worker.terminal_id.is_none()
+                && worker.agent_provider.is_none()
+                && worker.agent_session.is_none()
+                && worker.foreground_process.is_none()
+                && worker.initial_prompt_attempted.is_none()
+                && !worker.initial_prompt_pending
+                && !worker.initial_prompt_acknowledged
+                && worker.result_commit.is_none()
+                && worker.result_evidence.is_none()
+                && !worker.worktree.exists();
+            if unsent_queued {
+                state.workers.runs[i].status = WorkerStatus::Stopped;
+                state.workers.runs[i].human_decision = Some(
+                    "cancelled before dispatch; no checkout or worker process was created".into(),
+                );
+                store::atomic_json(&dir.join("state.json"), &state)?;
+                println!(
+                    "Undispatched queued worker {run} stopped; its durable history was retained."
+                );
+                return Ok(());
+            }
             let confirmed_blocked = worker.status == WorkerStatus::NeedsHuman
                 && worker.human_request_kind == Some(HumanRequestKind::HerdrBlockedUi);
             let confirmed_unsent = worker.status == WorkerStatus::Uncertain
@@ -800,6 +825,19 @@ fn run() -> Result<()> {
                 .position(|worker| worker.id == run)
                 .context("worker run not found")?;
             let prior = state.workers.runs[old].clone();
+            if let Some(existing) = state.workers.runs.iter().find(|candidate| {
+                candidate.source_run.as_deref() == Some(prior.id.as_str())
+                    && !matches!(
+                        candidate.status,
+                        WorkerStatus::Stopped | WorkerStatus::Failed
+                    )
+            }) {
+                println!(
+                    "Retry already recorded as {}; no additional worker was created.",
+                    existing.id
+                );
+                return Ok(());
+            }
             ensure!(
                 matches!(prior.status, WorkerStatus::Stopped | WorkerStatus::Failed)
                     || (confirmed_absent_or_stopped

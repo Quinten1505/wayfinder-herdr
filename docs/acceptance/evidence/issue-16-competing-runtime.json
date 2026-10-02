@@ -1,0 +1,15 @@
+{
+  "format_version": 1,
+  "captured_at_utc": "2026-10-02T00:26:04Z",
+  "session": "wayfinder-acceptance-20261001-issue16",
+  "map_key": "a17b3c907d0d945e87e2bb22ba9e1b3751b80d2885e472dfd6222e28405db1ab",
+  "state_dir": "/tmp/wf16-acceptance/state/wayfinder-herdr",
+  "primary_runtime": {"unit":"wayfinder-acceptance-20261001-issue16-runtime.service","active":true,"main_pid":1518633},
+  "attempt": {
+    "command": "timeout 8s /tmp/wf16-acceptance/bin/wf16-env /tmp/wf16-acceptance/install/bin/wayfinder-herdr --state-dir /tmp/wf16-acceptance/state/wayfinder-herdr serve --key a17b3c907d0d945e87e2bb22ba9e1b3751b80d2885e472dfd6222e28405db1ab",
+    "exit_code": 1,
+    "stderr": "Wayfinder: lock busy: /tmp/wf16-acceptance/state/wayfinder-herdr/maps/a17b3c907d0d945e87e2bb22ba9e1b3751b80d2885e472dfd6222e28405db1ab/runtime.lock (another runtime or command owns this map): Resource temporarily unavailable (os error 11)",
+    "outcome": "competing same-map runtime rejected by exclusive runtime lock; primary runtime stayed active"
+  },
+  "scope": "No other state directory/session was addressed; no second worker was launched."
+}

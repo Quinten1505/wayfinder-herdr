@@ -1,0 +1,19 @@
+{
+  "format_version": 1,
+  "status": "pending_real_user_response",
+  "map": "quinten1505/wayfinder-herdr-acceptance-20261001-issue16-7c4a#1",
+  "spec": "quinten1505/wayfinder-herdr-acceptance-20261001-issue16-7c4a#5",
+  "ticket": "quinten1505/wayfinder-herdr-acceptance-20261001-issue16-7c4a#6",
+  "source_request": {"run":"run-00000000000000000022","id":"human-run-00000000000000000022-0002","status":"preserved_unanswered_after_cold_restart"},
+  "active_request": {"run":"run-00000000000000000023","id":"human-run-00000000000000000023-0001","kind":"worker_question","sequence":1,"status":"needs_human"},
+  "exact_question": "For the `parse_milli` guide example, should the explanation use a compact input/output comparison table or a short Rust code snippet?",
+  "options": [
+    {"label":"Comparison table","recommended":true,"description":"Concise and readable for CLI users."},
+    {"label":"Short Rust snippet","recommended":false,"description":"Demonstrates the API call directly."}
+  ],
+  "bound_orchestrator": {"pane":"w2:p8","terminal":"term_65cd05438c54e14","session":"01a0f9f0-b70f-7611-b1e6-a96c66895b0e","process":{"pid":1481892,"start_time_ticks":5712523,"boot_id":"a093fcea-966d-46f2-8931-2d79488ce85b"},"surface_observed":true},
+  "current_worker": {"pane":"wP:p1","terminal":"term_65cd07a51477415","session":"01a0f9fa-771a-7b90-89fa-9bf31c27436d","process":{"pid":1519949,"start_time_ticks":5776436,"boot_id":"a093fcea-966d-46f2-8931-2d79488ce85b"}},
+  "answer": null,
+  "record_answer_only_after_root_relays_real_response": "/tmp/wf16-acceptance/bin/wf16-env /tmp/wf16-acceptance/install/bin/wayfinder-herdr --state-dir /tmp/wf16-acceptance/state/wayfinder-herdr answer-worker --map quinten1505/wayfinder-herdr-acceptance-20261001-issue16-7c4a#1 --run run-00000000000000000023 --request-id human-run-00000000000000000023-0001 --request-type worker_question --response 'EXACT HUMAN RESPONSE'",
+  "evidence_paths": ["/tmp/wf16-human-request.json","/tmp/wf16-acceptance/state/wayfinder-herdr/maps/a17b3c907d0d945e87e2bb22ba9e1b3751b80d2885e472dfd6222e28405db1ab/worker-results/run-00000000000000000023.json","/tmp/wf16-acceptance/.wayfinder-1-6-23/.wayfinder-result.json"]
+}

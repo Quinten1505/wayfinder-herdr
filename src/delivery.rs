@@ -114,13 +114,19 @@ pub struct FinalFeatureReviewScope {
 }
 
 impl FinalFeatureReviewScope {
-    pub fn matches(&self, expected_map: &str, expected_base: &str, expected_commit: &str) -> bool {
+    pub fn matches(
+        &self,
+        expected_map: &str,
+        expected_base: &str,
+        expected_commit: &str,
+        expected_spec: Option<&str>,
+    ) -> bool {
         self.scope == "complete_feature"
             && self.map == expected_map
             && self.base_ref == "origin/develop"
             && self.base_commit == expected_base
             && self.reviewed_commit == expected_commit
-            && (self.spec == "none-linked" || self.spec.starts_with("https://github.com/"))
+            && self.spec == expected_spec.unwrap_or("none-linked")
             && self.accepted_decisions_reviewed
     }
 }
@@ -299,6 +305,7 @@ pub fn final_feature_review_scope_matches(
     expected_map: &str,
     expected_base: &str,
     expected_commit: &str,
+    expected_spec: Option<&str>,
 ) -> bool {
     if !run.is_final_feature_review()
         || run.role != "reviewer"
@@ -316,7 +323,7 @@ pub fn final_feature_review_scope_matches(
     let observed_base = git(&run.worktree, &["rev-parse", "refs/remotes/origin/develop"])
         .ok()
         .map(|value| value.trim().to_owned());
-    scope.matches(expected_map, expected_base, expected_commit)
+    scope.matches(expected_map, expected_base, expected_commit, expected_spec)
         && observed_base.as_deref() == Some(expected_base)
 }
 
@@ -912,12 +919,22 @@ fn mark_ready_with(
             && reviewer.status == WorkerStatus::Completed,
         "final reviewer did not complete against the current feature commit"
     );
+    ensure!(
+        workers.canonical_linked_spec_resolved,
+        "canonical linked specification has not been resolved from the map"
+    );
     let review_base = delivery
         .pr_base_commit
         .as_deref()
         .context("final feature review has no recorded develop base")?;
     ensure!(
-        final_feature_review_scope_matches(reviewer, map, review_base, commit),
+        final_feature_review_scope_matches(
+            reviewer,
+            map,
+            review_base,
+            commit,
+            workers.canonical_linked_spec_url.as_deref(),
+        ),
         "final review evidence does not correlate a complete-feature scope, map, accepted decisions, origin/develop base, and pinned commit"
     );
     let review_summary = approved_review(reviewer, commit)?;
@@ -1453,7 +1470,8 @@ fn feature_review_outcome(
             child.state == "open"
         }
     });
-    if unresolved_children
+    if !state.canonical_linked_spec_resolved
+        || unresolved_children
         || delivery.tickets.is_empty()
         || delivery
             .tickets
@@ -1486,7 +1504,14 @@ fn feature_review_outcome(
             && candidate.base_commit.as_deref() == Some(&head)
             && candidate.status == WorkerStatus::Completed
             && review_base.is_some_and(|base| {
-                final_feature_review_scope_matches(candidate, &state.map, base, &head)
+                state.canonical_linked_spec_resolved
+                    && final_feature_review_scope_matches(
+                        candidate,
+                        &state.map,
+                        base,
+                        &head,
+                        state.canonical_linked_spec_url.as_deref(),
+                    )
             })
     });
     let Some(final_review) = final_review else {
@@ -1680,6 +1705,7 @@ fn ensure_draft_pr_with_gh(
                 .is_some_and(|ready_commit| {
                     workers.workers.runs.iter().any(|run| {
                         crate::store::implementation_source(&workers.workers.runs, run).is_some()
+                            && workers.canonical_linked_spec_resolved
                             && final_feature_review_scope_matches(
                                 run,
                                 map,
@@ -1688,6 +1714,7 @@ fn ensure_draft_pr_with_gh(
                                     .as_deref()
                                     .unwrap_or(observed_base.as_str()),
                                 ready_commit,
+                                workers.canonical_linked_spec_url.as_deref(),
                             )
                     })
                 });
@@ -2789,6 +2816,8 @@ mod tests {
             let state: serde_json::Value = json!({
                 "format_version":1,
                 "map":"example/project#42",
+                "canonical_linked_spec_url":null,
+                "canonical_linked_spec_resolved":true,
                 "binding":{"repository":repo,"herdr_binary":"/bin/true","socket":"/tmp/test.sock","herdr_config":null},
                 "authorization":"started","poll_seconds":30,"concurrency":3,"reconciled":true,
                 "suspension":"","history":[],"workers":{"next_run":2,"runs":[implementer,reviewer],"providers":{}}
@@ -3685,6 +3714,7 @@ else:
         .unwrap();
         let mut state_json = json!({
             "format_version":1,"map":"example/project#42",
+            "canonical_linked_spec_url":null,"canonical_linked_spec_resolved":true,
             "binding":{"repository":repo,"herdr_binary":"/bin/true","socket":"/tmp/test.sock","herdr_config":null},
             "authorization":"started","poll_seconds":30,"concurrency":3,"reconciled":true,
             "suspension":"","history":[],"workers":{"next_run":0,"runs":[],"providers":{}}
@@ -3758,6 +3788,11 @@ else:
         );
         let evidence = temp.path().join("final-review.json");
         let review_base = command(&repo, &["rev-parse", "refs/remotes/origin/develop"]);
+        let map_body = "## Destination\n\nAcceptance: exact milli-unit quantity parsing\n\n## Notes\n\nDisposable end-to-end acceptance map.\n\n## Decisions so far\n\n## Not yet specified\n\n## Out of scope\n";
+        let map_comments = vec!["### Canonical linked specification — body refresh pending for a human\n\n- [Draft spec: parser example format](https://github.com/Quinten1505/wayfinder-herdr-acceptance-20261001-issue16-7c4a/issues/5)\n\nThis named append-only pointer identifies the map's canonical linked specification. Refresh the map body manually when a human chooses to apply the link.\n\n<!-- issue16-live-canonical-spec:map-1:spec-5 -->".to_owned()];
+        let canonical_spec = crate::tracker::canonical_spec_from_map_text(map_body, &map_comments)
+            .unwrap()
+            .unwrap();
         fs::write(
             &evidence,
             serde_json::to_vec(&json!({
@@ -3768,7 +3803,7 @@ else:
                 "final_feature_review":{
                     "scope":"complete_feature","map":"example/project#42",
                     "base_ref":"origin/develop","base_commit":review_base,
-                    "reviewed_commit":head,"spec":"none-linked",
+                    "reviewed_commit":head,"spec":canonical_spec,
                     "accepted_decisions_reviewed":true
                 }
             })).unwrap(),
@@ -3776,14 +3811,58 @@ else:
         .unwrap();
         let reviewer = json!({"id":"run-final-review","ticket":15,"role":"reviewer","attempt":2,"rework_round":0,"status":"completed","worktree":reviewer_path,"workspace_id":null,"tab_id":null,"pane_id":null,"base_commit":head,"result_commit":null,"summary":"feature approved","question":null,"source_run":"run-final-first","purpose":"final_feature_review","claim_login":null,"context":"Human explicitly authorized this retry after the preceding worker was confirmed stopped or absent.","last_activity_ms":null,"terminal_id":null,"agent_provider":null,"agent_session":null,"foreground_process":null,"result_evidence":evidence});
         let retry_parent = json!({"id":"run-final-first","ticket":15,"role":"reviewer","attempt":1,"status":"stopped","worktree":repo,"base_commit":head,"source_run":"run-1","purpose":"final_feature_review","context":"Human explicitly authorized this retry after the preceding worker was confirmed stopped or absent."});
-        let mut ready_workers: State = serde_json::from_value(json!({"format_version":1,"map":"example/project#42","binding":{"repository":repo,"herdr_binary":"/bin/true","socket":"/tmp/test.sock","herdr_config":null},"authorization":"started","poll_seconds":30,"concurrency":3,"reconciled":true,"suspension":"","history":[],"workers":{"next_run":4,"runs":[reviewer,retry_parent,{"id":"run-1","ticket":15,"role":"implementer","attempt":1,"status":"reviewed","worktree":repo,"base_commit":head,"result_commit":head}],"providers":{}}})).unwrap();
+        let mut ready_workers: State = serde_json::from_value(json!({"format_version":1,"map":"example/project#42","canonical_linked_spec_url":canonical_spec,"canonical_linked_spec_resolved":true,"binding":{"repository":repo,"herdr_binary":"/bin/true","socket":"/tmp/test.sock","herdr_config":null},"authorization":"started","poll_seconds":30,"concurrency":3,"reconciled":true,"suspension":"","history":[],"workers":{"next_run":4,"runs":[reviewer,retry_parent,{"id":"run-1","ticket":15,"role":"implementer","attempt":1,"status":"reviewed","worktree":repo,"base_commit":head,"result_commit":head}],"providers":{}}})).unwrap();
         let reviewer_run = &ready_workers.workers.runs[0];
         assert!(final_feature_review_scope_matches(
             reviewer_run,
             "example/project#42",
             &review_base,
-            &head
+            &head,
+            Some(&canonical_spec)
         ));
+        assert!(!final_feature_review_scope_matches(
+            reviewer_run,
+            "example/project#42",
+            &review_base,
+            &head,
+            Some("https://github.com/example/project/issues/11")
+        ));
+        assert!(!final_feature_review_scope_matches(
+            reviewer_run,
+            "example/project#42",
+            &review_base,
+            &head,
+            None
+        ));
+        ready_workers.canonical_linked_spec_url =
+            Some("https://github.com/example/project/issues/11".into());
+        assert!(
+            mark_ready_with(
+                &state_dir,
+                &repo,
+                "example/project#42",
+                &ready_workers,
+                "run-final-review",
+                &head,
+                |_| panic!("a stale canonical map link must block checks and readiness"),
+                &gh,
+            )
+            .is_err()
+        );
+        let changed_comments = vec!["### Canonical linked specification — body refresh pending for a human\n\n- [Updated draft spec](https://github.com/Quinten1505/wayfinder-herdr-acceptance-20261001-issue16-7c4a/issues/6)\n\nThis named append-only pointer identifies the map's canonical linked specification. Refresh the map body manually when a human chooses to apply the link.\n\n<!-- issue16-live-canonical-spec:map-1:spec-6 -->".to_owned()];
+        let changed_spec =
+            crate::tracker::canonical_spec_from_map_text(map_body, &changed_comments)
+                .unwrap()
+                .unwrap();
+        assert_ne!(changed_spec, canonical_spec);
+        assert!(!final_feature_review_scope_matches(
+            reviewer_run,
+            "example/project#42",
+            &review_base,
+            &head,
+            Some(&changed_spec)
+        ));
+        ready_workers.canonical_linked_spec_url = Some(canonical_spec.clone());
         let mut missing_scope: serde_json::Value =
             serde_json::from_slice(&fs::read(&evidence).unwrap()).unwrap();
         missing_scope
@@ -3795,7 +3874,8 @@ else:
             reviewer_run,
             "example/project#42",
             &review_base,
-            &head
+            &head,
+            Some(&canonical_spec)
         ));
         fs::write(
             &evidence,
@@ -3807,7 +3887,7 @@ else:
                 "final_feature_review":{
                     "scope":"complete_feature","map":"example/project#42",
                     "base_ref":"origin/develop","base_commit":review_base,
-                    "reviewed_commit":head,"spec":"none-linked",
+                    "reviewed_commit":head,"spec":canonical_spec,
                     "accepted_decisions_reviewed":true
                 }
             })).unwrap(),

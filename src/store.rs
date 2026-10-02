@@ -45,6 +45,12 @@ pub struct State {
     /// Set only after the bound host and GitHub have both reconciled successfully.
     pub reconciled: bool,
     pub suspension: String,
+    /// Canonical map-linked spec resolved from its issue body and explicitly
+    /// named append-only map comments during the latest GitHub reconciliation.
+    #[serde(default)]
+    pub canonical_linked_spec_url: Option<String>,
+    #[serde(default)]
+    pub canonical_linked_spec_resolved: bool,
     /// Request IDs are retained to make replay after commit-before-unlink safe.
     pub history: Vec<Applied>,
     /// Defaults keep state created by the initial runtime foundation readable.
@@ -864,6 +870,8 @@ pub fn attach(
             suspension:
                 "First attachment: explicit Start required; GitHub tracker reads begin with runtime reconciliation"
                     .into(),
+            canonical_linked_spec_url: None,
+            canonical_linked_spec_resolved: false,
             history: vec![],
             workers: WorkerState::default(),
             orchestrator: None,

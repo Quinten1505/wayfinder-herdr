@@ -5337,6 +5337,66 @@ fn uncertain_retry_requires_actual_human_absence_confirmation_and_keeps_old_arti
 }
 
 #[test]
+fn repeated_confirmed_retry_reuses_one_successor_and_undispatched_duplicate_can_be_stopped() {
+    let f = Fixture::new_without_session();
+    let mut old = insert_uncertain_run(&f);
+    old.status = WorkerStatus::NeedsHuman;
+    old.question = Some("Choose the example format.".into());
+    old.human_request_id = Some("human-run-original-0001".into());
+    old.human_request_kind = Some(HumanRequestKind::WorkerQuestion);
+    old.human_request_seq = 1;
+    old.human_response = None;
+    old.answer_history.clear();
+    let mut state = f.state();
+    state.workers.runs[0] = old.clone();
+    store::atomic_json(&f.dir.join("state.json"), &state).unwrap();
+
+    let retry_args = [
+        "retry-worker",
+        "--map",
+        MAP,
+        "--run",
+        old.id.as_str(),
+        "--confirmed-absent-or-stopped",
+    ];
+    success(f.cli().args(retry_args).output().unwrap());
+    let first = f.state();
+    assert_eq!(first.workers.runs.len(), 2);
+    let successor = first.workers.runs[1].id.clone();
+    assert_eq!(first.workers.runs[0].status, WorkerStatus::Stopped);
+    assert_eq!(
+        first.workers.runs[0].human_request_id.as_deref(),
+        Some("human-run-original-0001")
+    );
+    assert_eq!(
+        first.workers.runs[0].question.as_deref(),
+        Some("Choose the example format.")
+    );
+    assert!(first.workers.runs[0].answer_history.is_empty());
+
+    let repeated = f.cli().args(retry_args).output().unwrap();
+    success(repeated);
+    assert_eq!(f.state().workers.runs.len(), 2);
+
+    let stopped = f
+        .cli()
+        .args(["stop-worker", "--map", MAP, "--run", &successor])
+        .output()
+        .unwrap();
+    success(stopped);
+    let final_state = f.state();
+    assert_eq!(final_state.workers.runs.len(), 2);
+    assert_eq!(final_state.workers.runs[1].status, WorkerStatus::Stopped);
+    assert!(final_state.workers.runs[1].pane_id.is_none());
+    assert!(final_state.workers.runs[1].result_evidence.is_none());
+    assert!(!final_state.workers.runs[1].worktree.exists());
+    assert_eq!(
+        final_state.workers.runs[0].human_request_id.as_deref(),
+        Some("human-run-original-0001")
+    );
+}
+
+#[test]
 fn supported_final_review_retry_keeps_typed_purpose_and_review_ancestry() {
     let f = Fixture::new_without_session();
     let mut old = insert_uncertain_run(&f);
