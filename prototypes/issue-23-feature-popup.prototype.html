@@ -1,0 +1,248 @@
+<!doctype html>
+<!--
+  THROWAWAY PROTOTYPE for GitHub issue 23: What should the feature popup and
+  first-run transition look like? Three structural variants via ?variant=A|B|C.
+  Open this file directly, or run: python3 -m http.server 8765 --directory prototypes
+  This simulates state and focus. It does not call Herdr, Git, or GitHub.
+-->
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Wayfinder feature popup — throwaway prototype</title>
+  <style>
+    :root { color-scheme: dark; font-family: ui-monospace, SFMono-Regular, Consolas, monospace; }
+    * { box-sizing: border-box; }
+    body { margin: 0; min-height: 100vh; background: #101521; color: #e8edf5; }
+    button, textarea, select { font: inherit; }
+    button { cursor: pointer; }
+    .page { display: grid; grid-template-columns: minmax(0, 1fr) 310px; min-height: 100vh; }
+    .workspace { padding: 32px; display: grid; place-items: center; min-width: 0; }
+    .terminal { position: relative; width: min(100%, 1040px); min-height: 650px; border: 1px solid #334053; border-radius: 14px; overflow: hidden; background: #0b1019; box-shadow: 0 24px 80px #02050a90; }
+    .terminal-bar { display: flex; justify-content: space-between; gap: 12px; align-items: center; height: 38px; padding: 0 15px; background: #1b2432; border-bottom: 1px solid #334053; color: #afbdd0; font-size: 12px; }
+    .dots { display: flex; gap: 5px; }
+    .dots i { width: 8px; height: 8px; border-radius: 50%; background: #62758b; }
+    .terminal-content { padding: 28px; color: #768ba2; line-height: 1.7; font-size: 13px; }
+    .terminal-content .prompt { color: #9ad8b5; }
+    .terminal-content .muted-line { color: #536579; }
+    .veil { position: absolute; inset: 38px 0 0; background: #03070fc4; display: grid; place-items: center; padding: 18px; }
+    .veil.top { align-items: start; padding-top: 38px; }
+    .popup { background: #171e2b; border: 1px solid #53667d; box-shadow: 0 20px 65px #000b; color: #ecf2fa; }
+    .popup textarea { width: 100%; resize: none; background: #0e1622; color: #f7fafc; border: 1px solid #60748b; border-radius: 7px; outline: none; line-height: 1.55; }
+    .popup textarea:focus { border-color: #89bff0; box-shadow: 0 0 0 2px #89bff036; }
+    .popup textarea::placeholder { color: #73869b; }
+    .popup button, .chat button { border: 1px solid #7196b6; border-radius: 7px; background: #234767; color: #f4f9ff; padding: 8px 12px; }
+    .popup button:hover, .chat button:hover { background: #315a7e; }
+    .secondary { background: transparent !important; border-color: #465971 !important; color: #b9c9d8 !important; }
+    .eyebrow { color: #9bd6b3; letter-spacing: .09em; text-transform: uppercase; font-size: 11px; font-weight: 700; }
+    .hint { font-size: 12px; color: #9baec3; }
+    .error { color: #ffb1a7; font-size: 12px; }
+    .accent { color: #a5d6ff; }
+    .rule { border-top: 1px solid #38495c; }
+    .row { display: flex; align-items: center; gap: 12px; }
+    .space { justify-content: space-between; }
+    .tag { color: #d4e7f9; border: 1px solid #3e5469; background: #243347; border-radius: 999px; padding: 4px 9px; font-size: 11px; }
+    .a { width: min(100%, 620px); border-radius: 11px; }
+    .a .header { padding: 20px 23px 14px; }
+    .a h1 { font-size: 19px; margin: 7px 0 4px; }
+    .a .body { padding: 0 23px 19px; }
+    .a textarea { min-height: 100px; padding: 11px 12px; margin-top: 12px; }
+    .a .footer { padding: 13px 23px; display: flex; justify-content: space-between; gap: 15px; align-items: center; border-top: 1px solid #36475a; }
+    .a .progress { padding: 28px 23px; }
+    .b { width: min(100%, 790px); display: grid; grid-template-columns: minmax(0, 1.3fr) minmax(245px, .7fr); border-radius: 4px; min-height: 355px; }
+    .b .main { padding: 27px 30px; }
+    .b .side { background: #202b39; border-left: 1px solid #53667d; padding: 27px 24px; }
+    .b h1 { font-size: 21px; margin: 10px 0 24px; line-height: 1.3; }
+    .b textarea { min-height: 160px; padding: 12px; }
+    .b .actions { display: flex; justify-content: space-between; align-items: center; gap: 10px; margin-top: 14px; }
+    .b .side ol { margin: 20px 0; padding-left: 23px; line-height: 2.1; font-size: 12px; color: #c2cedb; }
+    .b .side .meta { margin-top: 37px; font-size: 11px; color: #a7bacd; line-height: 1.8; }
+    .c { width: min(100%, 760px); border-radius: 10px; overflow: hidden; }
+    .c .command { display: flex; gap: 13px; align-items: start; padding: 17px 20px 12px; }
+    .c .glyph { color: #9bd6b3; font-size: 21px; line-height: 34px; }
+    .c textarea { min-height: 80px; padding: 9px 12px; border: 0; background: transparent; box-shadow: none; font-size: 16px; }
+    .c .under { display: flex; justify-content: space-between; gap: 15px; padding: 13px 20px; background: #202b39; border-top: 1px solid #53667d; }
+    .c .under .hint { line-height: 1.6; }
+    .c .progress { padding: 22px 24px; }
+    .chat { position: absolute; inset: 38px 0 0; background: #0d1420; padding: 30px min(7%, 70px); color: #e6eef8; }
+    .chat .topline { border-bottom: 1px solid #334253; padding-bottom: 13px; display: flex; justify-content: space-between; color: #a7bacd; font-size: 12px; }
+    .chat h2 { margin: 40px 0 12px; font-size: 22px; }
+    .chat p { max-width: 700px; line-height: 1.6; }
+    .chat .bubble { margin-top: 24px; max-width: 700px; background: #1b2939; border: 1px solid #38516a; border-radius: 10px; padding: 18px; }
+    .chat .bubble button { margin: 12px 8px 0 0; }
+    .chat .subtle { color: #a6b8c9; font-size: 12px; }
+    .inspector { border-left: 1px solid #354155; background: #182130; padding: 26px 20px 92px; }
+    .inspector h2 { font-size: 16px; margin: 7px 0 20px; }
+    .inspector label { display: block; font-size: 12px; color: #becbd9; margin-bottom: 7px; }
+    .inspector select { width: 100%; background: #0f1927; color: #e6edf6; border: 1px solid #54677e; border-radius: 5px; padding: 8px; }
+    .inspector button { margin: 12px 0; background: #26374a; border: 1px solid #576d83; border-radius: 6px; color: #e9f0f7; padding: 8px 10px; }
+    .inspector .callout { font-size: 12px; line-height: 1.55; color: #aebfd1; margin: 16px 0; }
+    .inspector pre { overflow-wrap: anywhere; white-space: pre-wrap; border: 1px solid #394b5d; background: #0d1623; padding: 11px; font-size: 11px; color: #afd1ec; border-radius: 7px; }
+    .switcher { position: fixed; z-index: 5; left: 50%; bottom: 18px; transform: translateX(-50%); display: flex; align-items: center; gap: 7px; background: #f2f5fa; color: #17212c; padding: 6px; border-radius: 999px; box-shadow: 0 8px 30px #0008; }
+    .switcher button { border: 0; background: #dce5ef; color: #142234; width: 33px; height: 33px; border-radius: 50%; font-size: 18px; }
+    .switcher strong { font-size: 12px; min-width: 170px; text-align: center; }
+    @media (max-width: 1050px) { .page { grid-template-columns: 1fr; } .inspector { border-left: 0; border-top: 1px solid #354155; } }
+    @media (max-width: 670px) { .workspace { padding: 9px; } .terminal { min-height: 560px; } .b { grid-template-columns: 1fr; } .b .side { display: none; } .switcher strong { min-width: 110px; } }
+  </style>
+</head>
+<body>
+  <div class="page">
+    <main class="workspace"><div class="terminal" id="terminal"></div></main>
+    <aside class="inspector">
+      <div class="eyebrow">Throwaway prototype</div>
+      <h2>First-run scenarios</h2>
+      <label for="scenario">After you press Enter</label>
+      <select id="scenario">
+        <option value="normal">Normal handoff</option>
+        <option value="dirty">Checkout has local changes</option>
+        <option value="github">GitHub setup fails</option>
+      </select>
+      <button id="again">Run a new invocation</button>
+      <p class="callout">Type a feature, press Enter to submit, Shift+Enter for a new line, or Esc to cancel. This panel is only for evaluating the prototype.</p>
+      <div class="eyebrow">Visible simulation state</div>
+      <pre id="state"></pre>
+    </aside>
+  </div>
+  <nav class="switcher" aria-label="Prototype variants">
+    <button id="prev" aria-label="Previous variant">←</button>
+    <strong id="variant-label"></strong>
+    <button id="next" aria-label="Next variant">→</button>
+  </nav>
+  <script>
+    const names = { A: 'Compact prompt', B: 'Guided form', C: 'Command palette' };
+    const variants = Object.keys(names);
+    const initial = new URL(location.href).searchParams.get('variant');
+    let variant = variants.includes(initial) ? initial : 'A';
+    let token = 0;
+    let state = { stage: 'editing', draft: '', scenario: 'normal', validation: '', focused: 'feature popup', mapCreated: false, startRecorded: false };
+    const terminal = document.getElementById('terminal');
+    const inspector = document.getElementById('state');
+    const label = document.getElementById('variant-label');
+    const escape = value => String(value).replace(/[&<>"']/g, char => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[char]));
+    function heading() {
+      return '<div class="terminal-bar"><span class="dots"><i></i><i></i><i></i></span><span>Herdr · ~/projects/example-repo</span><span>workspace</span></div>';
+    }
+    function background() {
+      return '<div class="terminal-content"><div><span class="prompt">$</span> wayfinder</div><div class="muted-line">New feature input opened</div></div>';
+    }
+    function footerHint() { return 'Enter starts · Shift+Enter new line · Esc cancels'; }
+    function popupA() {
+      return '<div class="veil"><section class="popup a" aria-label="Start a feature">'
+        + '<div class="header"><div class="eyebrow">Wayfinder</div><h1>Start a feature</h1><div class="hint">In <span class="accent">example-repo</span></div></div>'
+        + '<div class="body"><textarea id="feature" autofocus placeholder="Describe the feature you want to build">' + escape(state.draft) + '</textarea>'
+        + (state.validation ? '<div class="error" role="alert">' + escape(state.validation) + '</div>' : '') + '</div>'
+        + '<div class="footer"><span class="hint">' + footerHint() + '</span><button data-action="submit">Start feature ↵</button></div></section></div>';
+    }
+    function popupB() {
+      return '<div class="veil"><section class="popup b" aria-label="Start a feature">'
+        + '<div class="main"><div class="eyebrow">New Wayfinder effort</div><h1>What would you like to build?</h1>'
+        + '<textarea id="feature" autofocus placeholder="A short description is enough; we will work out the details together.">' + escape(state.draft) + '</textarea>'
+        + (state.validation ? '<div class="error" role="alert">' + escape(state.validation) + '</div>' : '')
+        + '<div class="actions"><button class="secondary" data-action="cancel">Cancel</button><button data-action="submit">Start feature ↵</button></div></div>'
+        + '<div class="side"><div class="eyebrow">Next</div><ol><li>Open your feature workspace</li><li>Plan in one Herdr chat</li><li>Review before merge</li></ol>'
+        + '<div class="meta">Repository<br><strong>example-repo</strong><br>Default branch<br><strong>main</strong></div></div></section></div>';
+    }
+    function popupC() {
+      return '<div class="veil top"><section class="popup c" aria-label="Start a feature">'
+        + '<div class="command"><div class="glyph">›</div><textarea id="feature" autofocus placeholder="New feature…">' + escape(state.draft) + '</textarea></div>'
+        + '<div class="under"><div class="hint"><strong>example-repo</strong> · ' + footerHint() + (state.validation ? '<br><span class="error" role="alert">' + escape(state.validation) + '</span>' : '') + '</div>'
+        + '<button data-action="submit">Start ↵</button></div></section></div>';
+    }
+    function progress() {
+      let inner = variant === 'B'
+        ? '<div class="main"><div class="eyebrow">Submitted</div><h1>Preparing your feature</h1><p>Opening its workspace and orchestrator chat…</p><p class="hint">You can continue in Herdr when the chat opens.</p><button class="secondary" data-action="cancel-after">Cancel startup</button></div><div class="side"><div class="eyebrow">Progress</div><ol><li>Feature saved ✓</li><li>Workspace opening…</li><li>Chat next</li></ol></div>'
+        : '<div class="progress"><div class="eyebrow">Wayfinder</div><h1>Preparing your feature…</h1><p class="hint">The orchestrator chat will open in Herdr.</p><button class="secondary" data-action="cancel-after">Cancel startup</button></div>';
+      return '<div class="veil' + (variant === 'C' ? ' top' : '') + '"><section class="popup ' + variant.toLowerCase() + '">' + inner + '</section></div>';
+    }
+    function chat() {
+      let content = '';
+      if (state.stage === 'dirty') {
+        content = '<h2>Before we start</h2><p>This checkout has local changes. They are still in your original checkout.</p>'
+          + '<div class="bubble"><strong>Start this feature from the committed main branch?</strong><br><button data-action="proceed">Proceed without local changes</button><button class="secondary" data-action="pause">Pause while I prepare them</button></div>';
+      } else if (state.stage === 'github') {
+        content = '<h2>Repository setup needs attention</h2><p>Wayfinder could not access <strong>example-repo</strong> on GitHub. Your submitted feature is saved.</p>'
+          + '<div class="bubble">Check GitHub access, then retry setup here.<br><button data-action="retry">Retry setup</button></div>';
+      } else if (state.stage === 'paused') {
+        content = '<h2>Feature startup paused</h2><p>Your submitted feature is saved. Your original checkout and local changes are untouched.</p>';
+      } else if (state.stage === 'cancelled-after') {
+        content = '<h2>Startup stopped</h2><p>The submitted feature remains recorded, and no further startup steps will run.</p>';
+      } else {
+        content = '<h2>Your feature is underway</h2><p>We will plan it here, ask for your decisions when needed, and bring you a reviewed pull request for the final merge decision.</p>'
+          + '<div class="bubble"><span class="eyebrow">Milestone</span><p>Feature submitted. Your map and workspace are ready.</p></div>';
+      }
+      return '<div class="chat"><div class="topline"><span>Wayfinder · example-repo</span><span>Orchestrator chat</span></div>' + content + '<p class="subtle">This is simulated chat content for the prototype.</p></div>';
+    }
+    function cancelled() { return '<div class="terminal-content"><div><span class="prompt">$</span> wayfinder</div><div>Cancelled. No feature effort was started.</div><div class="muted-line">Run wayfinder again to describe a new feature.</div></div>'; }
+    function render(refocus = false) {
+      label.textContent = variant + ' · ' + names[variant];
+      document.getElementById('scenario').value = state.scenario;
+      let surface = heading() + background();
+      if (state.stage === 'editing') surface += ({A: popupA, B: popupB, C: popupC})[variant]();
+      else if (state.stage === 'submitted') surface += progress();
+      else if (state.stage === 'cancelled') surface = heading() + cancelled();
+      else surface = heading() + chat();
+      terminal.innerHTML = surface;
+      inspector.textContent = JSON.stringify({ variant, ...state }, null, 2);
+      if (refocus && state.stage === 'editing') terminal.querySelector('#feature')?.focus();
+    }
+    function changeVariant(direction) {
+      variant = variants[(variants.indexOf(variant) + direction + variants.length) % variants.length];
+      const url = new URL(location.href);
+      url.searchParams.set('variant', variant);
+      history.replaceState({}, '', url);
+      render(true);
+    }
+    function reset() {
+      token++;
+      state = { stage: 'editing', draft: '', scenario: document.getElementById('scenario').value, validation: '', focused: 'feature popup', mapCreated: false, startRecorded: false };
+      render(true);
+    }
+    function submit() {
+      if (state.stage !== 'editing') return;
+      const box = terminal.querySelector('#feature');
+      state.draft = box?.value ?? state.draft;
+      if (!state.draft.trim()) { state.validation = 'Describe a feature before pressing Enter.'; render(true); return; }
+      state.validation = '';
+      state.stage = 'submitted';
+      state.focused = 'feature popup';
+      const current = ++token;
+      render();
+      setTimeout(() => {
+        if (current !== token || state.stage !== 'submitted') return;
+        state.stage = state.scenario === 'dirty' ? 'dirty' : state.scenario === 'github' ? 'github' : 'chat';
+        state.focused = 'orchestrator chat';
+        state.mapCreated = state.stage === 'chat';
+        state.startRecorded = state.stage === 'chat';
+        render();
+      }, 1200);
+    }
+    function cancel() { token++; state.stage = 'cancelled'; state.focused = 'invoking terminal'; render(); }
+    terminal.addEventListener('input', event => {
+      if (event.target.id === 'feature') { state.draft = event.target.value; state.validation = ''; inspector.textContent = JSON.stringify({variant, ...state}, null, 2); }
+    });
+    terminal.addEventListener('keydown', event => {
+      if (event.target.id === 'feature' && event.key === 'Enter' && !event.shiftKey) { event.preventDefault(); submit(); }
+      if (state.stage === 'editing' && event.key === 'Escape') { event.preventDefault(); cancel(); }
+    });
+    terminal.addEventListener('click', event => {
+      const action = event.target.closest('[data-action]')?.dataset.action;
+      if (action === 'submit') submit();
+      if (action === 'cancel') cancel();
+      if (action === 'cancel-after') { token++; state.stage = 'cancelled-after'; state.focused = 'orchestrator chat'; render(); }
+      if (action === 'proceed') { state.stage = 'chat'; state.mapCreated = true; state.startRecorded = true; render(); }
+      if (action === 'pause') { state.stage = 'paused'; render(); }
+      if (action === 'retry') { state.stage = 'chat'; state.mapCreated = true; state.startRecorded = true; render(); }
+    });
+    document.getElementById('scenario').addEventListener('change', reset);
+    document.getElementById('again').addEventListener('click', reset);
+    document.getElementById('prev').addEventListener('click', () => changeVariant(-1));
+    document.getElementById('next').addEventListener('click', () => changeVariant(1));
+    document.addEventListener('keydown', event => {
+      if (['INPUT','TEXTAREA','SELECT'].includes(document.activeElement?.tagName) || document.activeElement?.isContentEditable) return;
+      if (event.key === 'ArrowLeft') changeVariant(-1);
+      if (event.key === 'ArrowRight') changeVariant(1);
+    });
+    render(true);
+  </script>
+</body>
+</html>
