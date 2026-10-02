@@ -1,0 +1,26 @@
+{
+  "format_version": 1,
+  "source_change": "answer-worker can recover only a request-preserving uncertain hold caused by pre-effect identity-verification failure; it still verifies exact Herdr pane/session/terminal/provider/process before sending. Typed final-feature review prompts also include only durably submitted worker-question decisions, so a reviewer does not ask again for an already answered choice.",
+  "negative_guard": "unrelated uncertain causes, prior human responses, and requests without the exact correlated ID/type remain rejected",
+  "checks": [
+    {"command":"CARGO_HOME=/tmp/wayfinder-12-review-cargo-home CARGO_TARGET_DIR=/tmp/wf16-acceptance/evidence/source-final-target cargo fmt --all -- --check","result":"passed"},
+    {"command":"CARGO_HOME=/tmp/wayfinder-12-review-cargo-home CARGO_TARGET_DIR=/tmp/wf16-acceptance/evidence/source-final-target cargo clippy --locked --all-targets -- -D warnings","result":"passed"},
+    {"command":"CARGO_HOME=/tmp/wayfinder-12-review-cargo-home CARGO_TARGET_DIR=/tmp/wf16-acceptance/evidence/source-final-target cargo test --locked --all-targets","result":"passed: 35 library, 72 dispatch, 12 runtime, 11 tracker tests (130 total)"},
+    {"command":"CARGO_HOME=/tmp/wayfinder-12-review-cargo-home CARGO_TARGET_DIR=/tmp/wf16-acceptance/evidence/installer-cargo-target WAYFINDER_INSTALL_DIR=/tmp/wf16-acceptance/install python3 tests/install_smoke.py","result":"passed with isolated temporary XDG/install roots and recording-only systemctl; escalated Herdr plugin link after sandbox EPERM"}
+  ],
+  "live_answer_recovery": {
+    "run": "run-00000000000000000023",
+    "request": "human-run-00000000000000000023-0001",
+    "response": "comparison table",
+    "pre_effect_sandbox_failure": "socket permission denial explicitly said not submitted; answer history remained empty",
+    "same_saved_identity_rechecked": true,
+    "submission": "escalated answer-worker on the exact pending request returned Human response submitted to owned pane wP:p1",
+    "answer_history_disposition": "submitted",
+    "implementation_commit": "3ca068c00782ebbc54168db2484cbc18869e5c41",
+    "separate_reviewer_run": "run-00000000000000000025",
+    "complete_feature_reviewer_run": "run-00000000000000000026",
+    "complete_feature_reviewer_revision": 2,
+    "complete_feature_reviewer_verdict": "approved"
+  },
+  "limitation": "Installer smoke uses a recording systemctl stub; it is not the live service-supervision proof."
+}

@@ -3049,6 +3049,86 @@ fn recorded_worker_question_uses_correlated_agent_prompt() {
 }
 
 #[test]
+fn explicit_answer_recovers_only_a_pre_effect_identity_verification_hold() {
+    let f = Fixture::new();
+    let mut state = record_pending_worker_question(&f);
+    let run = state
+        .workers
+        .runs
+        .iter_mut()
+        .find(|run| run.ticket == 13)
+        .unwrap();
+    run.status = WorkerStatus::Uncertain;
+    run.question = Some("Worker identity/process continuity could not be verified; human response was not submitted: temporary socket permission failure".into());
+    run.human_response = None;
+    run.answer_history.clear();
+    store::atomic_json(&f.dir.join("state.json"), &state).unwrap();
+    let pending = f.state().workers.runs[0].clone();
+    f.herdr_state.lock().unwrap().agent_status = "done".into();
+
+    success(answer_cli(
+        &f,
+        &pending,
+        "worker_question",
+        "comparison table",
+    ));
+    let answered = f.state().workers.runs[0].clone();
+    assert_eq!(answered.status, WorkerStatus::Running);
+    assert_eq!(answered.answer_history.len(), 1);
+    assert_eq!(answered.answer_history[0].response, "comparison table");
+    assert_eq!(
+        answered.answer_history[0].disposition,
+        store::AnswerDisposition::Submitted
+    );
+    let herdr_requests = f.herdr_state.lock().unwrap();
+    let prompts = herdr_requests
+        .requests
+        .iter()
+        .filter(|request| request["method"] == "agent.prompt")
+        .collect::<Vec<_>>();
+    assert_eq!(prompts.len(), 2, "one task prompt and one human answer");
+    assert_eq!(prompts[1]["params"]["text"], "comparison table");
+
+    let unrelated = Fixture::new();
+    let mut state = record_pending_worker_question(&unrelated);
+    let run = state
+        .workers
+        .runs
+        .iter_mut()
+        .find(|run| run.ticket == 13)
+        .unwrap();
+    run.status = WorkerStatus::Uncertain;
+    run.question = Some("The prompt may have been submitted; the outcome is uncertain.".into());
+    run.human_response = None;
+    run.answer_history.clear();
+    store::atomic_json(&unrelated.dir.join("state.json"), &state).unwrap();
+    let pending = unrelated.state().workers.runs[0].clone();
+    let prompts_before = unrelated
+        .herdr_state
+        .lock()
+        .unwrap()
+        .requests
+        .iter()
+        .filter(|request| request["method"] == "agent.prompt")
+        .count();
+    let rejected = answer_cli(&unrelated, &pending, "worker_question", "comparison table");
+    assert!(!rejected.status.success());
+    assert!(String::from_utf8_lossy(&rejected.stderr).contains("unrelated uncertainty"));
+    assert_eq!(
+        unrelated
+            .herdr_state
+            .lock()
+            .unwrap()
+            .requests
+            .iter()
+            .filter(|request| request["method"] == "agent.prompt")
+            .count(),
+        prompts_before
+    );
+    assert!(unrelated.state().workers.runs[0].answer_history.is_empty());
+}
+
+#[test]
 fn blocked_pre_effect_read_failure_persists_manual_request_across_runtime_restart() {
     let f = Fixture::new();
     f.apply(RequestKind::Start);

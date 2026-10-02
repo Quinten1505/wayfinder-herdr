@@ -593,9 +593,21 @@ fn run() -> Result<()> {
                 .iter()
                 .position(|worker| worker.id == run)
                 .context("worker run not found")?;
+            let saved = &state.workers.runs[index];
+            let recoverable_pre_effect_identity_hold =
+                saved.status == WorkerStatus::Uncertain
+                    && saved.question.as_deref().is_some_and(|question| {
+                        question.starts_with(
+                            "Worker identity/process continuity could not be verified; human response was not submitted:",
+                        )
+                    })
+                    && saved.human_response.is_none()
+                    && saved.answer_history.is_empty()
+                    && saved.initial_prompt_attempted == Some(true);
             ensure!(
-                state.workers.runs[index].status == WorkerStatus::NeedsHuman,
-                "worker has no pending human question"
+                state.workers.runs[index].status == WorkerStatus::NeedsHuman
+                    || recoverable_pre_effect_identity_hold,
+                "worker has no pending human question or has an unrelated uncertainty"
             );
             let worker = state.workers.runs[index].clone();
             let request_kind = match request_type.as_str() {

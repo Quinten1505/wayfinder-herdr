@@ -808,13 +808,48 @@ mod tests {
         let run = state.workers.runs.last_mut().unwrap();
         run.purpose = Some(store::RunPurpose::FinalFeatureReview);
         run.worktree = repository;
-        let run = run.clone();
+        let repository_for_run = state.binding.repository.clone();
+        new_run(
+            &mut state,
+            NewRun {
+                ticket: 6,
+                role: "implementer",
+                repository: &repository_for_run,
+                map: &map,
+                source_run: None,
+                base_commit: None,
+                context: None,
+            },
+        );
+        state.workers.runs[1]
+            .answer_history
+            .push(crate::store::HumanAnswerEvidence {
+                request_id: "human-run-implementer-0001".into(),
+                request_kind: crate::store::HumanRequestKind::WorkerQuestion,
+                response: "comparison table".into(),
+                disposition: crate::store::AnswerDisposition::Submitted,
+            });
+        state.workers.runs[1]
+            .answer_history
+            .push(crate::store::HumanAnswerEvidence {
+                request_id: "human-run-uncertain-0001".into(),
+                request_kind: crate::store::HumanRequestKind::WorkerQuestion,
+                response: "unconfirmed choice".into(),
+                disposition: crate::store::AnswerDisposition::Uncertain,
+            });
+        let run = state.workers.runs[0].clone();
 
         let prompt = worker_prompt(&run, &state).unwrap();
         assert!(prompt.contains("independent COMPLETE-FEATURE review"));
         assert!(prompt.contains(&format!("origin/develop..{head}")));
         assert!(prompt.contains("every linked ticket, linked spec (if any)"));
         assert!(prompt.contains("accepted map/spec comments and human decisions"));
+        assert!(prompt.contains("human-run-implementer-0001"));
+        assert!(prompt.contains("exact human answer: \"comparison table\""));
+        assert!(
+            prompt.contains("This request is resolved; do not ask the human this question again.")
+        );
+        assert!(!prompt.contains("unconfirmed choice"));
         assert!(prompt.contains("final_feature_review"));
         assert!(prompt.contains("accepted_decisions_reviewed"));
         assert!(!prompt.contains("Human explicitly authorized this retry"));
@@ -2847,6 +2882,36 @@ fn now_ms() -> u64 {
         .min(u64::MAX as u128) as u64
 }
 
+fn accepted_worker_decision_context(state: &State) -> String {
+    let decisions = state
+        .workers
+        .runs
+        .iter()
+        .flat_map(|run| {
+            run.answer_history
+                .iter()
+                .filter(|answer| {
+                    answer.request_kind == crate::store::HumanRequestKind::WorkerQuestion
+                        && answer.disposition == crate::store::AnswerDisposition::Submitted
+                })
+                .map(move |answer| {
+                    format!(
+                        "- Ticket #{}; request `{}`; exact human answer: {:?}. This request is resolved; do not ask the human this question again.",
+                        run.ticket, answer.request_id, answer.response
+                    )
+                })
+        })
+        .collect::<Vec<_>>();
+    if decisions.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "Already recorded human decisions for this map (durable local answer history):\n{}",
+            decisions.join("\n")
+        )
+    }
+}
+
 fn worker_prompt(run: &WorkerRun, state: &State) -> Result<String> {
     let map = MapRef::parse(&state.map).expect("validated map identity in durable state");
     let repository = format!("{}/{}", map.owner, map.repository);
@@ -2881,7 +2946,7 @@ fn worker_prompt(run: &WorkerRun, state: &State) -> Result<String> {
                 "This is the independent COMPLETE-FEATURE review, not a review of ticket #{} alone or only the latest commit. Read the entire map #{}, its every linked ticket, linked spec (if any), and all accepted map/spec comments and human decisions. Inspect the complete change range `origin/develop..{target}` and the resulting tree, then compare the complete feature with the map/spec. Do not edit or commit. The exact review correlation is map `{}`; base ref `origin/develop` at `{base}`; pinned HEAD `{target}`. The canonical linked spec is exactly `{spec}`; report that exact URL, or `none-linked` only when this runtime resolved no canonical link.",
                 run.ticket, map.number, state.map
             ),
-            String::new(),
+            accepted_worker_decision_context(state),
         )
     } else if run.role == "reviewer" {
         (

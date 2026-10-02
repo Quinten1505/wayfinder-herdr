@@ -1,0 +1,78 @@
+{
+  "format_version": 1,
+  "status": "answered_by_real_user_and_recorded",
+  "map": "quinten1505/wayfinder-herdr-acceptance-20261001-issue16-7c4a#1",
+  "spec": "quinten1505/wayfinder-herdr-acceptance-20261001-issue16-7c4a#5",
+  "ticket": "quinten1505/wayfinder-herdr-acceptance-20261001-issue16-7c4a#6",
+  "source_request": {"run":"run-00000000000000000022","id":"human-run-00000000000000000022-0002","status":"preserved_unanswered_after_cold_restart"},
+  "active_request": {"run":"run-00000000000000000023","id":"human-run-00000000000000000023-0001","kind":"worker_question","sequence":1,"status":"answered_and_submitted"},
+  "exact_question": "For the `parse_milli` guide example, should the explanation use a compact input/output comparison table or a short Rust code snippet?",
+  "options": [
+    {"label":"Comparison table","recommended":true,"description":"Concise and readable for CLI users."},
+    {"label":"Short Rust snippet","recommended":false,"description":"Demonstrates the API call directly."}
+  ],
+  "bound_orchestrator": {"pane":"w2:p8","terminal":"term_65cd05438c54e14","session":"01a0f9f0-b70f-7611-b1e6-a96c66895b0e","process":{"pid":1481892,"start_time_ticks":5712523,"boot_id":"a093fcea-966d-46f2-8931-2d79488ce85b"},"surface_observed":true},
+  "current_worker": {"pane":"wP:p1","terminal":"term_65cd07a51477415","session":"01a0f9fa-771a-7b90-89fa-9bf31c27436d","process":{"pid":1519949,"start_time_ticks":5776436,"boot_id":"a093fcea-966d-46f2-8931-2d79488ce85b"}},
+  "answer": "comparison table",
+  "answer_record": {
+    "exact_user_response": "comparison table",
+    "answer_run": "run-00000000000000000023",
+    "answer_request_id": "human-run-00000000000000000023-0001",
+    "answer_request_type": "worker_question",
+    "disposition": "submitted",
+    "worker_result_commit": "3ca068c00782ebbc54168db2484cbc18869e5c41",
+    "worker_result_summary": "Updated the parse_milli guide example to use the human-selected comparison table format."
+  },
+  "submission_recovery": {
+    "first_sandbox_attempt": "pre-submit socket permission denial; CLI explicitly recorded response not submitted",
+    "identity_rechecked": true,
+    "supported_reconcile_request": "request-00000000000000000336",
+    "runtime_restarted_only_after_unit_was_observed_inactive": "wayfinder-acceptance-20261001-issue16-runtime.service",
+    "retry": "same answer-worker request with the exact verified run23 request ID and `comparison table`; escalated isolated Herdr socket access",
+    "retry_result": "Human response submitted to owned pane wP:p1."
+  },
+  "orchestrator_delivery_evidence": {
+    "pane": "w2:p8",
+    "terminal": "term_65cd05438c54e14",
+    "session": "01a0f9f0-b70f-7611-b1e6-a96c66895b0e",
+    "visible_output_sha256": "652d71fb909a32f45bf9b676efbd09bbb6a9e74db628864c40ae9d7217146347",
+    "visible_output_external_path": "/tmp/wf16-acceptance/evidence/orchestrator-p8-after-answer.txt",
+    "contains": "p8 acknowledges the actual response, says it was not resubmitted, and reports run23 completion and separate reviewer run25 dispatch"
+  },
+  "unanswered_cold_source_preserved": {"run":"run-00000000000000000022","request_id":"human-run-00000000000000000022-0002","answer_history":[]},
+  "review": {
+    "run":"run-00000000000000000025",
+    "role":"reviewer",
+    "reviewed_commit":"3ca068c00782ebbc54168db2484cbc18869e5c41",
+    "verdict":"approved",
+    "unresolved_findings":[],
+    "known_limitations":[]
+  },
+  "complete_feature_review": {
+    "run":"run-00000000000000000026",
+    "revision":2,
+    "reviewed_commit":"3ca068c00782ebbc54168db2484cbc18869e5c41",
+    "verdict":"approved",
+    "scope":"complete_feature",
+    "base_ref":"origin/develop",
+    "base_commit":"4155227aa9beb20bfb72a3ec953c8c3c4fcd09fe",
+    "map":"quinten1505/wayfinder-herdr-acceptance-20261001-issue16-7c4a#1",
+    "spec":"https://github.com/Quinten1505/wayfinder-herdr-acceptance-20261001-issue16-7c4a/issues/5",
+    "accepted_decisions_reviewed":true,
+    "unresolved_findings":[],
+    "known_limitations":["The reviewer did not run tests; configured delivery checks passed separately."],
+    "prior_revision":"The immutable initial changes-requested review asked for the already resolved format choice; its original artifact is retained in result_evidence_history. Revision 2 reused the exact actual response, not a new human answer."
+  },
+  "delivery": {
+    "required_checks": [
+      "cargo fmt --all -- --check",
+      "cargo clippy --locked --all-targets -- -D warnings",
+      "cargo test --locked --all-targets"
+    ],
+    "result":"all passed",
+    "ticket_integration":"ticket #6 integrated at the reviewed commit through the runtime's authorized delivery flow",
+    "disposable_pr":"https://github.com/Quinten1505/wayfinder-herdr-acceptance-20261001-issue16-7c4a/pull/4",
+    "pr_state":"open, ready, unmerged"
+  },
+  "evidence_paths": ["/tmp/wf16-human-request.json","/tmp/wf16-acceptance/state/wayfinder-herdr/maps/a17b3c907d0d945e87e2bb22ba9e1b3751b80d2885e472dfd6222e28405db1ab/worker-results/run-00000000000000000023-revision-0002.json","/tmp/wf16-acceptance/evidence/run23-after-answer-pane.txt","/tmp/wf16-acceptance/evidence/run23-after-answer-state.json","/tmp/wf16-acceptance/evidence/orchestrator-p8-after-answer.txt"]
+}
