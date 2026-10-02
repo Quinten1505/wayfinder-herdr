@@ -1,6 +1,6 @@
 # Herdr interfaces for a one-command Wayfinder launch
 
-Research for [Which Herdr interfaces support a reliable one-command feature launch?](https://github.com/Quinten1505/wayfinder-herdr/issues/20), part of [One-command Wayfinder feature launch](https://github.com/Quinten1505/wayfinder-herdr/issues/19). Investigated 2026-10-02. This establishes host capabilities; it does not settle the lifecycle or input-flow decisions.
+Research for [Which Herdr interfaces support a reliable one-command feature launch?](https://github.com/Quinten1505/wayfinder-herdr/issues/20), part of [Start a feature with one wayfinder command](https://github.com/Quinten1505/wayfinder-herdr/issues/19). Investigated 2026-10-02. This establishes host capabilities; it does not settle the lifecycle or input-flow decisions.
 
 ## Evidence and compatibility boundary
 
@@ -44,7 +44,8 @@ The existing plugin requires both its CLI and bound server to be 0.9.3. Future v
 
 - Prototype cold startup and TUI attachment against an isolated named session, including a restored session already containing other repositories. Validate permission/trust and first-run UI interruptions without silently answering them.
 - Prototype caller focus, popup open, Enter/cancel, process exit, and orchestrator focus with a second client changing active focus. If strict atomic caller targeting is required, the host currently needs an interface improvement; ordinary plugin code can preserve repository binding but cannot make two focus/open requests atomic.
-- Lifecycle decision: choose session reuse, pre-map durable identity, map adoption, interrupted startup reconciliation, and repeated invocation behavior. These are not settled by this research.
+- Settled invocation policy: every deliberate `wayfinder` invocation prompts for a new feature, with separate worktrees and workspaces for concurrent efforts. Recovery of one interrupted submission must preserve that submission's identity and remain distinct from deliberately starting a new effort.
+- Lifecycle decision: choose session reuse, pre-map durable identity, map adoption, and interrupted startup reconciliation under that settled invocation policy. These are not settled by this research.
 - Input-flow decision/prototype: define cancellation, empty input, multiline editing, and recovery after submission but before agent prompt acknowledgement. Persist the request before input-process exit; no popup exit event is available to implement the handoff.
 
 No production implementation or live host experiment was performed for this artifact.
