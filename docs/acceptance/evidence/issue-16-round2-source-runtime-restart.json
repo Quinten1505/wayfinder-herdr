@@ -9,6 +9,13 @@
   "service_executable_sha256": "e5065fb12110744ac421163a3b5ca3e8d13729fdcd188ce82c2b5ddcf88fd678",
   "prior_service_main_pid": 1695172,
   "prior_service_pid_absent_after_restart": true,
+  "service_environment_verified": {
+    "PATH": "/home/qbruinsma/.cargo/bin:/home/qbruinsma/.local/share/mise/installs/gh/latest/gh_2.101.0_linux_amd64/bin:/usr/bin:/bin",
+    "GH_BIN_PATH": "/home/qbruinsma/.local/share/mise/installs/gh/latest/gh_2.101.0_linux_amd64/bin/gh",
+    "GH_CONFIG_DIR": "/home/qbruinsma/.config/gh",
+    "CARGO_HOME": "/tmp/wayfinder-12-review-cargo-home",
+    "CARGO_TARGET_DIR": "/tmp/wf16-acceptance/evidence/runtime-cargo-target"
+  },
   "isolated_roots": {
     "xdg_config_home": "/tmp/wf16-acceptance/config",
     "xdg_state_home": "/tmp/wf16-acceptance/state",
