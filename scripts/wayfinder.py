@@ -114,6 +114,8 @@ def launch():
         source_pane = source.get("result", {}).get("pane", source.get("pane", {}))
         if not all(source_pane.get(key) for key in ("pane_id", "workspace_id", "terminal_id")):
             raise RuntimeError("Herdr could not verify this shell pane; retry from the intended shell")
+        if source_pane["pane_id"] != os.environ["HERDR_PANE_ID"]:
+            raise RuntimeError("Herdr source pane changed; retry from the intended shell")
     launch_id = secrets.token_hex(16)
     path = record_path(launch_id)
     while path.exists():
@@ -314,10 +316,11 @@ def draw_recovery(window, repo: str, launch_id: str):
     window.erase()
     height, width = window.getmaxyx()
     lines = [
-        "Feature could not start. Your description was saved.",
-        "Recovery ID: " + launch_id,
-        "Run: wayfinder recover " + launch_id,
-        "Open wayfinder again to retry when delivery is available.",
+        "Feature handoff unavailable. Your description is saved.",
+        "Launch ID: " + launch_id,
+        "Retry same input: wayfinder retry " + launch_id,
+        "Read saved text: wayfinder recover " + launch_id,
+        "Press Enter or Esc to close this notice.",
     ]
     top = max(0, (height - len(lines)) // 2)
     for offset, line in enumerate(lines):
@@ -373,7 +376,7 @@ def read_key():
         return "idle", ""
 
 
-def run_tui(window, repo: str, launch_id: str, on_submit):
+def run_tui(window, repo: str, launch_id: str, on_submit, initial_value=""):
     curses.set_escdelay(25)
     curses.raw()
     try:
@@ -388,8 +391,8 @@ def run_tui(window, repo: str, launch_id: str, on_submit):
         curses.init_pair(4, curses.COLOR_RED, -1)
 
     window.keypad(False)
-    value = ""
-    cursor = 0
+    value = initial_value
+    cursor = len(value)
     message = ""
     while True:
         draw(window, value, cursor, repo, message)
@@ -403,7 +406,10 @@ def run_tui(window, repo: str, launch_id: str, on_submit):
             draw_progress(window, repo, "Saving your description and preparing the chat")
             on_submit(value.strip())
             draw_recovery(window, repo, launch_id)
-            time.sleep(6)
+            while True:
+                dismiss, _ = read_key()
+                if dismiss in ("enter", "escape"):
+                    break
             return "submitted", value.strip()
         if kind == "newline":
             value = value[:cursor] + "\n" + value[cursor:]
@@ -434,7 +440,7 @@ def run_tui(window, repo: str, launch_id: str, on_submit):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("mode", nargs="?", choices=("launch", "popup", "coordinate", "recover"), default="launch")
+    parser.add_argument("mode", nargs="?", choices=("launch", "popup", "coordinate", "recover", "retry"), default="launch")
     parser.add_argument("launch_id", nargs="?")
     args = parser.parse_args()
     if args.mode == "launch":
@@ -445,11 +451,20 @@ def main():
         raise ValueError("Missing Wayfinder launch identity")
     if args.mode == "recover":
         _, record = read_record(launch_id)
-        if record["status"] != "submitted":
+        if record.get("handoff", "unavailable") != "unavailable" or "description" not in record:
             raise RuntimeError("This launch has no submitted description to recover")
         print("Repository: " + record["checkout"])
         print("Description:\n" + record["description"])
-        print("No feature effort was started. Run wayfinder again to retry.")
+        print("No feature effort was started. Run wayfinder retry " + launch_id + " to resume it.")
+        return
+    if args.mode == "retry":
+        path, record = read_record(launch_id)
+        if record.get("handoff", "unavailable") != "unavailable" or record["status"] not in ("submitted", "launch_error"):
+            raise RuntimeError("This launch is not waiting for a recoverable handoff")
+        record["status"] = "awaiting_input"
+        record.pop("error", None)
+        save_record(path, record)
+        coordinate_or_record_error(launch_id)
         return
     if args.mode == "coordinate":
         coordinate_or_record_error(launch_id)
@@ -474,9 +489,11 @@ def main():
     def submit(value):
         record["description"] = value
         record["status"] = "submitted"
+        record["handoff"] = "unavailable"
         save_record(path, record)
 
-    status, _ = curses.wrapper(run_tui, record["checkout"], launch_id, submit)
+    status, _ = curses.wrapper(run_tui, record["checkout"], launch_id, submit,
+                               record.get("description", ""))
     if status == "cancelled":
         record["status"] = "cancelled"
         save_record(path, record)

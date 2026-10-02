@@ -110,6 +110,13 @@ else:
             self.assertIn("--cwd", call)
             self.assertIn("--env", call)
             self.assertIn("WAYFINDER_LAUNCH_ID=", call[call.index("--env") + 1])
+        wrong_source = self.env.copy()
+        wrong_source["HERDR_PANE_ID"] = "w1:other"
+        rejected = subprocess.run([sys.executable, str(COMMAND)], cwd=self.repo,
+                                  env=wrong_source, text=True, capture_output=True)
+        self.assertNotEqual(rejected.returncode, 0)
+        self.assertIn("source pane changed", rejected.stderr)
+        self.assertEqual(len(self.records()), 3)
 
     def test_outside_herdr_starts_client_and_coordinates_popup(self):
         env = {key: value for key, value in self.env.items() if not key.startswith("HERDR_")}
@@ -127,6 +134,25 @@ else:
         self.assertEqual(self.records()[0]["source_workspace"], "w2")
         self.assertEqual(self.records()[0]["source_pane"], "w2:p1")
         self.assertEqual(self.records()[0]["source_terminal"], "term-2")
+
+    def test_retry_reopens_the_same_launch_id_and_preserves_text(self):
+        first = subprocess.run([sys.executable, str(COMMAND)], cwd=self.repo,
+                               env=self.env, text=True, capture_output=True)
+        self.assertEqual(first.returncode, 0, first.stderr)
+        record = self.records()[0]
+        record["status"] = "submitted"
+        record["description"] = "Saved feature request"
+        record["handoff"] = "unavailable"
+        path = self.root / "state/wayfinder-herdr/launches" / (record["launch_id"] + ".json")
+        path.write_text(json.dumps(record))
+        retry = subprocess.run([sys.executable, str(COMMAND), "retry", record["launch_id"]],
+                               cwd=self.repo, env=self.env, text=True, capture_output=True)
+        self.assertEqual(retry.returncode, 0, retry.stderr)
+        self.assertEqual(len(self.records()), 1)
+        resumed = self.records()[0]
+        self.assertEqual(resumed["launch_id"], record["launch_id"])
+        self.assertEqual(resumed["description"], "Saved feature request")
+        self.assertEqual(resumed["status"], "awaiting_input")
 
     def run_popup(self, sequence):
         launch_id = os.urandom(16).hex()
@@ -162,7 +188,7 @@ else:
             os.close(master)
 
     def test_modified_enter_and_cancel(self):
-        submitted = self.run_popup([b"First line", b"\x1b[13;2u", b"Second line", b"\r"])
+        submitted = self.run_popup([b"First line", b"\x1b[13;2u", b"Second line", b"\r", b"\r"])
         self.assertEqual(submitted["status"], "submitted")
         self.assertEqual(submitted["description"], "First line\nSecond line")
         recovered = subprocess.run(
