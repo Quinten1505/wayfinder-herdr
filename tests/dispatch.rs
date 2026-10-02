@@ -393,13 +393,14 @@ fn existing_map_authorization_requires_the_pinned_chat_and_reuses_comment_and_st
         json!({"source":"herdr:codex","agent":"codex","kind":"id","value":"conversation-after-compaction"}),
     );
     let instruction = "Authorize delivery of this named map through a ready PR.";
+    let displayed_map = "Example/project#42";
     let authorize = || {
         let mut command = f.cli();
         command
             .args([
                 "authorize-existing",
                 "--map",
-                MAP,
+                displayed_map,
                 "--instruction",
                 instruction,
             ])
@@ -439,6 +440,7 @@ fn existing_map_authorization_requires_the_pinned_chat_and_reuses_comment_and_st
     )
     .unwrap();
     assert_eq!(receipt["map"], MAP);
+    assert_eq!(receipt["map_repository"], "Example/project");
     assert_eq!(receipt["instruction"], instruction);
     assert_eq!(
         receipt["source_session"]["value"],
@@ -454,6 +456,9 @@ fn existing_map_authorization_requires_the_pinned_chat_and_reuses_comment_and_st
         .count();
     assert_eq!(starts, 1);
     assert_eq!(f.state().authorization, Authorization::AwaitingStart);
+    success(f.once());
+    assert_eq!(f.state().authorization, Authorization::Started);
+    assert!(!f.state().suspension.contains("execution override"));
 }
 
 #[test]

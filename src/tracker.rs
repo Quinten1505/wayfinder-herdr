@@ -94,6 +94,8 @@ const EXISTING_MAP_SCOPE: &str = "Continuous planning and delivery of this named
 struct ExistingMapReceipt {
     format_version: u32,
     map: String,
+    #[serde(default)]
+    map_repository: String,
     instruction: String,
     scope: String,
     source_session: store::AgentSessionIdentity,
@@ -114,7 +116,11 @@ impl ExistingMapReceipt {
             .join("\n");
         format!(
             "## Existing-map execution preference — body refresh pending for a human\n\nThe human gave this explicit instruction in the verified orchestrator chat for [this named map](https://github.com/{}/issues/{}):\n\n{}\n\nScope: {}\n\nLocal receipt: `{}`. The receipt pins the map, exact instruction, observed chat session, process, pane, and terminal; the runtime checks this map comment against that retained receipt before dispatch. Opening or attaching a chat does not authorize delivery.\n\n**Body refresh pending for a human.** The map and specification bodies remain unchanged.\n\n<!-- {} -->",
-            map.repo(),
+            if self.map_repository.is_empty() {
+                map.repo()
+            } else {
+                self.map_repository.clone()
+            },
             map.number,
             instruction,
             self.scope,
@@ -294,6 +300,7 @@ impl GitHub {
             let receipt = ExistingMapReceipt {
                 format_version: store::FORMAT,
                 map: identity,
+                map_repository: map.repo(),
                 instruction: instruction.to_owned(),
                 scope: EXISTING_MAP_SCOPE.to_owned(),
                 source_session: session,
@@ -307,6 +314,10 @@ impl GitHub {
             store::atomic_json(&path, &receipt)?;
             receipt
         };
+        if receipt.map_repository.is_empty() {
+            receipt.map_repository = map.repo();
+            store::atomic_json(&path, &receipt)?;
+        }
         let expected = receipt.comment(map);
         self.post_comment_once(map, map.number, &expected, &receipt.marker)?;
         let marker = format!("<!-- {} -->", receipt.marker);
@@ -946,6 +957,7 @@ impl GitHub {
         ensure!(
             receipt.map == identity
                 && state.map == identity
+                && receipt.map_repository.to_ascii_lowercase() == map.repo().to_ascii_lowercase()
                 && receipt.scope == EXISTING_MAP_SCOPE
                 && receipt.marker == expected_marker
                 && receipt.comment_verified
