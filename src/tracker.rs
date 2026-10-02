@@ -954,7 +954,7 @@ impl GitHub {
         ensure!(
             receipt.map == identity
                 && state.map == identity
-                && receipt.map_repository.to_ascii_lowercase() == map.repo().to_ascii_lowercase()
+                && receipt.map_repository.eq_ignore_ascii_case(&map.repo())
                 && receipt.scope == EXISTING_MAP_SCOPE
                 && receipt.marker == expected_marker
                 && receipt.comment_verified
