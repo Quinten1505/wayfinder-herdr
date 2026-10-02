@@ -310,6 +310,22 @@ def draw_progress(window, repo: str, detail: str):
     window.refresh()
 
 
+def draw_recovery(window, repo: str, launch_id: str):
+    window.erase()
+    height, width = window.getmaxyx()
+    lines = [
+        "Feature could not start. Your description was saved.",
+        "Recovery ID: " + launch_id,
+        "Run: wayfinder recover " + launch_id,
+        "Open wayfinder again to retry when delivery is available.",
+    ]
+    top = max(0, (height - len(lines)) // 2)
+    for offset, line in enumerate(lines):
+        put(window, top + offset, max(1, (width - len(line)) // 2), line)
+    put(window, min(height - 1, top + len(lines) + 1), 2, repo, curses.color_pair(3))
+    window.refresh()
+
+
 def read_key():
     # curses.get_wch() normalizes both CR and LF to '\n' even in raw mode.
     # Read the PTY bytes directly so Enter and Shift+Enter can differ.
@@ -357,7 +373,7 @@ def read_key():
         return "idle", ""
 
 
-def run_tui(window, repo: str, on_submit):
+def run_tui(window, repo: str, launch_id: str, on_submit):
     curses.set_escdelay(25)
     curses.raw()
     try:
@@ -386,8 +402,8 @@ def run_tui(window, repo: str, on_submit):
                 continue
             draw_progress(window, repo, "Saving your description and preparing the chat")
             on_submit(value.strip())
-            draw_progress(window, repo, "Handoff unavailable. Description saved; see launch record for recovery.")
-            time.sleep(4)
+            draw_recovery(window, repo, launch_id)
+            time.sleep(6)
             return "submitted", value.strip()
         if kind == "newline":
             value = value[:cursor] + "\n" + value[cursor:]
@@ -418,7 +434,7 @@ def run_tui(window, repo: str, on_submit):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("mode", nargs="?", choices=("launch", "popup", "coordinate"), default="launch")
+    parser.add_argument("mode", nargs="?", choices=("launch", "popup", "coordinate", "recover"), default="launch")
     parser.add_argument("launch_id", nargs="?")
     args = parser.parse_args()
     if args.mode == "launch":
@@ -427,6 +443,14 @@ def main():
     launch_id = args.launch_id or os.environ.get("WAYFINDER_LAUNCH_ID")
     if not launch_id:
         raise ValueError("Missing Wayfinder launch identity")
+    if args.mode == "recover":
+        _, record = read_record(launch_id)
+        if record["status"] != "submitted":
+            raise RuntimeError("This launch has no submitted description to recover")
+        print("Repository: " + record["checkout"])
+        print("Description:\n" + record["description"])
+        print("No feature effort was started. Run wayfinder again to retry.")
+        return
     if args.mode == "coordinate":
         coordinate_or_record_error(launch_id)
         return
@@ -452,7 +476,7 @@ def main():
         record["status"] = "submitted"
         save_record(path, record)
 
-    status, _ = curses.wrapper(run_tui, record["checkout"], submit)
+    status, _ = curses.wrapper(run_tui, record["checkout"], launch_id, submit)
     if status == "cancelled":
         record["status"] = "cancelled"
         save_record(path, record)

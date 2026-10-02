@@ -165,6 +165,11 @@ else:
         submitted = self.run_popup([b"First line", b"\x1b[13;2u", b"Second line", b"\r"])
         self.assertEqual(submitted["status"], "submitted")
         self.assertEqual(submitted["description"], "First line\nSecond line")
+        recovered = subprocess.run(
+            [sys.executable, str(COMMAND), "recover", submitted["launch_id"]],
+            env=self.env, text=True, capture_output=True, check=True)
+        self.assertIn("First line\nSecond line", recovered.stdout)
+        self.assertIn("No feature effort was started", recovered.stdout)
         empty_cancelled = self.run_popup([b"\r", b"\x1b"])
         self.assertEqual(empty_cancelled["status"], "cancelled")
         self.assertNotIn("description", empty_cancelled)
